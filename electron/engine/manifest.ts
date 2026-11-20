@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { META_DIR } from './scan';
@@ -13,6 +14,8 @@ export interface Manifest {
   version: 1;
   sourceRoot: string;
   updatedAt: number;
+  /** Job which published this generation (absent in legacy manifests). */
+  generation?: string;
   files: Record<string, ManifestEntry>;
 }
 
@@ -32,48 +35,86 @@ export function historyDir(targetRoot: string): string {
   return path.join(metaDir(targetRoot), 'history');
 }
 
-/**
- * 原子写入：先写临时文件再 rename。
- * 目标介质随时可能被拔出，半截 JSON 比没有 JSON 更糟。
- *
- * 移动介质上 rename 偶尔会因目标文件被短暂占用（索引器、杀软扫描）而失败，
- * 此时重试一次；仍失败则清理临时件，避免在介质上堆积垃圾。
- */
+/** Windows does not expose directory flush through Node's fs API. */
+export async function syncDirectory(dir: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const handle = await fs.open(dir, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function syncFile(file: string): Promise<void> {
+  const handle = await fs.open(file, process.platform === 'win32' ? 'r+' : 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** anchor already exists. Never recreate it if the target disappears. */
+export async function createDurableDirectory(dir: string, anchor?: string): Promise<void> {
+  if (anchor) {
+    dir = path.resolve(dir);
+    anchor = path.resolve(anchor);
+    if (dir === anchor) return;
+    const relative = path.relative(anchor, dir);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error('目录超出目标根路径');
+    }
+    await createDurableDirectory(path.dirname(dir), anchor);
+    await fs.mkdir(dir).catch(async (err: NodeJS.ErrnoException) => {
+      if (err.code !== 'EEXIST' || !(await fs.lstat(dir)).isDirectory()) throw err;
+    });
+  } else {
+    const created = await fs.mkdir(dir, { recursive: true });
+    // On Windows mkdir can return a namespaced path; directory fsync is unavailable there.
+    if (!created || process.platform === 'win32') return;
+    const boundary = path.dirname(path.resolve(created));
+    let parent = path.dirname(path.resolve(dir));
+    while (parent !== boundary) {
+      const next = path.dirname(parent);
+      if (next === parent) throw new Error('Created directory is not an ancestor of the requested directory');
+      await syncDirectory(parent);
+      parent = next;
+    }
+  }
+  await syncDirectory(path.dirname(dir));
+}
+
+/** Flush contents before the atomic rename, then persist the directory entry. */
 export async function writeJsonAtomic(
   filePath: string,
   data: unknown,
-  options?: { createDirs?: boolean },
+  options?: { createDirs?: boolean; beforeRename?: () => Promise<void> },
 ): Promise<void> {
-  // createDirs: false —— 调用方确认父目录必须已存在时使用。
-  // 介质掉线后创建目录会把已掉线的目标端「造回来」，掩盖掉线事实。
-  if (options?.createDirs !== false) {
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-  }
-  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  const payload = JSON.stringify(data, null, 2);
-  const handle = await fs.open(tmp, 'w');
-  let writeFailed = false;
+  const dir = path.dirname(filePath);
+  if (options?.createDirs !== false) await createDurableDirectory(dir);
+  const tmp = `${filePath}.tmp-${randomUUID()}`;
+  const handle = await fs.open(tmp, 'wx');
   try {
-    await handle.writeFile(payload, 'utf8');
-    await handle.sync();
-  } catch (err) {
-    // 写入阶段失败（介质掉线等）：临时件必须清理，不能在介质上留垃圾
-    writeFailed = true;
-    throw err;
-  } finally {
-    await handle.close();
-    if (writeFailed) await fs.unlink(tmp).catch(() => undefined);
-  }
-  try {
-    await fs.rename(tmp, filePath);
-  } catch (err) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    try {
+      await handle.writeFile(JSON.stringify(data, null, 2), 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await options?.beforeRename?.();
     try {
       await fs.rename(tmp, filePath);
-    } catch (retryErr) {
-      await fs.unlink(tmp).catch(() => undefined);
-      throw retryErr;
+    } catch (err) {
+      if (!['EACCES', 'EPERM', 'EBUSY'].includes((err as NodeJS.ErrnoException).code ?? '')) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await options?.beforeRename?.();
+      await fs.rename(tmp, filePath);
     }
+    await syncDirectory(dir);
+  } catch (err) {
+    await fs.unlink(tmp).catch(() => undefined);
+    throw err;
   }
 }
 

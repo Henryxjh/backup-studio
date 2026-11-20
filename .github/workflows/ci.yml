@@ -30,14 +30,5 @@ jobs:
       - name: Build electron
         run: npm run build:electron
 
-      - name: Engine tests
-        run: npm run test:engine
-
-      - name: Auto sync tests
-        run: npm run test:aut
-
-      - name: Write gate tests
-        run: npm run test:gate
-
-      - name: Duplicate finder tests
-        run: npm run test:dup
+      - name: Run all tests
+        run: npm test

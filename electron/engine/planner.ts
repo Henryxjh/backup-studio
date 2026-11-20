@@ -1,7 +1,8 @@
+import os from 'node:os';
 import path from 'node:path';
-import { hashConcurrency, hashFilesDetailed } from './hash';
+import { hashFilesDetailed } from './hash';
 import type { ScannedFile, ScannedTree } from './scan';
-import type { Manifest } from './manifest';
+import type { Manifest, ManifestEntry } from './manifest';
 import type { PlanAction, SyncMode } from '../../shared/types';
 
 export interface PlanInput {
@@ -11,16 +12,6 @@ export interface PlanInput {
   target: ScannedTree;
   manifest: Manifest | null;
   syncMode: SyncMode;
-  /**
-   * 重复排除名单：被排除的源端相对路径。
-   *
-   * 语义（REQ-DUP-001 FR-09）：
-   * - 被排除的源端副本**不生成复制/更新动作**，但仍计入源端文件数统计
-   * - 被排除的路径在目标端若成为孤儿，**不生成删除动作**——目标端副本默认保留
-   *
-   * 这是排除生效的前提：否则会出现「源端不再写入、目标端却被删掉」的自相矛盾。
-   */
-  excluded?: ReadonlySet<string>;
   onProgress?: (stage: string, done: number, total: number) => void;
 }
 
@@ -53,21 +44,32 @@ export const MAX_PREVIEW_ACTIONS = 20000;
 
 const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
 
+function hashConcurrency(): number {
+  return Math.max(2, Math.min(8, os.cpus().length - 1));
+}
+
+function cachedTargetHash(dst: ScannedFile, memo: ManifestEntry | undefined): string | undefined {
+  // v1 清单记录的是提交后目标文件的元数据，没有独立的源端时间戳。
+  if (memo && memo.size === dst.size && memo.mtimeMs === dst.mtimeMs && memo.sha256) {
+    return memo.sha256;
+  }
+  return undefined;
+}
+
 /**
  * 生成备份计划。
  *
  * 判定顺序（成本从低到高）：
- *  1. 元数据快判：manifest 记录的大小与 mtime 完全一致 → 跳过，零 I/O
- *  2. 大小不同 → 必然内容不同 → 直接覆盖，不做无意义哈希
- *  3. 大小相同但 mtime 不同 → 哈希比对，确认是否真的变了
- *  4. 源端新增文件 → 先按 size 分桶，只有可能与孤儿文件配对的才计算哈希
- *     命中同哈希即判定为「改名」，整个文件无需重新拷贝
+ *  1. 源目标大小不同 → 直接更新，无需计算哈希。
+ *  2. 大小相同 → 比对源端实算哈希和目标哈希。
+ *     仅当目标大小及 mtime 与清单记录一致时，复用目标哈希。
+ *  3. 源端新增文件 → 先按 size 分桶，只有可能与孤儿文件配对的才计算哈希。
+ *     命中同哈希即判定为「改名」，整个文件无需重新拷贝。
  */
 export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   const { sourceRoot, targetRoot, source, target, manifest, syncMode } = input;
   const report = input.onProgress ?? (() => {});
   const manifestFiles = manifest?.files ?? {};
-  const excluded = input.excluded ?? new Set<string>();
 
   const srcFiles = source.files;
   const dstFiles = target.files;
@@ -87,34 +89,9 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   // ---- 第一轮：零 I/O 的元数据快判 ----
   report('分类', 0, srcFiles.size);
   for (const src of srcFiles.values()) {
-    // 重复排除：冗余副本不再写入目标端。
-    // 它仍计入 srcFiles.size（源端文件数统计），只是不产生任何写入动作。
-    if (excluded.has(src.relPath)) {
-      identical.push({
-        id: `skip:${src.relPath}`,
-        type: 'skip',
-        relPath: src.relPath,
-        size: src.size,
-        status: 'skipped',
-        note: '已按重复排除规则排除，不写入目标端',
-      });
-      continue;
-    }
     const dst = dstFiles.get(src.relPath);
     if (!dst) {
       newFiles.push(src);
-      continue;
-    }
-    const memo = manifestFiles[src.relPath];
-    if (memo && memo.size === src.size && memo.mtimeMs === src.mtimeMs) {
-      identical.push({
-        id: `skip:${src.relPath}`,
-        type: 'skip',
-        relPath: src.relPath,
-        size: src.size,
-        status: 'skipped',
-        note: '与上次备份完全一致',
-      });
       continue;
     }
     if (src.size !== dst.size) {
@@ -139,10 +116,14 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
 
   // 孤儿文件哈希：优先用 manifest 里的历史值，其次才实算
   const orphanHashEntries: { key: string; path: string }[] = [];
+  const orphanHashes = new Map<string, string>();
   for (const orphan of orphans) {
     if (!neededSizes.has(orphan.size)) continue;
-    const memo = manifestFiles[orphan.relPath];
-    if (memo && memo.size === orphan.size && memo.sha256) continue; // manifest 已有，无需实算
+    const cached = cachedTargetHash(orphan, manifestFiles[orphan.relPath]);
+    if (cached) {
+      orphanHashes.set(orphan.relPath, cached);
+      continue;
+    }
     orphanHashEntries.push({
       key: orphan.relPath,
       path: path.join(targetRoot, orphan.relPath),
@@ -157,14 +138,8 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
     hashConcurrency(),
     (done, total) => report('计算哈希', done, total),
   );
-  const orphanHashes = orphanHashRes.hashes;
-  // 用 manifest 里的历史哈希补齐
-  for (const orphan of orphans) {
-    if (orphanHashes.has(orphan.relPath)) continue;
-    const memo = manifestFiles[orphan.relPath];
-    if (memo && memo.size === orphan.size && memo.mtimeMs === orphan.mtimeMs && memo.sha256) {
-      orphanHashes.set(orphan.relPath, memo.sha256);
-    }
+  for (const [relPath, hash] of orphanHashRes.hashes) {
+    orphanHashes.set(relPath, hash);
   }
 
   const sourceHashRes = await hashFilesDetailed(
@@ -174,8 +149,7 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   );
   const sourceHashes = sourceHashRes.hashes;
 
-  // 注意：进入 sameSize 的条目要么无 manifest，要么 mtime 已变化。
-  // 源端必须实算哈希——绝不能用旧 manifest 代替源端新哈希，否则同大小原地修改会漏备份。
+  // v1 没有源端元数据基线：即便源 mtime 恰好等于目标的历史 mtime，也必须实算源哈希。
   const sameSizeHashEntries = sameSize.map(({ src }) => ({
     key: src.relPath,
     path: path.join(sourceRoot, src.relPath),
@@ -188,24 +162,19 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   const sameSizeHashes = sameSizeHashRes.hashes;
 
   // ---- 第四轮：目标端哈希（用于同尺寸疑似变更的判定） ----
-  const dstHashEntries = sameSize
-    .filter(({ src, dst }) => {
-      if (!sameSizeHashes.has(src.relPath)) return false;
-      const memo = manifestFiles[src.relPath];
-      if (memo && memo.size === dst.size && memo.mtimeMs === dst.mtimeMs && memo.sha256) return false;
-      return true;
-    })
-    .map(({ dst }) => ({ key: dst.relPath, path: path.join(targetRoot, dst.relPath) }));
+  const dstHashEntries: { key: string; path: string }[] = [];
+  const dstHashes = new Map<string, string>();
+  for (const { src, dst } of sameSize) {
+    if (!sameSizeHashes.has(src.relPath)) continue;
+    const cached = cachedTargetHash(dst, manifestFiles[dst.relPath]);
+    if (cached) dstHashes.set(dst.relPath, cached);
+    else dstHashEntries.push({ key: dst.relPath, path: path.join(targetRoot, dst.relPath) });
+  }
   const dstHashRes = await hashFilesDetailed(dstHashEntries, hashConcurrency(), (done, total) =>
     report('计算哈希', done, total),
   );
-  const dstHashes = dstHashRes.hashes;
-  for (const { src, dst } of sameSize) {
-    if (dstHashes.has(dst.relPath)) continue;
-    const memo = manifestFiles[src.relPath];
-    if (memo && memo.size === dst.size && memo.mtimeMs === dst.mtimeMs && memo.sha256) {
-      dstHashes.set(dst.relPath, memo.sha256);
-    }
+  for (const [relPath, hash] of dstHashRes.hashes) {
+    dstHashes.set(relPath, hash);
   }
 
   const hashErrors: string[] = [
@@ -239,7 +208,9 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
     if (hash) {
       const candidates = orphanByHash.get(hash) ?? [];
       // 同名优先：更符合用户心智（a.txt → b/a.txt）
-      const sameName = candidates.find((o) => path.basename(o.relPath) === path.basename(src.relPath));
+      const sameName = candidates.find(
+        (o) => !consumedOrphans.has(o.relPath) && path.basename(o.relPath) === path.basename(src.relPath),
+      );
       const chosen = sameName ?? candidates.find((o) => !consumedOrphans.has(o.relPath));
       if (chosen) {
         consumedOrphans.add(chosen.relPath);
@@ -328,9 +299,6 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   let deleted = 0;
   for (const orphan of orphans) {
     if (consumedOrphans.has(orphan.relPath)) continue;
-    // 命中重复排除名单：目标端副本默认保留。
-    // 排除表示「这份内容由规范副本代表」，不是「可以删掉」。
-    if (excluded.has(orphan.relPath)) continue;
     // 哈希计算失败的孤儿或所属尺寸桶配对不完整时，严禁静默删除
     if (orphanHashRes.errors.has(orphan.relPath) || unsafeOrphanSizes.has(orphan.size)) {
       continue;

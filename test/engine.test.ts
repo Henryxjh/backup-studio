@@ -5,7 +5,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { scanTree } from '../electron/engine/scan';
 import { buildPlan } from '../electron/engine/planner';
-import { readManifest } from '../electron/engine/manifest';
+import { readManifest, writeManifest } from '../electron/engine/manifest';
 import { CopyPool } from '../electron/engine/pool';
 import { BackupService } from '../electron/engine/service';
 import { assessMedia, identifyMedia, probeMedia, sameMedia } from '../electron/engine/media';
@@ -114,6 +114,27 @@ async function runService(source: string, target: string, syncMode: SyncMode = '
   });
 }
 
+const baselineMtime = new Date('2023-11-14T22:13:20Z');
+const modifiedMtime = new Date('2023-11-14T22:14:20Z');
+
+async function makeHashFixture() {
+  const source = await makeTemp('bs-hash-src-');
+  const target = await makeTemp('bs-hash-dst-');
+  const src = path.join(source, 'a.txt');
+  const dst = path.join(target, 'a.txt');
+  await fs.writeFile(src, 'hello');
+  await runService(source, target);
+
+  // 用整秒时间构造可跨文件系统精确复现的基线，摘要仍由真实备份生成。
+  await fs.utimes(src, baselineMtime, baselineMtime);
+  await fs.utimes(dst, baselineMtime, baselineMtime);
+  const manifest = await readManifest(target);
+  assert.ok(manifest);
+  manifest.files['a.txt'].mtimeMs = (await fs.stat(dst)).mtimeMs;
+  await writeManifest(target, manifest);
+  return { source, target, src, dst, memo: manifest.files['a.txt'] };
+}
+
 async function main(): Promise<void> {
   console.log('\nBackup Studio 引擎验证\n');
 
@@ -179,6 +200,88 @@ async function main(): Promise<void> {
 
     await runService(source, target);
     assert.equal(await readFile(target, 'a.txt'), 'v2-longer-content');
+  });
+
+  await test('清单快判：源同尺寸改写且时间恰好匹配目标清单，仍判定更新', async () => {
+    const { source, target, src, memo } = await makeHashFixture();
+    await fs.writeFile(src, 'world');
+    await fs.utimes(src, baselineMtime, baselineMtime);
+    const stat = await fs.stat(src);
+    assert.equal(stat.size, memo.size);
+    assert.equal(stat.mtimeMs, memo.mtimeMs);
+
+    const plan = await planFor(source, target);
+    assert.equal(plan.summary.update, 1);
+    await runService(source, target);
+    assert.equal(await readFile(target, 'a.txt'), 'world');
+  });
+
+  for (const changed of ['world', 'truncated-and-replaced']) {
+    await test(`清单快判：目标外部改写（${changed.length === 5 ? '同尺寸' : '尺寸变化'}）后重写目标`, async () => {
+      const { source, target, dst, memo } = await makeHashFixture();
+      await fs.writeFile(dst, changed);
+      await fs.utimes(dst, modifiedMtime, modifiedMtime);
+      assert.notEqual((await fs.stat(dst)).mtimeMs, memo.mtimeMs);
+
+      const plan = await planFor(source, target);
+      assert.equal(plan.summary.update, 1);
+      assert.equal(plan.summary.skip, 0);
+      await runService(source, target);
+      assert.equal(await readFile(target, 'a.txt'), 'hello');
+    });
+  }
+
+  await test('清单快判：仅目标 mtime 变化时对比摘要并跳过传输', async () => {
+    const { source, target, dst, memo } = await makeHashFixture();
+    await fs.utimes(dst, modifiedMtime, modifiedMtime);
+    assert.notEqual((await fs.stat(dst)).mtimeMs, memo.mtimeMs);
+
+    const plan = await planFor(source, target);
+    assert.equal(plan.summary.skip, 1);
+    assert.equal(plan.summary.update, 0);
+    assert.equal(plan.summary.bytes, 0);
+    assert.equal(plan.actions[0].note, '内容一致，仅修改时间');
+    assert.deepEqual(plan.hashErrors, []);
+  });
+
+  await test('显式完整性校验：发现目标同尺寸且 mtime 未变的损坏', async () => {
+    const { inspectHealth } = await import('../electron/engine/health');
+    const { source, target, dst, memo } = await makeHashFixture();
+    await fs.writeFile(dst, 'world');
+    await fs.utimes(dst, baselineMtime, baselineMtime);
+    const stat = await fs.stat(dst);
+    assert.equal(stat.size, memo.size);
+    assert.equal(stat.mtimeMs, memo.mtimeMs);
+
+    // 常规计划仍复用已通过元数据检查的目标摘要，显式校验直接读取目标。
+    assert.equal((await planFor(source, target)).summary.skip, 1);
+    const local = await makeTemp('bs-hash-health-');
+    const report = await inspectHealth(target, { platform: 'linux', store: new JournalStore(local) });
+    assert.equal(report.files.mismatch, 1);
+    assert.equal(report.files.complete, 0);
+  });
+
+  await test('改名配对：重新计算 mtime 已变化的孤儿文件摘要', async () => {
+    const { source, target, src, dst } = await makeHashFixture();
+    await fs.rename(src, path.join(source, 'renamed.txt'));
+    await fs.utimes(dst, modifiedMtime, modifiedMtime);
+
+    const plan = await planFor(source, target);
+    assert.equal(plan.summary.rename, 1);
+    assert.equal(plan.summary.copy, 0);
+    assert.equal(plan.summary.delete, 0);
+  });
+
+  await test('改名配对：同名优先时一个孤儿仅能配对一次', async () => {
+    const { source, target, src } = await makeHashFixture();
+    await fs.unlink(src);
+    await writeFile(source, 'dir1/a.txt', 'hello');
+    await writeFile(source, 'dir2/a.txt', 'hello');
+
+    const plan = await planFor(source, target);
+    assert.equal(plan.summary.rename, 1);
+    assert.equal(plan.summary.copy, 1);
+    assert.equal(plan.summary.delete, 0);
   });
 
   await test('严格镜像：源端已删除的文件在目标端被删除', async () => {
