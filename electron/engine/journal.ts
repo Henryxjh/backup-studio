@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { writeJsonAtomic } from './manifest';
@@ -184,12 +185,9 @@ export class JournalStore {
   }
 }
 
-/** 把相对路径映射成安全的临时文件名，避免路径分隔符与超长名问题 */
+/** 把相对路径映射成安全的临时文件名，避免路径分隔符、超长名与哈希碰撞问题 */
 export function partFileName(relPath: string): string {
   const base = path.basename(relPath).replace(/[^\w.\-一-龥]/g, '_').slice(-48);
-  let hash = 0;
-  for (let i = 0; i < relPath.length; i += 1) {
-    hash = (hash * 31 + relPath.charCodeAt(i)) >>> 0;
-  }
-  return `${base}.${hash.toString(16).padStart(8, '0')}.part`;
+  const digest = createHash('sha256').update(relPath, 'utf8').digest('hex').slice(0, 24);
+  return `${base}.${digest}.part`;
 }

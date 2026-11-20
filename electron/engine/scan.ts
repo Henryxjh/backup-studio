@@ -33,8 +33,9 @@ function errorText(err: unknown): string {
  */
 export async function scanTree(
   root: string,
-  options: { exclude?: (relPath: string) => boolean } = {},
+  options: { exclude?: (relPath: string) => boolean; excludeMetaDir?: boolean } = {},
 ): Promise<ScannedTree> {
+  const excludeMetaDir = options.excludeMetaDir ?? true;
   const files = new Map<string, ScannedFile>();
   const dirs: string[] = [];
   const errors: string[] = [];
@@ -54,7 +55,7 @@ export async function scanTree(
     }
 
     for (const entry of entries) {
-      if (entry.name === META_DIR) continue;
+      if (excludeMetaDir && entry.name === META_DIR) continue;
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       if (options.exclude?.(childRel)) continue;
 
