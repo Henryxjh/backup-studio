@@ -825,6 +825,185 @@ async function main(): Promise<void> {
     assert.equal(new Set(capabilityMatrix.map((r) => `${r.platform}/${r.interface}/${r.filesystem}`)).size, 72);
     assert.ok(capabilityMatrix.filter((r) => ['VHD', '加密容器', '压缩包内文件系统'].includes(r.filesystem)).every((r) => r.directRepair === '不支持'));
   });
+  await test('稳定性：同尺寸但 mtime 变动且内容一致的文件实算目标哈希后判定跳过', async () => {
+    const source = await makeTemp('bs-same-src-');
+    const target = await makeTemp('bs-same-dst-');
+    await writeFile(source, 'doc.bin', 'SAME-CONTENT-8B');
+    await writeFile(target, 'doc.bin', 'SAME-CONTENT-8B');
+    const older = new Date(1700000000000);
+    const newer = new Date(1700000020000);
+    await fs.utimes(path.join(target, 'doc.bin'), older, older);
+    await fs.utimes(path.join(source, 'doc.bin'), newer, newer);
+
+    const plan = await planFor(source, target, 'mirror');
+    assert.equal(plan.summary.skip, 1, '同内容文件应直接跳过而非重传');
+    assert.equal(plan.summary.update, 0, '同内容不应误判为 update');
+    assert.equal(plan.summary.bytes, 0);
+  });
+
+  await test('可靠性：超过 20000 条动作时 UI 预览截断但后台完整执行不漏文件', async () => {
+    const fakeFiles = new Map<string, { relPath: string; size: number; mtimeMs: number }>();
+    for (let i = 0; i < 20005; i += 1) {
+      fakeFiles.set(`f${i}.txt`, { relPath: `f${i}.txt`, size: 1, mtimeMs: 1000 });
+    }
+    const plan = await buildPlan({
+      sourceRoot: '/tmp/fake-src',
+      targetRoot: '/tmp/fake-dst',
+      source: { root: '/tmp/fake-src', files: fakeFiles, dirs: [], totalBytes: 20005, skippedSymlinks: 0, errors: [] },
+      target: { root: '/tmp/fake-dst', files: new Map(), dirs: [], totalBytes: 0, skippedSymlinks: 0, errors: [] },
+      manifest: null,
+      syncMode: 'mirror',
+    });
+    assert.equal(plan.actions.length, 20005, '执行动作不可截断');
+    assert.equal(plan.previewActions.length, 20000, '预览列表应限制在 20000 条');
+    assert.equal(plan.truncated, true);
+  });
+
+  await test('可靠性：单文件复制失败时不允许报 completed 且保留断点供恢复', async () => {
+    const source = await makeTemp('bs-fail-src-');
+    const target = await makeTemp('bs-fail-dst-');
+    const userData = await makeTemp('bs-fail-ud-');
+    await writeFile(source, 'ok.txt', 'good');
+    await writeFile(source, 'missing.txt', 'will-vanish');
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'mirror');
+    // 在开始前删掉其中一个源文件，触发单文件失败
+    await fs.unlink(path.join(source, 'missing.txt'));
+
+    await service.start({
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'mirror',
+      allowMassDelete: true,
+      resume: true,
+    });
+
+    const state = service.getState();
+    assert.equal(state.phase, 'failed', '存在失败动作时 phase 不得伪装成 completed');
+    assert.equal(await fs.readFile(path.join(target, 'ok.txt'), 'utf8'), 'good');
+    const rec = await service.findRecoverableJob();
+    assert.ok(rec !== null, '部分失败应保留活动断点指针');
+  });
+
+  await test('容灾：recover() 在重新扫描失败时不提前丢失旧断点指针', async () => {
+    const source = await makeTemp('bs-rec-src-');
+    const target = await makeTemp('bs-rec-dst-');
+    const userData = await makeTemp('bs-rec-ud-');
+    await writeFile(source, 'a.txt', 'hello');
+
+    const service = new BackupService(userData);
+    const store = new JournalStore(userData);
+    await store.write({
+      version: 1,
+      jobId: 'keep-active-on-plan-fail',
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'mirror',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      txSeq: 1,
+      committedTx: 1,
+      mediaIdentity: await identifyMedia(target),
+      interruption: { at: Date.now(), reason: '模拟中断', activeFiles: ['a.txt'], committedTasks: 0 },
+      tasks: {
+        'a.txt': {
+          relPath: 'a.txt',
+          totalBytes: 5,
+          copiedBytes: 0,
+          partPath: path.join(target, '.backup-studio', 'parts', partFileName('a.txt')),
+          status: 'copying',
+        },
+      },
+    });
+    await store.setActive('keep-active-on-plan-fail');
+
+    // 删除源目录使 recover 中的 plan() 失败
+    await fs.rm(source, { recursive: true, force: true });
+    await assert.rejects(() => service.recover({ confirmed: true }));
+    const stillThere = await service.findRecoverableJob();
+    assert.equal(stillThere?.jobId, 'keep-active-on-plan-fail', 'recover 失败后旧 active 指针应完整保留');
+  });
+
+  await test('可靠性：源端同名 .backup-studio 目录不被漏备、空目录同步、嵌套目录被拦截', async () => {
+    const source = await makeTemp('bs-meta-src-');
+    const target = await makeTemp('bs-meta-dst-');
+    const userData = await makeTemp('bs-meta-ud-');
+    await writeFile(source, '.backup-studio/user-file.txt', 'preserve-me');
+    await fs.mkdir(path.join(source, 'empty-dir'), { recursive: true });
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'mirror');
+    await service.start({
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'mirror',
+      allowMassDelete: true,
+      resume: true,
+    });
+    assert.equal(service.getState().phase, 'completed');
+    assert.equal(await fs.readFile(path.join(target, '.backup-studio', 'user-file.txt'), 'utf8'), 'preserve-me');
+    const emptyStat = await fs.stat(path.join(target, 'empty-dir'));
+    assert.equal(emptyStat.isDirectory(), true, '源端空目录应同步到目标端');
+
+    // 嵌套目录校验
+    const nestedTarget = path.join(source, 'nested-dst');
+    await fs.mkdir(nestedTarget, { recursive: true });
+    await assert.rejects(() => service.plan(source, nestedTarget, 'mirror'), /不能位于源目录内部/);
+    await assert.rejects(() => service.plan(source, source, 'mirror'), /同一路径/);
+  });
+
+  await test('可靠性：孤儿文件哈希读取失败时不进入删除列表', async () => {
+    const source = await makeTemp('bs-orpha-src-');
+    const target = await makeTemp('bs-orpha-dst-');
+    await writeFile(source, 'new-name.txt', '123456');
+    await writeFile(target, 'old-name.txt', '123456');
+
+    const srcScan = await scanTree(source, { excludeMetaDir: false });
+    const dstScan = await scanTree(target, { excludeMetaDir: true });
+    // 删除 target 上的 old-name.txt 模拟规划期间哈希阶段读取失败（权限拒绝/I/O 错误等）
+    await fs.unlink(path.join(target, 'old-name.txt'));
+
+    const plan = await buildPlan({
+      sourceRoot: source,
+      targetRoot: target,
+      source: srcScan,
+      target: dstScan,
+      manifest: null,
+      syncMode: 'mirror',
+    });
+    assert.ok(plan.hashErrors.length > 0, '应记录哈希读取错误');
+    assert.equal(
+      plan.actions.some((a) => a.type === 'delete' && a.relPath === 'old-name.txt'),
+      false,
+      '哈希失败的孤儿文件严禁生成删除动作',
+    );
+  });
+
+  if (process.platform === 'win32') {
+    await test('Windows 大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', async () => {
+      const source = await makeTemp('bs-case-src-');
+      const target = await makeTemp('bs-case-dst-');
+      const userData = await makeTemp('bs-case-ud-');
+      await writeFile(source, 'zzz_target.txt', 'MUST-SURVIVE');
+      await writeFile(target, 'ZZZ_TARGET.txt', 'old-small');
+      for (let i = 0; i < 60; i += 1) {
+        await writeFile(target, `aaa_del_${String(i).padStart(2, '0')}.txt`, 'x');
+      }
+
+      const service = new BackupService(userData);
+      await service.plan(source, target, 'mirror');
+      await service.start({
+        sourceRoot: source,
+        targetRoot: target,
+        syncMode: 'mirror',
+        allowMassDelete: true,
+        resume: true,
+      });
+      assert.equal(service.getState().phase, 'completed');
+      assert.equal(await fs.readFile(path.join(target, 'zzz_target.txt'), 'utf8'), 'MUST-SURVIVE');
+    });
+  }
 
   console.log(`\n结果：${passed} 通过 / ${failed} 失败\n`);
   if (failed > 0) process.exitCode = 1;

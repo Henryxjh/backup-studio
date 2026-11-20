@@ -181,24 +181,30 @@ export default function App() {
     [runScanAndPlan, sourceRoot, targetRoot],
   );
 
-  const handleStart = useCallback(async () => {
-    if (state?.requiresConfirmation && !allowMassDelete) {
-      setConfirming(true);
-      return;
-    }
-    setBusy(true);
-    try {
-      await api.start({
-        sourceRoot,
-        targetRoot,
-        syncMode,
-        allowMassDelete,
-        resume: true,
-      });
-    } finally {
-      setBusy(false);
-    }
-  }, [api, sourceRoot, targetRoot, syncMode, allowMassDelete, state?.requiresConfirmation]);
+  const handleStart = useCallback(
+    async (confirmedOverride?: boolean) => {
+      const confirmed = confirmedOverride ?? allowMassDelete;
+      if (state?.requiresConfirmation && !confirmed) {
+        setConfirming(true);
+        return;
+      }
+      setBusy(true);
+      try {
+        await api.start({
+          sourceRoot,
+          targetRoot,
+          syncMode,
+          allowMassDelete: confirmed,
+          resume: true,
+        });
+      } catch (err) {
+        console.error('启动备份失败', err);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [api, sourceRoot, targetRoot, syncMode, allowMassDelete, state?.requiresConfirmation],
+  );
 
   const running = phase === 'running' || phase === 'paused';
   const canStart = Boolean(sourceRoot && targetRoot) && !running && phase !== 'scanning' && phase !== 'planning';
@@ -311,7 +317,7 @@ export default function App() {
                   onClick={() => {
                     setAllowMassDelete(true);
                     setConfirming(false);
-                    void handleStart();
+                    void handleStart(true);
                   }}
                 >
                   确认并执行

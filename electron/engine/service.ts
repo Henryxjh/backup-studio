@@ -60,6 +60,28 @@ function errorCode(err: unknown): string | undefined {
   return typeof code === 'string' ? code : undefined;
 }
 
+const CASE_INSENSITIVE_PATHS = process.platform === 'win32' || process.platform === 'darwin';
+
+function assertDistinctRoots(sourceRoot: string, targetRoot: string): void {
+  const norm = (p: string) => {
+    const resolved = path.resolve(p);
+    return CASE_INSENSITIVE_PATHS ? resolved.toLowerCase() : resolved;
+  };
+  const src = norm(sourceRoot);
+  const dst = norm(targetRoot);
+  if (src === dst) {
+    throw new Error('源目录与目标目录不能是同一路径');
+  }
+  const relFromSrc = path.relative(src, dst);
+  if (relFromSrc && !relFromSrc.startsWith('..') && !path.isAbsolute(relFromSrc)) {
+    throw new Error('目标目录不能位于源目录内部，否则会触发递归备份或误删');
+  }
+  const relFromDst = path.relative(dst, src);
+  if (relFromDst && !relFromDst.startsWith('..') && !path.isAbsolute(relFromDst)) {
+    throw new Error('源目录不能位于目标目录内部，否则扫描与镜像删除互相冲突');
+  }
+}
+
 export interface StartOptions {
   sourceRoot: string;
   targetRoot: string;
@@ -68,6 +90,8 @@ export interface StartOptions {
   allowMassDelete: boolean;
   /** 断点续传：校验并复用未完成任务的 .part 分片 */
   resume: boolean;
+  /** 内部恢复流程已通过确认与重扫 */
+  fromRecovery?: boolean;
 }
 
 /** 恢复选项：用户确认后才允许继续写入 */
@@ -201,12 +225,13 @@ export class BackupService extends EventEmitter {
   /** 扫描源目录与目标目录 */
   async scan(sourceRoot: string, targetRoot: string): Promise<ScanResult> {
     if (this.running) throw new Error('备份执行中，不能重新扫描');
+    assertDistinctRoots(sourceRoot, targetRoot);
     this.setPhase('scanning');
     const started = now();
 
     const [source, target] = await Promise.all([
-      scanTree(sourceRoot),
-      scanTree(targetRoot),
+      scanTree(sourceRoot, { excludeMetaDir: false }),
+      scanTree(targetRoot, { excludeMetaDir: true }),
     ]);
 
     const result: ScanResult = {
@@ -241,6 +266,7 @@ export class BackupService extends EventEmitter {
     if (this.running || this.state.phase === 'planning' || this.state.phase === 'scanning') {
       throw new Error('已有备份操作正在执行');
     }
+    assertDistinctRoots(sourceRoot, targetRoot);
     this.currentPlan = null;
     this.plannedMedia = null;
     this.setPhase('planning');
@@ -257,8 +283,8 @@ export class BackupService extends EventEmitter {
       this.state.syncMode = syncMode;
 
       const [source, target, manifest] = await Promise.all([
-        scanTree(sourceRoot),
-        scanTree(targetRoot),
+        scanTree(sourceRoot, { excludeMetaDir: false }),
+        scanTree(targetRoot, { excludeMetaDir: true }),
         readManifest(targetRoot),
       ]);
 
@@ -298,7 +324,8 @@ export class BackupService extends EventEmitter {
       this.expectedMedia = identity;
       this.currentPlan = result;
       this.setMedia(after.writable ? 'online' : 'restoring');
-      this.state.actions = result.actions;
+      // 渲染层状态只暴露 previewActions（避免超大型目录打爆 IPC）；executePlan 仍执行全量 currentPlan.actions
+      this.state.actions = result.previewActions;
       this.state.requiresConfirmation = result.requiresConfirmation;
       this.state.confirmReason = result.confirmReason;
       this.state.summary = {
@@ -313,12 +340,18 @@ export class BackupService extends EventEmitter {
         'info',
         `计划生成：新增 ${result.summary.copy}，更新 ${result.summary.update}，改名 ${result.summary.rename}，删除 ${result.summary.delete}，跳过 ${result.summary.skip}`,
       );
+      if (result.truncated) {
+        this.log('info', `计划清单共 ${result.actions.length} 条，界面仅展示前 ${result.previewActions.length} 条（后台仍完整执行全部动作）`);
+      }
+      for (const err of result.hashErrors.slice(0, 5)) {
+        this.log('warn', `哈希读取异常（相关孤儿文件已跳过删除）：${err}`);
+      }
       if (result.requiresConfirmation) {
         this.log('warn', result.confirmReason);
       }
       this.setPhase('ready');
       this.emit('plan', {
-        actions: result.actions,
+        actions: result.previewActions,
         summary: this.state.summary,
         requiresConfirmation: result.requiresConfirmation,
         confirmReason: result.confirmReason,
@@ -374,12 +407,14 @@ export class BackupService extends EventEmitter {
       throw new Error('该介质处于隔离观察状态，已禁止写入。请先撤销隔离再继续。');
     }
 
+    const previous = await this.journal.getActive();
+    if (previous?.interruption && previous.targetRoot === targetRoot && !options.fromRecovery) {
+      // 中断后必须先由用户确认恢复或经过显式恢复入口：旧计划里的删除动作一律作废
+      throw new Error('检测到上次中断记录，请通过「恢复并重扫」确认后继续，避免沿用过期计划。');
+    }
+
     this.running = true;
     try {
-      const previous = await this.journal.getActive();
-      if (previous?.interruption && previous.targetRoot === targetRoot) {
-        throw new Error('检测到上次中断记录，请重新扫描以生成新的备份计划后再开始。');
-      }
       await this.guardTargetWrites(targetRoot);
     } catch (error) {
       this.running = false;
@@ -498,8 +533,8 @@ export class BackupService extends EventEmitter {
     }
     this.log('info', '开始恢复备份：正在重新扫描并生成新计划');
 
-    // Invalidate the old plan. The worker will validate the on-disk chunks against the source.
-    await this.journal.clearActive();
+    // 不提前清除 active.json：只有新计划生成并进入 start() 写入新 jobId 后才替换，
+    // 确保 plan/start 任一步失败时仍保留原有断点指针不丢失。
     this.currentJob = null;
     this.currentPlan = null;
     this.plannedMedia = null;
@@ -512,6 +547,7 @@ export class BackupService extends EventEmitter {
       syncMode: job.syncMode,
       allowMassDelete: false,
       resume: true,
+      fromRecovery: true,
     });
   }
 
@@ -711,24 +747,33 @@ export class BackupService extends EventEmitter {
     try {
       // 第一步：改名动作（纯元数据操作，瞬间完成）
       for (const action of actions.filter((a) => a.type === 'rename')) {
+        if (this.mediaLost || this.cancelled) break;
         await this.performRename(action);
       }
 
-      // 第二步：复制与更新
-      for (const action of actions.filter((a) => a.type === 'copy' || a.type === 'update')) {
-        await this.enqueueCopy(action, options.resume);
+      // 同步源端新增目录结构（含空目录）
+      for (const relDir of plan.missingDirs) {
+        if (this.mediaLost || this.cancelled) break;
+        await this.ensureTargetDir(relDir);
       }
 
-      // 第三步：删除与归档（放在最后，避免误删后又被写回）
-      // 删除前必须确认介质仍然健康——介质状态异常时不执行任何破坏性动作
-      if (!this.mediaLost) {
+      // 第二步：复制与更新，并等待所有工作线程落盘完毕
+      for (const action of actions.filter((a) => a.type === 'copy' || a.type === 'update')) {
+        if (this.mediaLost || this.cancelled) break;
+        await this.enqueueCopy(action, options.resume);
+      }
+      await this.waitForCompletion();
+
+      // 第三步：删除与归档（必须在所有复制彻底落盘之后执行，避免 Windows 大小写竞态误删新写入文件）
+      // 删除前及循环中必须实时确认介质健康与未取消
+      if (!this.mediaLost && !this.cancelled) {
         for (const action of actions.filter((a) => a.type === 'delete')) {
+          if (this.mediaLost || this.cancelled) break;
           await this.performDelete(action);
         }
       }
 
-      await this.waitForCompletion();
-
+      const failedActions = actions.filter((a) => a.status === 'failed');
       if (this.mediaLost) {
         // 中断路径：不写清单、不清账本，保留断点供恢复
         this.setPhase('interrupted');
@@ -737,9 +782,28 @@ export class BackupService extends EventEmitter {
         this.setPhase('cancelled');
         this.log('warn', '备份已取消');
       } else {
-        await this.finalize(options);
-        this.setPhase('completed');
-        this.log('success', '备份完成');
+        const manifestOk = await this.finalize(options, failedActions.length > 0);
+        if (failedActions.length > 0 || !manifestOk || plan.hashErrors.length > 0) {
+          const reasons: string[] = [];
+          if (failedActions.length > 0) reasons.push(`${failedActions.length} 个文件操作失败`);
+          if (plan.hashErrors.length > 0) reasons.push(`${plan.hashErrors.length} 个文件规划期读取失败`);
+          if (!manifestOk) reasons.push('写入清单失败');
+          if (this.currentJob) {
+            this.currentJob.interruption = {
+              at: now(),
+              reason: `备份未完全成功：${reasons.join('，')}`,
+              activeFiles: failedActions.map((a) => a.relPath),
+              committedTasks: Object.values(this.currentJob.tasks).filter((t) => t.status === 'done').length,
+            };
+            await this.flushJournal(true);
+            this.state.recoverableJob = await this.findRecoverableJob();
+          }
+          this.setPhase('failed');
+          this.log('error', `备份未完全成功（${reasons.join('，')}），已保留恢复记录`);
+        } else {
+          this.setPhase('completed');
+          this.log('success', '备份完成');
+        }
       }
     } catch (err) {
       this.setPhase('failed');
@@ -753,7 +817,7 @@ export class BackupService extends EventEmitter {
         this.pool = null;
       }
       await this.flushJournal();
-      // 只有正常结束才清除活动任务指针；中断时必须保留，供下次恢复
+      // 只有完全成功结束或主动取消才清除活动任务指针；中断/部分失败时保留，供下次恢复
       if (this.state.phase === 'completed' || this.state.phase === 'cancelled') {
         await this.journal.clearActive();
       }
@@ -822,7 +886,8 @@ export class BackupService extends EventEmitter {
   private computeCopiedBytes(): number {
     let sum = 0;
     for (const task of this.pendingTasks.values()) sum += task.copiedBytes;
-    for (const action of this.state.actions) {
+    const sourceActions = this.currentPlan?.actions ?? this.state.actions;
+    for (const action of sourceActions) {
       if ((action.type === 'copy' || action.type === 'update') && action.status === 'done') {
         sum += action.size;
       }
@@ -965,6 +1030,26 @@ export class BackupService extends EventEmitter {
     this.updateThroughput();
   }
 
+  private async ensureTargetDir(relDir: string): Promise<void> {
+    const targetRoot = this.state.targetRoot;
+    if (!targetRoot) return;
+    if (!(await this.checkMediaAlive())) {
+      await this.handleMediaLoss('目标目录在同步目录结构期间不可达');
+      return;
+    }
+    try {
+      await fs.mkdir(path.join(targetRoot, relDir), { recursive: true });
+    } catch (err) {
+      const code = errorCode(err);
+      if (code && MEDIA_ERROR_CODES.has(code)) {
+        this.ioErrors += 1;
+        await this.handleMediaLoss(errorText(err));
+        return;
+      }
+      this.log('warn', `创建目录失败：${relDir} — ${errorText(err)}`);
+    }
+  }
+
   private async performRename(action: PlanAction): Promise<void> {
     const targetRoot = this.state.targetRoot;
     const from = path.join(targetRoot, action.fromRelPath ?? '');
@@ -1019,7 +1104,8 @@ export class BackupService extends EventEmitter {
   }
 
   private findActionByRel(relPath: string): PlanAction | undefined {
-    for (const action of this.state.actions) {
+    const sourceActions = this.currentPlan?.actions ?? this.state.actions;
+    for (const action of sourceActions) {
       if (action.relPath === relPath && (action.type === 'copy' || action.type === 'update')) {
         return action;
       }
@@ -1175,19 +1261,22 @@ export class BackupService extends EventEmitter {
     });
   }
 
-  private async finalize(options: StartOptions): Promise<void> {
+  private async finalize(options: StartOptions, hasFailure: boolean): Promise<boolean> {
     const targetRoot = options.targetRoot;
     const manifest = await this.updateManifest(targetRoot);
+    let manifestOk = true;
     await writeManifest(targetRoot, manifest).catch((err) => {
-      this.log('warn', `写入清单失败：${errorText(err)}`);
+      manifestOk = false;
+      this.log('error', `写入清单失败：${errorText(err)}`);
     });
     if (this.currentJob) {
       await this.journal.write(this.currentJob);
     }
-    // A failed copy can still have intact chunks for the next run to reuse.
-    if (!this.state.actions.some((action) => action.status === 'failed')) {
+    // 只有全部动作成功且清单已写入时才清理 .part 临时目录；失败/未完成时保留已拷贝分片供下次续传
+    if (!hasFailure && manifestOk) {
       await fs.rm(partsDir(targetRoot), { recursive: true, force: true }).catch(() => undefined);
     }
+    return manifestOk;
   }
 
   private async updateManifest(targetRoot: string): Promise<Manifest> {
@@ -1198,8 +1287,9 @@ export class BackupService extends EventEmitter {
       files: {},
     };
     const files: Record<string, ManifestEntry> = { ...manifest.files };
+    const sourceActions = this.currentPlan?.actions ?? this.state.actions;
 
-    for (const action of this.state.actions) {
+    for (const action of sourceActions) {
       if (action.type !== 'copy' && action.type !== 'update' && action.type !== 'rename') continue;
       if (action.status !== 'done' && action.status !== 'archived') continue;
       try {
@@ -1216,8 +1306,8 @@ export class BackupService extends EventEmitter {
     }
 
     // 被删除的文件从清单中移除
-    for (const action of this.state.actions) {
-      if (action.type === 'delete' && action.status === 'done') {
+    for (const action of sourceActions) {
+      if (action.type === 'delete' && (action.status === 'done' || action.status === 'archived')) {
         delete files[action.relPath];
       }
     }
@@ -1263,8 +1353,11 @@ export class BackupService extends EventEmitter {
       if (await this.canWriteMirror()) {
         await this.journal.writeMirror(this.state.targetRoot, this.currentJob).catch(() => false);
       }
-    } catch {
-      // 账本落盘失败不阻塞主流程，下次心跳会重试
+    } catch (err) {
+      this.journalDirty = true;
+      if (force) {
+        this.log('error', `本机断点账本落盘失败，续传进度可能丢失：${errorText(err)}`);
+      }
     }
   }
 

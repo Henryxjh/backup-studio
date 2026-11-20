@@ -34,28 +34,58 @@ export class CopyPool {
   private paused = false;
   private destroyed = false;
 
+  private readonly workerPath: string;
+
   constructor(
     workerPath: string,
     size: number,
     private readonly defaults: PoolCallbacks = {},
   ) {
+    this.workerPath = workerPath;
     for (let index = 0; index < size; index += 1) {
-      const worker = new Worker(workerPath);
-      const slot: Slot = { index, worker, busy: false, current: null };
-      worker.on('message', (message: WorkerResponse) => this.onWorkerMessage(slot, message));
-      worker.on('error', (err) => {
-        const pending = slot.current;
-        slot.current = null;
-        slot.busy = false;
-        const report = pending?.callbacks ?? this.defaults;
-        report.onError?.(pending?.task.id ?? '', { message: err.message, code: 'WORKER_CRASH' });
-        this.pump();
-      });
-      // 注意：此处不可 unref。
-      // unref 后工作线程不再持有事件循环，纯脚本场景（引擎验证、CLI 化）
-      // 会在任务未完成时直接静默退出。改为由 destroy() 显式终止线程。
+      const slot: Slot = { index, worker: null as unknown as Worker, busy: false, current: null };
       this.slots.push(slot);
+      this.attachWorker(slot);
     }
+  }
+
+  private attachWorker(slot: Slot): void {
+    const worker = new Worker(this.workerPath);
+    slot.worker = worker;
+    worker.on('message', (message: WorkerResponse) => {
+      if (slot.worker !== worker) return;
+      this.onWorkerMessage(slot, message);
+    });
+    const failAndRespawn = (message: string) => {
+      if (slot.worker !== worker) return;
+      const pending = slot.current;
+      slot.current = null;
+      slot.busy = false;
+      if (pending) {
+        const report = pending.callbacks ?? this.defaults;
+        report.onError?.(pending.task.id, { message, code: 'WORKER_CRASH' });
+      }
+      if (!this.destroyed) {
+        this.attachWorker(slot);
+        this.pump();
+      }
+    };
+    worker.on('error', (err) => {
+      void worker.terminate().catch(() => undefined);
+      failAndRespawn(err.message);
+    });
+    worker.on('exit', (code) => {
+      if (this.destroyed || slot.worker !== worker) return;
+      if (code !== 0 || slot.current) {
+        failAndRespawn(`复制工作线程意外退出（code=${code}）`);
+      } else {
+        this.attachWorker(slot);
+        this.pump();
+      }
+    });
+    // 注意：此处不可 unref。
+    // unref 后工作线程不再持有事件循环，纯脚本场景（引擎验证、CLI 化）
+    // 会在任务未完成时直接静默退出。改为由 destroy() 显式终止线程。
   }
 
   submit(task: CopyTask, callbacks: PoolCallbacks): void {

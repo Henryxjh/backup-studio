@@ -1,6 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
-import { hashFiles } from './hash';
+import { hashFilesDetailed } from './hash';
 import type { ScannedFile, ScannedTree } from './scan';
 import type { Manifest } from './manifest';
 import type { PlanAction, SyncMode } from '../../shared/types';
@@ -16,7 +16,16 @@ export interface PlanInput {
 }
 
 export interface PlanResult {
+  /** 全量计划动作（执行层必须完整消费，不可截断） */
   actions: PlanAction[];
+  /** 渲染层预览列表（截断到 MAX_PREVIEW_ACTIONS，避免十万级文件打爆 IPC） */
+  previewActions: PlanAction[];
+  /** 预览列表是否发生截断 */
+  truncated: boolean;
+  /** 源端存在但目标端缺失的目录（含空目录） */
+  missingDirs: string[];
+  /** 规划期间哈希读取失败的文件清单 */
+  hashErrors: string[];
   summary: {
     totalFiles: number;
     copy: number;
@@ -30,8 +39,10 @@ export interface PlanResult {
   confirmReason: string;
 }
 
-/** 计划列表上限，避免十万级文件把 IPC 通道打爆 */
-const MAX_ACTIONS = 20000;
+/** 渲染列表预览上限，避免十万级文件把 IPC 通道打爆（不影响真实执行） */
+export const MAX_PREVIEW_ACTIONS = 20000;
+
+const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
 
 function hashConcurrency(): number {
   return Math.max(2, Math.min(8, os.cpus().length - 1));
@@ -122,63 +133,68 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   // ---- 第三轮：并发计算哈希 ----
   report('计算哈希', 0, orphanHashEntries.length + newFilesToHash.length + sameSize.length);
 
-  const orphanHashes = await hashFiles(
+  const orphanHashRes = await hashFilesDetailed(
     orphanHashEntries,
     hashConcurrency(),
     (done, total) => report('计算哈希', done, total),
   );
+  const orphanHashes = orphanHashRes.hashes;
   // 用 manifest 里的历史哈希补齐
   for (const orphan of orphans) {
     if (orphanHashes.has(orphan.relPath)) continue;
     const memo = manifestFiles[orphan.relPath];
-    if (memo && memo.size === orphan.size && memo.sha256) {
+    if (memo && memo.size === orphan.size && memo.mtimeMs === orphan.mtimeMs && memo.sha256) {
       orphanHashes.set(orphan.relPath, memo.sha256);
     }
   }
 
-  const sourceHashes = await hashFiles(
+  const sourceHashRes = await hashFilesDetailed(
     newFilesToHash.map((f) => ({ key: f.relPath, path: path.join(sourceRoot, f.relPath) })),
     hashConcurrency(),
     (done, total) => report('计算哈希', done, total),
   );
+  const sourceHashes = sourceHashRes.hashes;
 
-  const sameSizeHashEntries = sameSize.map(({ src, dst }) => {
-    const memo = manifestFiles[src.relPath];
-    if (memo && memo.size === dst.size && memo.sha256) return null;
-    return { key: src.relPath, path: path.join(sourceRoot, src.relPath) };
-  });
-  const sameSizeHashes = await hashFiles(
-    sameSizeHashEntries.filter((e): e is { key: string; path: string } => e !== null),
+  // 注意：进入 sameSize 的条目要么无 manifest，要么 mtime 已变化。
+  // 源端必须实算哈希——绝不能用旧 manifest 代替源端新哈希，否则同大小原地修改会漏备份。
+  const sameSizeHashEntries = sameSize.map(({ src }) => ({
+    key: src.relPath,
+    path: path.join(sourceRoot, src.relPath),
+  }));
+  const sameSizeHashRes = await hashFilesDetailed(
+    sameSizeHashEntries,
     hashConcurrency(),
     (done, total) => report('计算哈希', done, total),
   );
-  // manifest 里的历史哈希优先
-  for (const { src, dst } of sameSize) {
-    if (sameSizeHashes.has(src.relPath)) continue;
-    const memo = manifestFiles[src.relPath];
-    if (memo && memo.size === dst.size && memo.sha256) {
-      sameSizeHashes.set(src.relPath, memo.sha256);
-    }
-  }
+  const sameSizeHashes = sameSizeHashRes.hashes;
 
   // ---- 第四轮：目标端哈希（用于同尺寸疑似变更的判定） ----
   const dstHashEntries = sameSize
     .filter(({ src, dst }) => {
+      if (!sameSizeHashes.has(src.relPath)) return false;
       const memo = manifestFiles[src.relPath];
-      if (memo && memo.size === dst.size && memo.sha256) return false;
-      return !sameSizeHashes.has(src.relPath);
+      if (memo && memo.size === dst.size && memo.mtimeMs === dst.mtimeMs && memo.sha256) return false;
+      return true;
     })
     .map(({ dst }) => ({ key: dst.relPath, path: path.join(targetRoot, dst.relPath) }));
-  const dstHashes = await hashFiles(dstHashEntries, hashConcurrency(), (done, total) =>
+  const dstHashRes = await hashFilesDetailed(dstHashEntries, hashConcurrency(), (done, total) =>
     report('计算哈希', done, total),
   );
+  const dstHashes = dstHashRes.hashes;
   for (const { src, dst } of sameSize) {
     if (dstHashes.has(dst.relPath)) continue;
     const memo = manifestFiles[src.relPath];
-    if (memo && memo.size === dst.size && memo.sha256) {
+    if (memo && memo.size === dst.size && memo.mtimeMs === dst.mtimeMs && memo.sha256) {
       dstHashes.set(dst.relPath, memo.sha256);
     }
   }
+
+  const hashErrors: string[] = [
+    ...[...orphanHashRes.errors.entries()].map(([k, e]) => `目标孤儿读取失败 ${k}: ${e}`),
+    ...[...sourceHashRes.errors.entries()].map(([k, e]) => `源新增读取失败 ${k}: ${e}`),
+    ...[...sameSizeHashRes.errors.entries()].map(([k, e]) => `源比对读取失败 ${k}: ${e}`),
+    ...[...dstHashRes.errors.entries()].map(([k, e]) => `目标比对读取失败 ${k}: ${e}`),
+  ];
 
   // ---- 第五轮：改名配对 ----
   const orphanByHash = new Map<string, ScannedFile[]>();
@@ -280,9 +296,31 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
     });
   }
 
+  // 若某尺寸组存在源端新增哈希失败或目标孤儿自身哈希失败，禁止将该孤儿纳入删除，以免把改名文件误删
+  const unsafeOrphanSizes = new Set<number>();
+  for (const rel of sourceHashRes.errors.keys()) {
+    const f = srcFiles.get(rel);
+    if (f) unsafeOrphanSizes.add(f.size);
+  }
+  const srcLowerMap = CASE_INSENSITIVE_FS
+    ? new Map([...srcFiles.keys()].map((k) => [k.toLowerCase(), k]))
+    : null;
+
   let deleted = 0;
   for (const orphan of orphans) {
     if (consumedOrphans.has(orphan.relPath)) continue;
+    // 哈希计算失败的孤儿或所属尺寸桶配对不完整时，严禁静默删除
+    if (orphanHashRes.errors.has(orphan.relPath) || unsafeOrphanSizes.has(orphan.size)) {
+      continue;
+    }
+    // 大小写不敏感文件系统上，若源端存在仅大小写不同的文件（非改名配对而走新增拷贝），
+    // 不得单独生成一个 delete 动作，否则并发/延后 unlink 会抹掉刚复制的新文件。
+    if (srcLowerMap) {
+      const winner = srcLowerMap.get(orphan.relPath.toLowerCase());
+      if (winner && winner !== orphan.relPath && !renameByNewPath.has(winner)) {
+        continue;
+      }
+    }
     deleted++;
     actions.push({
       id: `delete:${orphan.relPath}`,
@@ -295,9 +333,18 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
     });
   }
 
+  const targetDirSet = new Set(
+    CASE_INSENSITIVE_FS ? target.dirs.map((d) => d.toLowerCase()) : target.dirs,
+  );
+  const missingDirs = source.dirs.filter((d) =>
+    !targetDirSet.has(CASE_INSENSITIVE_FS ? d.toLowerCase() : d),
+  );
+
   const skip = identical.length;
   const important = actions.filter((a) => a.type !== 'skip');
-  const ordered = [...important, ...identical].slice(0, MAX_ACTIONS);
+  const fullActions = [...important, ...identical];
+  const truncated = fullActions.length > MAX_PREVIEW_ACTIONS;
+  const previewActions = truncated ? fullActions.slice(0, MAX_PREVIEW_ACTIONS) : fullActions;
 
   // ---- 删除风险闸门 ----
   // 目标端文件远多于源端，通常意味着选错了源目录或目标目录。
@@ -313,7 +360,11 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
     : '';
 
   return {
-    actions: ordered,
+    actions: fullActions,
+    previewActions,
+    truncated,
+    missingDirs,
+    hashErrors,
     summary: {
       totalFiles: srcFiles.size,
       copy,

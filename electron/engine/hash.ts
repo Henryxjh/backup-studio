@@ -17,14 +17,20 @@ export async function hashFile(filePath: string): Promise<string> {
   return hash.digest('hex');
 }
 
-/** 计算一批文件的哈希，带并发上限，避免把磁盘打满成随机寻道。 */
-export async function hashFiles(
+export interface HashBatchResult {
+  hashes: Map<string, string>;
+  errors: Map<string, string>;
+}
+
+/** 计算一批文件的哈希并保留单文件失败信息，供规划器阻止未知孤儿误删。 */
+export async function hashFilesDetailed(
   entries: { key: string; path: string }[],
   concurrency: number,
   onProgress?: (done: number, total: number) => void,
-): Promise<Map<string, string>> {
-  const result = new Map<string, string>();
-  if (entries.length === 0) return result;
+): Promise<HashBatchResult> {
+  const hashes = new Map<string, string>();
+  const errors = new Map<string, string>();
+  if (entries.length === 0) return { hashes, errors };
 
   let cursor = 0;
   let done = 0;
@@ -36,9 +42,9 @@ export async function hashFiles(
       if (index >= entries.length) return;
       const entry = entries[index];
       try {
-        result.set(entry.key, await hashFile(entry.path));
-      } catch {
-        // 读不到的文件留给后续复制阶段报错，不在此处中断整轮规划
+        hashes.set(entry.key, await hashFile(entry.path));
+      } catch (err) {
+        errors.set(entry.key, err instanceof Error ? err.message : String(err));
       }
       done++;
       onProgress?.(done, entries.length);
@@ -46,5 +52,15 @@ export async function hashFiles(
   };
 
   await Promise.all(Array.from({ length: workerCount }, () => runOne()));
-  return result;
+  return { hashes, errors };
+}
+
+/** 计算一批文件的哈希，带并发上限，避免把磁盘打满成随机寻道。 */
+export async function hashFiles(
+  entries: { key: string; path: string }[],
+  concurrency: number,
+  onProgress?: (done: number, total: number) => void,
+): Promise<Map<string, string>> {
+  const { hashes } = await hashFilesDetailed(entries, concurrency, onProgress);
+  return hashes;
 }

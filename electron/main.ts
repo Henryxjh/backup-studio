@@ -15,6 +15,15 @@ const THEME_COLORS = {
   light: { background: '#f5f5f3', overlay: '#fcfcfb', symbol: '#4a4a46' },
 };
 
+function isSafeExternalUrl(raw: string): boolean {
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 function themeKey(): 'dark' | 'light' {
   return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
 }
@@ -40,7 +49,7 @@ function createWindow(): void {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
       spellcheck: false,
     },
   });
@@ -56,7 +65,9 @@ function createWindow(): void {
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    if (isSafeExternalUrl(url)) {
+      void shell.openExternal(url);
+    }
     return { action: 'deny' };
   });
 
@@ -164,6 +175,9 @@ function registerIpc(): void {
   });
 
   ipcMain.handle('app:open-external', async (_event, url: string) => {
+    if (!isSafeExternalUrl(url)) {
+      throw new Error('仅允许打开 http/https 外部链接');
+    }
     await shell.openExternal(url);
   });
 }
