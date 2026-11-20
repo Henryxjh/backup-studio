@@ -38,13 +38,21 @@ Backup Studio 是一个**高性能本地目录备份工具**。核心命题是�
 
 | 能力域 | 现状 | 关键实现位置 |
 | --- | --- | --- |
-| 目录扫描 | 源/目标并行 DFS 扫描；统计文件数、字节数、目录数、耗时、错误列表；跳过符号链接；排除元数据目录 `.backup-studio` | `electron/engine/scan.ts` |
+| 目录扫描 | 源/目标并行 DFS 扫描；统计文件数、字节数、目录数、耗时、错误列表；跳过符号链接；**目标端排除元数据目录 `.backup-studio`，源端保留同名用户目录** | `electron/engine/scan.ts` |
 | 元数据快判 | 目标端 manifest 记录 `size` / `mtimeMs` / `sha256` / `backedUpAt`；三者一致则零 I/O 跳过 | `electron/engine/manifest.ts`、`electron/engine/planner.ts` |
 | 哈希去重 | 并发 SHA-256 计算（并发数 `2..8`，随 CPU 核数自适应）；manifest 命中历史哈希时不再实算 | `electron/engine/hash.ts` |
 | 改名同步 | 源端新增文件按 size 分桶，与目标端孤儿文件做哈希配对；同名优先；命中即判定为改名，仅做元数据级移动，不重新拷贝 | `electron/engine/planner.ts`（改名配对轮） |
 | 差异判定分级 | 元数据一致 → 跳过；大小不同 → 直接判定变更；大小相同 → 哈希比对后才判定 | `electron/engine/planner.ts` |
 | 删除风险闸门 | 源端为空 / 孤儿占比 > 30% / 删除数 > max(100, 源文件数) 时挂起计划，要求用户显式二次确认 | `electron/engine/planner.ts`、`electron/engine/service.ts` |
-| 计划规模上限 | 计划动作上限 20000 条，超出截断，避免十万级文件打爆 IPC 通道 | `electron/engine/planner.ts` |
+| 计划规模上限 | **仅截断渲染层预览列表**（20000 条）；`actions` 保留全量并在后台完整执行，避免超大目录静默漏备或漏删 | `electron/engine/planner.ts` |
+| 失败不伪装成功 | 存在任一失败动作、规划期哈希读取失败或 manifest 写入失败时，状态置为「失败」并保留活动断点与 `.part` 分片供后续恢复，**禁止进入 completed** | `electron/engine/service.ts` |
+| 误删防护 | 孤儿文件哈希读取失败、或同尺寸源文件读取失败时，该孤儿**不生成删除动作**；大小写不敏感文件系统上仅大小写变化的文件不单独生成删除动作 | `electron/engine/planner.ts` |
+| 执行顺序 | 改名 → 补建目录 → 复制/更新 → **等待全部落盘** → 删除/归档；删除阶段必须排在全部复制彻底落盘之后，否则大小写不敏感文件系统上的延后 `unlink` 会抹掉刚复制的新文件 | `electron/engine/service.ts` |
+| 断点不丢失 | `recover()` 不提前清除 `active.json`，只有新计划生成并进入 `start()` 写入新 jobId 后才替换旧断点指针；任一步失败均保留原断点 | `electron/engine/service.ts`、`electron/engine/journal.ts` |
+| 分片命名 | `.part` 临时文件名后缀改用相对路径 SHA-256 前 24 位十六进制（96 bit），消除大批量文件下的命名碰撞 | `electron/engine/journal.ts` |
+| 目录边界校验 | 源目录与目标目录同路径、或互为父子嵌套时直接拒绝，防止递归备份与镜像删除互相冲突 | `electron/engine/service.ts` |
+| 空目录与源端元数据目录 | 源端新增空目录同步到目标端；源端同名 `.backup-studio` 用户目录**不再被跳过**（仅目标端排除元数据目录） | `electron/engine/planner.ts`、`electron/engine/scan.ts` |
+| 复制线程自愈 | worker `error` / 异常退出时终止旧线程、回调当前任务失败并重建槽位，避免池任务永久挂起 | `electron/engine/pool.ts` |
 | 多线程复制 | `worker_threads` 池，线程数 `max(2, min(8, cpus-1))`；先写 `.part` 临时件再 `rename` 原子落盘 | `electron/engine/pool.ts`、`electron/engine/copyWorker.ts` |
 | 完整性校验 | 落盘后 `fsync` → 回读整份文件重算 SHA-256 比对；校验失败返回 `VERIFY_FAILED` 并**保留临时件**，不再整份重传 | `electron/engine/copyWorker.ts` |
 | 断点续传 | **分片级续传**：默认 1 MiB 分片，逐片比对目标 `.part` 与源文件的 SHA-256，只重写损坏/截断/缺失分片；整文件回读校验通过才原子 rename 提交。journal 持久化任务级 `copiedBytes` / `status`，落盘间隔 400ms | `electron/engine/copyWorker.ts`、`electron/engine/journal.ts`、`electron/engine/service.ts` |
@@ -769,7 +777,7 @@ REQ-AUT-001 决策项 3 明确：本期**不做**开机自启、托盘常驻或�
 
 **实测取证与自动化回放**：两轮拔盘后，Generic Flash Disk（E:、USB、MBR、NTFS、29.49 GB）的 `Get-Volume` 为 `Warning / Full Repair Needed`，`fsutil dirty query` 为 `Dirty`；同盘 `Get-PhysicalDisk` 报 `Healthy`，`Get-StorageReliabilityCounter` 返回 Access denied；`Get-Disk` 为 `Online / IsOffline=False / IsReadOnly=False`。2026-11-20 09:00:52 至 10:19:43，系统日志有 33 条 `disk` Event 51（`\Device\Harddisk1\DR12/DR14`，paging operation），没有 Event 7 或 153。孤立 Event 51 不作为物理故障结论。注入执行器回放卷级和权限证据，验证得到 **L1 只读、文件系统需人工检查、SMART 能力缺失**；没有访问该 E: 盘、读取其事件日志或运行修复。
 
-**验收边界**：`typecheck`（三套配置）、`build:electron`、`test:engine`（35/35，新增 11 项）、`build` 与 `git diff --check` 通过。测试覆盖只读探测、MBR/GPT 校验、确认与镜像顺序、隔离撤销、权限和矩阵。实际 Windows 原始设备镜像、高权限可靠性采集及 Linux/macOS 的原始文件系统诊断未真机验收。
+**验收边界**：`typecheck`（三套配置）、`build:electron`、`test:engine`（35/35，新增 11 项）、`build` 与 `git diff --check` 通过。测试覆盖只读探测、MBR/GPT 校验、确认与镜像顺序、隔离撤销、权限和矩阵。实际 Windows 原始设备镜像、高权限可靠性采集及 Linux/macOS 的原始文件系统诊断未真机验收。（合并 PR #1 后引擎测试为 42/42，见 §6 变更记录）
 
 ## 4. 已取消需求
 
@@ -834,3 +842,4 @@ REQ-AUT-001 决策项 3 明确：本期**不做**开机自启、托盘常驻或�
 | 2026-11-20 | REQ-AUT-001 九项风险决策收口（见 `REQUIREMENTS-002-AUTO-SYNC.md` §11.1）并开工 P0：默认不删除、不覆盖冲突，回收站与 `mirror-archive` 归档目录隔离，实时监听自研 `fs.watch` 保持零运行时依赖；决策项 3 另立 REQ-AUT-002《开机自启与托盘常驻》并在 §3 登记。自动备份面板接入主界面，IPC 走 `aut:*` 通道，写入许可由容灾闸门裁决 | REQ-AUT-001、REQ-AUT-002 |
 | 2026-11-20 | 扩充测试入口与 CI：`npm run test` 一次跑完引擎、自动同步、写入闸门三套用例，`ci.yml` 同步增加两个测试步骤；`.gitignore` 补测试夹具与工具缓存目录，避免测试残留进入提交 | 全文 |
 | 2026-11-20 | **CI 首次实际执行并通过**：推送 `13f07be` 触发 `ci.yml`（run `44669726782`，ubuntu-latest），全步骤 success——checkout → setup-node → install → typecheck → build renderer → build electron → 引擎测试 → 自动同步测试 → 写入闸门测试；上一提交 `078d7a4` 的运行同样通过。REQ-PKG-001 状态由「待实现」改为「进行中」，§3.18 快照同步；`release.yml` 的 tag 发布链路仍未验证 | REQ-PKG-001 |
+| 2026-11-20 | **合并外部 PR #1**（`FuRongJun-1999`，分支 `fix/stability-security-reliability`，提交 `0e85483`，9 文件 +498/-111）。审阅后确认其修复均为真实缺陷、且不与 V2.0 硬约束冲突，逐条采纳：①动作上限 20000 从「截断执行」改为「仅截断预览」，后台全量执行；②部分失败/哈希读取失败/清单写入失败不再伪装为 `completed`，改置「失败」并保留断点与 `.part`；③孤儿哈希失败禁止生成删除动作；④删除阶段移到全部复制彻底落盘之后，修 Windows 大小写竞态误删；⑤`recover()` 不提前清除 `active.json`，重扫失败亦不丢断点；⑥`.part` 命名改用 SHA-256 前 24 位（96 bit）消除碰撞；⑦worker 崩溃自愈；⑧源/目标同路径与父子嵌套拦截；⑨Electron `sandbox: true` 与外链协议白名单；⑩高风险确认按钮需点两次的闭包缺陷修复。合并冲突 2 处（`service.ts` 中断守卫位置与 `fromRecovery` 豁免、`engine.test.ts` 双方新增用例并存），`main.ts` 与 `App.tsx` 自动合并。容灾链路逐条复核未被削弱：用户确认、只读探测、身份漂移、L2 隔离、旧计划立即失效、重扫仍在，写入闸门未被绕过。引擎测试 35 → **42/42**，三套合计 **60 项**全绿；`typecheck`、`build` 通过。同步 §2 基线与 README 口径 | REQ-ENG-001、REQ-AUT-001 |
