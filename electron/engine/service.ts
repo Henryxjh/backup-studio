@@ -6,7 +6,8 @@ import { randomUUID } from 'node:crypto';
 import { inspectHealth, preflightImage } from './health';
 import { rehearseRepair } from './repair';
 import { driveLetter, redactLog } from './security';
-import { writeJsonAtomic } from './manifest';
+import { BackupTransaction } from './transaction';
+import { hashFile } from './hash';
 import { scanTree, META_DIR } from './scan';
 import { buildPlan, type PlanResult } from './planner';
 import { CopyPool, type CopyResult } from './pool';
@@ -18,11 +19,13 @@ import {
   type MediaProbe,
 } from './media';
 import {
-  historyDir,
+  createDurableDirectory,
+  manifestPath,
   metaDir,
   partsDir,
   readManifest,
-  writeManifest,
+  syncDirectory,
+  writeJsonAtomic,
   type Manifest,
   type ManifestEntry,
 } from './manifest';
@@ -90,8 +93,6 @@ export interface StartOptions {
   allowMassDelete: boolean;
   /** 断点续传：校验并复用未完成任务的 .part 分片 */
   resume: boolean;
-  /** 内部恢复流程已通过确认与重扫 */
-  fromRecovery?: boolean;
 }
 
 /** 恢复选项：用户确认后才允许继续写入 */
@@ -130,6 +131,10 @@ export class BackupService extends EventEmitter {
   private mediaLost = false;
   private journalDirty = false;
   private currentJob: Journal | null = null;
+  private transaction: BackupTransaction | null = null;
+  private journalFlush: Promise<void> | null = null;
+  private readonly copyCallbacks = new Set<Promise<void>>();
+  private copyCallbackFailure: string | null = null;
   private currentPlan: PlanResult | null = null;
   private plannedMedia: MediaIdentity | null = null;
   /**
@@ -369,10 +374,7 @@ export class BackupService extends EventEmitter {
     const job = await this.journal.getActive();
     if (!job) return null;
     const unfinished = Object.values(job.tasks).filter((t) => t.status !== 'done');
-    if (unfinished.length === 0) {
-      await this.journal.clearActive();
-      return null;
-    }
+    if (!job.transaction && !job.interruption && unfinished.length === 0) return null;
     return {
       jobId: job.jobId,
       sourceRoot: job.sourceRoot,
@@ -389,6 +391,10 @@ export class BackupService extends EventEmitter {
   }
 
   async start(options: StartOptions): Promise<void> {
+    return this.startPlanned(options);
+  }
+
+  private async startPlanned(options: StartOptions, recovering?: Journal): Promise<void> {
     if (this.running) throw new Error('已有备份任务正在执行');
 
     const { sourceRoot, targetRoot, syncMode } = options;
@@ -407,27 +413,25 @@ export class BackupService extends EventEmitter {
       throw new Error('该介质处于隔离观察状态，已禁止写入。请先撤销隔离再继续。');
     }
 
-    const previous = await this.journal.getActive();
-    if (previous?.interruption && previous.targetRoot === targetRoot && !options.fromRecovery) {
-      // 中断后必须先由用户确认恢复或经过显式恢复入口：旧计划里的删除动作一律作废
-      throw new Error('检测到上次中断记录，请通过「恢复并重扫」确认后继续，避免沿用过期计划。');
-    }
-
     this.running = true;
-    try {
-      await this.guardTargetWrites(targetRoot);
-    } catch (error) {
-      this.running = false;
-      throw error;
-    }
     this.cancelled = false;
     this.mediaLost = false;
+    this.currentJob = null;
+    this.transaction = null;
+    this.journalDirty = false;
+    this.copyCallbackFailure = null;
+    try {
+    const previous = await this.journal.getActive();
+    if (recovering ? previous?.jobId !== recovering.jobId : previous &&
+        (previous.transaction || previous.interruption || Object.values(previous.tasks).some((t) => t.status !== 'done'))) {
+      throw new Error('检测到上次中断记录，请通过「恢复并重扫」确认后继续。');
+    }
+    await this.guardTargetWrites(targetRoot);
     this.ioErrors = 0;
     this.verifyFailures = 0;
     this.copiedBytes = 0;
     this.startedAt = now();
 
-    try {
     // 写入前最后一次只读确认：身份一致且可写才允许开写
     const probe = await probeMedia(targetRoot);
     this.lastProbe = probe;
@@ -441,10 +445,9 @@ export class BackupService extends EventEmitter {
       throw new Error('目标介质为只读，无法写入');
     }
 
-    const jobId = randomUUID();
-    const journal: Journal = {
+    const journal: Journal = recovering?.transaction ? recovering : {
       version: 1,
-      jobId,
+      jobId: randomUUID(),
       sourceRoot,
       targetRoot,
       syncMode,
@@ -453,20 +456,27 @@ export class BackupService extends EventEmitter {
       txSeq: 0,
       committedTx: 0,
       mediaIdentity: identity,
-      tasks: {},
+      transaction: 'pending',
+      tasks: Object.create(null),
     };
+    this.state.jobId = journal.jobId;
+    this.transaction = new BackupTransaction(targetRoot, journal.jobId, () => this.assertTargetWritable());
+    // A crash after publishing the manifest needs only cleanup, never a replay.
+    if (recovering?.transaction && (await readManifest(targetRoot))?.generation === journal.jobId) {
+      await syncDirectory(metaDir(targetRoot));
+      await this.finishCommitted(targetRoot, journal);
+      this.running = false;
+      this.setPhase('completed');
+      return;
+    }
+    await this.assertTargetWritable();
     await this.journal.write(journal);
-    await this.journal.setActive(jobId);
+    if (journal !== recovering) await this.journal.setActive(journal.jobId);
     this.currentJob = journal;
     this.pendingTasks.clear();
-    this.state.jobId = jobId;
-    this.state.sourceRoot = sourceRoot;
-    this.state.targetRoot = targetRoot;
-    this.state.syncMode = syncMode;
 
-    // 元数据目录创建属于「写入阶段」，必须放在可写性确认之后
-    await fs.mkdir(metaDir(targetRoot), { recursive: true });
-    await fs.mkdir(partsDir(targetRoot), { recursive: true });
+    await createDurableDirectory(partsDir(targetRoot), path.resolve(targetRoot));
+    await this.transaction.preserveManifest();
 
     this.setMedia('online');
     this.setPhase('running');
@@ -481,8 +491,8 @@ export class BackupService extends EventEmitter {
       poolSize,
       {
         onProgress: (id, bytes) => this.onCopyProgress(id, bytes),
-        onDone: (result) => void this.onCopyDone(result),
-        onError: (id, err) => void this.onCopyError(id, err.message, err.code),
+        onDone: (result) => this.trackCopyCallback(this.onCopyDone(result)),
+        onError: (id, err) => this.trackCopyCallback(this.onCopyError(id, err.message, err.code)),
       },
     );
 
@@ -505,8 +515,9 @@ export class BackupService extends EventEmitter {
    * 直接沿用会误删。
    */
   async recover(options: RecoverOptions): Promise<void> {
+    if (this.running || this.diagnosing) throw new Error('已有备份或检测正在进行');
     const job = await this.journal.getActive();
-    if (!job?.interruption) {
+    if (!job || (!job.transaction && !job.interruption && Object.values(job.tasks).every((t) => t.status === 'done'))) {
       throw new Error('没有可恢复的中断任务');
     }
     if (!options.confirmed) {
@@ -518,8 +529,15 @@ export class BackupService extends EventEmitter {
     if (!probe.reachable) {
       throw new Error(`目标介质仍不可用：${probe.errorText ?? '未知错误'}`);
     }
-    if (job.mediaIdentity && probe.identity && !sameMedia(job.mediaIdentity, probe.identity)) {
+    if (!probe.writable) throw new Error('目标介质为只读，无法恢复');
+    if (job.mediaIdentity && !sameMedia(job.mediaIdentity, probe.identity)) {
       throw new Error('目标路径指向了另一块介质，已禁止续传以免写错设备');
+    }
+    if (job.quarantine && !job.quarantine.released && !this.state.quarantine?.released) {
+      this.currentJob = job;
+      this.state.quarantine = job.quarantine;
+      this.setMedia('quarantined');
+      throw new Error('该介质处于隔离观察状态，已禁止写入。');
     }
 
     const assessment = await this.assessTarget(job.targetRoot);
@@ -531,24 +549,47 @@ export class BackupService extends EventEmitter {
     if (this.blockedTargets.has(await this.targetRiskKey(job.targetRoot))) {
       throw new Error('卷需人工检查，仍须保持只读；中断账本已保留。');
     }
+    if (job.transaction && (await readManifest(job.targetRoot))?.generation === job.jobId) {
+      this.running = true;
+      this.cancelled = false;
+      this.mediaLost = false;
+      try {
+        this.state.sourceRoot = job.sourceRoot;
+        this.state.targetRoot = job.targetRoot;
+        this.state.syncMode = job.syncMode;
+        this.state.jobId = job.jobId;
+        this.expectedMedia = probe.identity;
+        this.currentJob = job;
+        this.transaction = new BackupTransaction(job.targetRoot, job.jobId, () => this.assertTargetWritable());
+        await this.guardTargetWrites(job.targetRoot);
+        await this.assertTargetWritable();
+        await syncDirectory(metaDir(job.targetRoot));
+        await this.finishCommitted(job.targetRoot, job);
+        this.setPhase('completed');
+      } finally {
+        this.running = false;
+      }
+      return;
+    }
     this.log('info', '开始恢复备份：正在重新扫描并生成新计划');
 
-    // 不提前清除 active.json：只有新计划生成并进入 start() 写入新 jobId 后才替换，
-    // 确保 plan/start 任一步失败时仍保留原有断点指针不丢失。
+    // Pending transactions keep their original id and history; legacy jobs still replan.
     this.currentJob = null;
     this.currentPlan = null;
     this.plannedMedia = null;
     this.state.phase = 'idle';
     await this.plan(job.sourceRoot, job.targetRoot, job.syncMode);
+    if (job.mediaIdentity && !sameMedia(job.mediaIdentity, this.plannedMedia)) {
+      throw new Error('恢复扫描期间目标介质身份已变化');
+    }
 
-    await this.start({
+    await this.startPlanned({
       sourceRoot: job.sourceRoot,
       targetRoot: job.targetRoot,
       syncMode: job.syncMode,
       allowMassDelete: false,
       resume: true,
-      fromRecovery: true,
-    });
+    }, job);
   }
 
   /** 诊断与镜像只对当前目录开放，与备份写入互斥。 */
@@ -752,9 +793,10 @@ export class BackupService extends EventEmitter {
       }
 
       // 同步源端新增目录结构（含空目录）
+      let directoryFailures = 0;
       for (const relDir of plan.missingDirs) {
         if (this.mediaLost || this.cancelled) break;
-        await this.ensureTargetDir(relDir);
+        if (!(await this.ensureTargetDir(relDir))) directoryFailures += 1;
       }
 
       // 第二步：复制与更新，并等待所有工作线程落盘完毕
@@ -764,63 +806,53 @@ export class BackupService extends EventEmitter {
       }
       await this.waitForCompletion();
 
-      // 第三步：删除与归档（必须在所有复制彻底落盘之后执行，避免 Windows 大小写竞态误删新写入文件）
-      // 删除前及循环中必须实时确认介质健康与未取消
-      if (!this.mediaLost && !this.cancelled) {
-        for (const action of actions.filter((a) => a.type === 'delete')) {
-          if (this.mediaLost || this.cancelled) break;
-          await this.performDelete(action);
-        }
+      const reasons: string[] = [];
+      if (this.copyCallbackFailure) reasons.push(this.copyCallbackFailure);
+      if (directoryFailures) reasons.push(`${directoryFailures} 个目录创建失败`);
+      if (plan.hashErrors.length) reasons.push(`${plan.hashErrors.length} 个文件规划期读取失败`);
+      if (actions.some((a) => a.type !== 'delete' && a.status !== 'done')) reasons.push('前置文件操作未完成');
+      if (reasons.length) throw new Error(reasons.join('，'));
+      await this.assertTargetWritable();
+      this.stopJournalFlush();
+      await this.journalFlush;
+      await this.flushJournal(true, true);
+      const manifest = await this.buildManifest(options.targetRoot, plan, this.currentJob!.jobId);
+
+      for (const action of actions.filter((a) => a.type === 'delete')) {
+        await this.assertTargetWritable();
+        await this.performDelete(action);
+        if (action.status === 'failed') throw new Error(`删除未完成：${action.relPath}`);
       }
 
-      const failedActions = actions.filter((a) => a.status === 'failed');
-      if (this.mediaLost) {
-        // 中断路径：不写清单、不清账本，保留断点供恢复
-        this.setPhase('interrupted');
-        this.log('warn', '备份因介质中断而停止，断点已保存在本机');
-      } else if (this.cancelled) {
-        this.setPhase('cancelled');
-        this.log('warn', '备份已取消');
-      } else {
-        const manifestOk = await this.finalize(options, failedActions.length > 0);
-        if (failedActions.length > 0 || !manifestOk || plan.hashErrors.length > 0) {
-          const reasons: string[] = [];
-          if (failedActions.length > 0) reasons.push(`${failedActions.length} 个文件操作失败`);
-          if (plan.hashErrors.length > 0) reasons.push(`${plan.hashErrors.length} 个文件规划期读取失败`);
-          if (!manifestOk) reasons.push('写入清单失败');
-          if (this.currentJob) {
-            this.currentJob.interruption = {
-              at: now(),
-              reason: `备份未完全成功：${reasons.join('，')}`,
-              activeFiles: failedActions.map((a) => a.relPath),
-              committedTasks: Object.values(this.currentJob.tasks).filter((t) => t.status === 'done').length,
-            };
-            await this.flushJournal(true);
-            this.state.recoverableJob = await this.findRecoverableJob();
-          }
-          this.setPhase('failed');
-          this.log('error', `备份未完全成功（${reasons.join('，')}），已保留恢复记录`);
-        } else {
-          this.setPhase('completed');
-          this.log('success', '备份完成');
-        }
-      }
+      await this.finalize(options, manifest);
+      this.setPhase('completed');
+      this.log('success', '备份完成');
     } catch (err) {
-      this.setPhase('failed');
-      this.log('error', `备份失败：${errorText(err)}`);
-    } finally {
-      this.running = false;
       this.stopMediaMonitor();
       this.stopJournalFlush();
-      if (this.pool) {
-        await this.pool.destroy();
-        this.pool = null;
+      await this.pool?.destroy();
+      this.pool = null;
+      await Promise.allSettled(this.copyCallbacks);
+      const failed = actions.filter((a) => a.status === 'failed');
+      if (this.currentJob && !this.currentJob.interruption) {
+        this.currentJob.interruption = {
+          at: now(),
+          reason: errorText(err),
+          activeFiles: [...new Set([...failed.map((a) => a.relPath), ...this.pendingTasks.keys()])],
+          committedTasks: Object.values(this.currentJob.tasks).filter((t) => t.status === 'done').length,
+        };
       }
-      await this.flushJournal();
-      // 只有完全成功结束或主动取消才清除活动任务指针；中断/部分失败时保留，供下次恢复
-      if (this.state.phase === 'completed' || this.state.phase === 'cancelled') {
-        await this.journal.clearActive();
-      }
+      await this.journalFlush;
+      await this.flushJournal(true);
+      this.state.recoverableJob = await this.findRecoverableJob();
+      this.setPhase(this.mediaLost ? 'interrupted' : this.cancelled ? 'cancelled' : 'failed');
+      this.log('warn', `备份未提交，已保留恢复记录：${errorText(err)}`);
+    } finally {
+      this.stopMediaMonitor();
+      this.stopJournalFlush();
+      await this.pool?.destroy();
+      this.pool = null;
+      this.running = false;
       this.emitState();
     }
   }
@@ -860,8 +892,8 @@ export class BackupService extends EventEmitter {
       },
       {
         onProgress: (id, copiedBytes) => this.onCopyProgress(id, copiedBytes),
-        onDone: (result) => void this.onCopyDone(result),
-        onError: (id, error) => void this.onCopyError(id, error.message, error.code),
+        onDone: (result) => this.trackCopyCallback(this.onCopyDone(result)),
+        onError: (id, error) => this.trackCopyCallback(this.onCopyError(id, error.message, error.code)),
       },
     );
   }
@@ -913,6 +945,14 @@ export class BackupService extends EventEmitter {
     });
   }
 
+  private trackCopyCallback(work: Promise<void>): void {
+    const tracked = work.catch((err) => {
+      this.copyCallbackFailure = errorText(err);
+    });
+    this.copyCallbacks.add(tracked);
+    void tracked.then(() => this.copyCallbacks.delete(tracked));
+  }
+
   private async onCopyDone(result: CopyResult): Promise<void> {
     const { id: relPath, sha256, bytes } = result;
     const task = this.pendingTasks.get(relPath);
@@ -923,11 +963,8 @@ export class BackupService extends EventEmitter {
     const finalPath = path.join(targetRoot, relPath);
 
     try {
-      const committed = await this.commitToTarget(task.partPath, finalPath);
-      if (!committed) {
-        await this.handleMediaLoss(`目标端路径在写入过程中消失：${finalPath}`);
-        return;
-      }
+      await this.transaction!.preserveTarget(finalPath);
+      await this.commitToTarget(task.partPath, finalPath);
     } catch (err) {
       const code = errorCode(err);
       if (code && MEDIA_ERROR_CODES.has(code)) {
@@ -963,18 +1000,13 @@ export class BackupService extends EventEmitter {
    *
    * 返回 false 表示目标根已不可达（介质掉线），调用方必须停止写入。
    */
-  private async commitToTarget(srcPath: string, destPath: string): Promise<boolean> {
-    try {
-      await fs.rename(srcPath, destPath);
-      return true;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-      // 父目录缺失：先复核目标根是否还可达，介质掉线时不得重建目录
-      if (!(await this.checkMediaAlive())) return false;
-      await fs.mkdir(path.dirname(destPath), { recursive: true });
-      await fs.rename(srcPath, destPath);
-      return true;
-    }
+  private async commitToTarget(srcPath: string, destPath: string): Promise<void> {
+    await this.assertTargetWritable();
+    await createDurableDirectory(path.dirname(destPath), path.resolve(this.state.targetRoot));
+    await this.assertTargetWritable();
+    await fs.rename(srcPath, destPath);
+    await syncDirectory(path.dirname(destPath));
+    if (path.dirname(srcPath) !== path.dirname(destPath)) await syncDirectory(path.dirname(srcPath));
   }
 
   private async onCopyError(relPath: string, message: string, code?: string): Promise<void> {
@@ -1030,23 +1062,20 @@ export class BackupService extends EventEmitter {
     this.updateThroughput();
   }
 
-  private async ensureTargetDir(relDir: string): Promise<void> {
+  private async ensureTargetDir(relDir: string): Promise<boolean> {
     const targetRoot = this.state.targetRoot;
-    if (!targetRoot) return;
-    if (!(await this.checkMediaAlive())) {
-      await this.handleMediaLoss('目标目录在同步目录结构期间不可达');
-      return;
-    }
     try {
-      await fs.mkdir(path.join(targetRoot, relDir), { recursive: true });
+      await this.assertTargetWritable();
+      await createDurableDirectory(path.join(targetRoot, relDir), path.resolve(targetRoot));
+      return true;
     } catch (err) {
       const code = errorCode(err);
       if (code && MEDIA_ERROR_CODES.has(code)) {
         this.ioErrors += 1;
         await this.handleMediaLoss(errorText(err));
-        return;
       }
       this.log('warn', `创建目录失败：${relDir} — ${errorText(err)}`);
+      return false;
     }
   }
 
@@ -1055,11 +1084,9 @@ export class BackupService extends EventEmitter {
     const from = path.join(targetRoot, action.fromRelPath ?? '');
     const to = path.join(targetRoot, action.relPath);
     try {
-      const committed = await this.commitToTarget(from, to);
-      if (!committed) {
-        await this.handleMediaLoss(`目标端路径在改名过程中消失：${to}`);
-        return;
-      }
+      await this.transaction!.preserveTarget(from);
+      await this.transaction!.preserveTarget(to);
+      await this.commitToTarget(from, to);
       this.updateAction(action.id, { status: 'done' });
       this.log('success', `改名同步：${action.fromRelPath} → ${action.relPath}`);
     } catch (err) {
@@ -1078,17 +1105,13 @@ export class BackupService extends EventEmitter {
     const targetRoot = this.state.targetRoot;
     const target = path.join(targetRoot, action.relPath);
     try {
+      await this.transaction!.preserveTarget(target);
+      await this.assertTargetWritable();
+      await fs.unlink(target);
+      await syncDirectory(path.dirname(target));
       if (this.state.syncMode === 'mirror-archive') {
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const archive = path.join(historyDir(targetRoot), stamp, action.relPath);
-        const committed = await this.commitToTarget(target, archive);
-        if (!committed) {
-          await this.handleMediaLoss(`目标端路径在归档过程中消失：${target}`);
-          return;
-        }
         this.updateAction(action.id, { status: 'archived', note: '已归档至历史目录' });
       } else {
-        await fs.unlink(target);
         this.updateAction(action.id, { status: 'done' });
       }
     } catch (err) {
@@ -1146,23 +1169,9 @@ export class BackupService extends EventEmitter {
 
     if (probe.reachable) {
       this.probeFailures = 0;
-      if (this.mediaLost) {
-        // 同一路径可能已经插入了**另一块设备**。身份漂移不能当作「介质恢复」，
-        // 否则后续会把数据写到错误的设备上。此时按身份漂移处置，禁止写入。
-        if (this.expectedMedia && probe.identity && !sameMedia(this.expectedMedia, probe.identity)) {
-          this.mediaLost = false;
-          this.setMedia('quarantined');
-          this.log('error', '目标路径指向了另一块介质（身份漂移），已禁止继续写入，请重新选择目标目录');
-          this.state.phase = 'interrupted';
-          this.emitState();
-          return;
-        }
-        this.mediaLost = false;
-        this.setMedia('online');
-        // 不自动续传：介质回来后必须由用户重新扫描并确认
-        this.log('success', '备份介质已重新接入。请重新扫描并确认后继续备份');
-        this.state.phase = 'interrupted';
-        this.emitState();
+      // Once interrupted, this run remains stopped even if the same device returns.
+      if (!this.mediaLost && this.expectedMedia && !sameMedia(this.expectedMedia, probe.identity)) {
+        await this.handleMediaLoss('目标路径指向了另一块介质，已禁止继续写入');
       }
       return;
     }
@@ -1172,6 +1181,21 @@ export class BackupService extends EventEmitter {
     if (!this.mediaLost && this.probeFailures >= MEDIA_LOSS_THRESHOLD) {
       await this.handleMediaLoss(probe.errorText ?? '目标根不可读');
     }
+  }
+
+  /** Every destructive boundary rechecks accessibility, write permission and identity. */
+  private async assertTargetWritable(): Promise<void> {
+    if (this.cancelled) throw new Error('备份已取消');
+    if (this.mediaLost) throw new Error('目标介质不可用');
+    const probe = await probeMedia(this.state.targetRoot);
+    this.lastProbe = probe;
+    if (this.cancelled) throw new Error('备份已取消');
+    if (!probe.reachable || !sameMedia(this.expectedMedia, probe.identity)) {
+      if (this.currentJob) await this.handleMediaLoss('目标介质不可达或身份已变化');
+      throw new Error('目标介质不可达或身份已变化');
+    }
+    if (!probe.writable) throw new Error('目标介质为只读，已停止写入');
+    if (this.mediaLost) throw new Error('目标介质不可用');
   }
 
   /** 只读探测目标根是否仍然可达 */
@@ -1230,7 +1254,7 @@ export class BackupService extends EventEmitter {
   private waitForCompletion(): Promise<void> {
     return new Promise((resolve) => {
       const check = () => {
-        if (!this.running) {
+        if (!this.running || this.copyCallbackFailure) {
           resolve();
           return;
         }
@@ -1261,61 +1285,46 @@ export class BackupService extends EventEmitter {
     });
   }
 
-  private async finalize(options: StartOptions, hasFailure: boolean): Promise<boolean> {
-    const targetRoot = options.targetRoot;
-    const manifest = await this.updateManifest(targetRoot);
-    let manifestOk = true;
-    await writeManifest(targetRoot, manifest).catch((err) => {
-      manifestOk = false;
-      this.log('error', `写入清单失败：${errorText(err)}`);
-    });
-    if (this.currentJob) {
-      await this.journal.write(this.currentJob);
-    }
-    // 只有全部动作成功且清单已写入时才清理 .part 临时目录；失败/未完成时保留已拷贝分片供下次续传
-    if (!hasFailure && manifestOk) {
-      await fs.rm(partsDir(targetRoot), { recursive: true, force: true }).catch(() => undefined);
-    }
-    return manifestOk;
+  private async finishCommitted(targetRoot: string, job: Journal): Promise<void> {
+    await this.assertTargetWritable();
+    if (job.syncMode !== 'mirror-archive') await this.transaction!.cleanup();
+    await this.assertTargetWritable();
+    await fs.rm(partsDir(targetRoot), { recursive: true, force: true });
+    await syncDirectory(metaDir(targetRoot));
+    await this.journal.clearActive(job.jobId);
+    this.state.recoverableJob = null;
   }
 
-  private async updateManifest(targetRoot: string): Promise<Manifest> {
-    const manifest = (await readManifest(targetRoot)) ?? {
-      version: 1 as const,
-      sourceRoot: this.state.sourceRoot,
-      updatedAt: now(),
-      files: {},
-    };
-    const files: Record<string, ManifestEntry> = { ...manifest.files };
-    const sourceActions = this.currentPlan?.actions ?? this.state.actions;
+  private async finalize(options: StartOptions, manifest: Manifest): Promise<void> {
+    const job = this.currentJob!;
+    await this.assertTargetWritable();
+    await writeJsonAtomic(manifestPath(options.targetRoot), manifest, {
+      createDirs: false,
+      beforeRename: () => this.assertTargetWritable(),
+    });
+    await this.finishCommitted(options.targetRoot, job);
+  }
 
-    for (const action of sourceActions) {
-      if (action.type !== 'copy' && action.type !== 'update' && action.type !== 'rename') continue;
-      if (action.status !== 'done' && action.status !== 'archived') continue;
-      try {
-        const stat = await fs.stat(path.join(targetRoot, action.relPath));
-        files[action.relPath] = {
-          size: stat.size,
-          mtimeMs: stat.mtimeMs,
-          sha256: action.sha256 ?? '',
-          backedUpAt: now(),
-        };
-      } catch {
-        // 目标端读取失败时保留旧记录
+  private async buildManifest(targetRoot: string, plan: PlanResult, generation: string): Promise<Manifest> {
+    const previous = await readManifest(targetRoot);
+    const files: Record<string, ManifestEntry> = Object.create(null);
+    for (const action of plan.actions) {
+      if (action.type === 'delete') continue;
+      const target = path.join(targetRoot, action.relPath);
+      const stat = await fs.stat(target);
+      const cached = previous?.files[action.relPath];
+      if (action.type === 'skip' && cached?.sha256 && stat.size === cached.size && stat.mtimeMs === cached.mtimeMs) {
+        files[action.relPath] = cached;
+        continue;
       }
+      files[action.relPath] = {
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        sha256: action.sha256 ?? await hashFile(target),
+        backedUpAt: now(),
+      };
     }
-
-    // 被删除的文件从清单中移除
-    for (const action of sourceActions) {
-      if (action.type === 'delete' && (action.status === 'done' || action.status === 'archived')) {
-        delete files[action.relPath];
-      }
-    }
-
-    manifest.files = files;
-    manifest.sourceRoot = this.state.sourceRoot;
-    manifest.updatedAt = now();
-    return manifest;
+    return { version: 1, sourceRoot: this.state.sourceRoot, generation, updatedAt: now(), files };
   }
 
   // ---- 账本落盘 ----
@@ -1338,7 +1347,19 @@ export class BackupService extends EventEmitter {
     }
   }
 
-  private async flushJournal(force = false): Promise<void> {
+  private async flushJournal(force = false, strict = false): Promise<void> {
+    if (this.journalFlush) {
+      await this.journalFlush;
+      if (!force) return;
+    }
+    const flush = this.writeJournalProgress(force, strict);
+    this.journalFlush = flush;
+    try { await flush; } finally {
+      if (this.journalFlush === flush) this.journalFlush = null;
+    }
+  }
+
+  private async writeJournalProgress(force: boolean, strict: boolean): Promise<void> {
     if (!this.currentJob) return;
     if (!this.journalDirty && !force) return;
     this.journalDirty = false;
@@ -1355,6 +1376,7 @@ export class BackupService extends EventEmitter {
       }
     } catch (err) {
       this.journalDirty = true;
+      if (strict) throw err;
       if (force) {
         this.log('error', `本机断点账本落盘失败，续传进度可能丢失：${errorText(err)}`);
       }

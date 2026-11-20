@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { writeJsonAtomic } from './manifest';
+import { syncDirectory, writeJsonAtomic } from './manifest';
 import type { MediaIdentity, QuarantineMark, SyncMode } from '../../shared/types';
 
 /**
@@ -48,6 +48,8 @@ export interface Journal {
   committedTx: number;
   /** 计划阶段锁定的介质身份 */
   mediaIdentity?: MediaIdentity;
+  /** 本机意图在首次目标写入前持久化，复制状态不能代表清单已提交。 */
+  transaction?: 'pending';
   /** 中断标记 */
   interruption?: JournalInterruption;
   /** 隔离观察标记 */
@@ -114,20 +116,30 @@ export class JournalStore {
   }
 
   async getActive(): Promise<Journal | null> {
+    let raw: string;
     try {
-      const raw = await fs.readFile(this.activePath(), 'utf8');
-      const { jobId } = JSON.parse(raw) as { jobId: string };
-      return await this.read(jobId);
-    } catch {
-      return null;
+      raw = await fs.readFile(this.activePath(), 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw err;
     }
+    const { jobId } = JSON.parse(raw) as { jobId: string };
+    if (typeof jobId !== 'string' || !/^[\w-]+$/.test(jobId)) throw new Error('活动任务指针无效');
+    const job = await this.read(jobId);
+    if (!job || job.jobId !== jobId || !job.tasks) throw new Error('活动任务账本不可读，已禁止覆盖');
+    return job;
   }
 
-  async clearActive(): Promise<void> {
+  async clearActive(expectedJobId?: string): Promise<void> {
     try {
+      if (expectedJobId) {
+        const active = JSON.parse(await fs.readFile(this.activePath(), 'utf8')) as { jobId: string };
+        if (active.jobId !== expectedJobId) throw new Error('活动任务已变化，拒绝清理');
+      }
       await fs.unlink(this.activePath());
-    } catch {
-      // 活动任务指针不存在时无需处理
+      await syncDirectory(this.jobsDir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
   }
 
