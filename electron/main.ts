@@ -164,6 +164,24 @@ function registerIpc(): void {
     return svc.getState();
   });
 
+  ipcMain.handle('backup:recycle:list', async (_event, targetRoot: string) => {
+    if (typeof targetRoot !== 'string') throw new Error('回收站目标目录无效');
+    return svc.listRecycleBin(targetRoot);
+  });
+
+  ipcMain.handle(
+    'backup:recycle:restore',
+    async (_event, targetRoot: string, id: string, overwrite: boolean) => {
+      if (typeof targetRoot !== 'string' || typeof id !== 'string') throw new Error('回收项参数无效');
+      return svc.restoreRecycleEntry(targetRoot, id, overwrite === true);
+    },
+  );
+
+  ipcMain.handle('backup:recycle:remove', async (_event, targetRoot: string, id: string) => {
+    if (typeof targetRoot !== 'string' || typeof id !== 'string') throw new Error('回收项参数无效');
+    return svc.removeRecycleEntry(targetRoot, id);
+  });
+
   // 既有通道：**行为保持不变**，供备份主线定位文件使用。
   // 重复文件检测页走的是下面那条受校验的 `dup:reveal`（FR-14、FR-20）。
   ipcMain.handle('app:reveal', async (_event, targetPath: string) => {

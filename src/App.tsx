@@ -3,6 +3,7 @@ import { getApi, type BackupAPI, type ScanOutcome } from './lib/api';
 import { createMockApi } from './lib/mock';
 import { DirectoryPicker } from './components/DirectoryPicker';
 import { PlanPanel } from './components/PlanPanel';
+import { RecycleBin } from './components/RecycleBin';
 import { MediaDiagnostics } from './components/MediaDiagnostics';
 import { AutoSyncPanel } from './components/AutoSync';
 import { DuplicateFinderPage } from './components/DuplicateFinder';
@@ -70,7 +71,8 @@ export default function App() {
   const [sourceRoot, setSourceRoot] = useState('');
   const [targetRoot, setTargetRoot] = useState('');
   const [scan, setScan] = useState<ScanOutcome | null>(null);
-  const [syncMode, setSyncMode] = useState<SyncMode>('mirror');
+  // 默认非破坏性：备份不该顺手删掉目标端多出来的文件。
+  const [syncMode, setSyncMode] = useState<SyncMode>('copy');
   const [state, setState] = useState<AppState | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [busyStage, setBusyStage] = useState<'scanning' | 'planning' | 'starting' | null>(null);
@@ -80,6 +82,8 @@ export default function App() {
   const [dismissedFailure, setDismissedFailure] = useState<string | null>(null);
   const [planMeta, setPlanMeta] = useState<{ truncated?: boolean; totalActions?: number; previewLimit?: number }>({});
   const [autoTarget, setAutoTarget] = useState('');
+  // 备份完成后回收站会多出新删除项，用它触发回收站重新读取。
+  const [recycleToken, setRecycleToken] = useState(0);
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('backup-studio-theme');
@@ -160,6 +164,7 @@ export default function App() {
   // 完成态：对勾欠阻尼微弹，2.5 秒后自动淡出恢复
   useEffect(() => {
     if (phase !== 'completed') return;
+    setRecycleToken((n) => n + 1);
     setShowCheck(true);
     animateCheck(0, 1, () => {
       window.setTimeout(() => {
@@ -289,8 +294,15 @@ export default function App() {
   const bannerText = startError ?? engineFailure;
   const showBanner = bannerText !== undefined && bannerText !== null && dismissedFailure !== bannerText;
 
+  // 删除确认要给样例而不是数字：用户要能看见具体会动哪些文件。
+  const deleteActions = useMemo(() => (state?.actions ?? []).filter((a) => a.type === 'delete'), [state?.actions]);
+  const deleteSamples = useMemo(() => deleteActions.slice(0, 3).map((a) => a.relPath), [deleteActions]);
+
   const writeCount = summary ? summary.copy + summary.update + summary.rename : 0;
   const deleteCount = summary?.delete ?? 0;
+  const retained = summary?.retained ?? 0;
+  // 只有「安全镜像」把删除项留在回收站里，其余模式的删除不可恢复。
+  const recycleRecoverable = syncMode === 'mirror-archive';
   // 引擎只在进度事件里刷新 elapsedMs；没有进度时如实标注未上报，不编造耗时。
   const elapsedText = summary && summary.elapsedMs > 0 ? fmtDuration(summary.elapsedMs) : '引擎未上报';
 
@@ -305,7 +317,11 @@ export default function App() {
       return `备份完成：写入 ${fmtInt(writeCount)} 个文件 · 删除 ${fmtInt(deleteCount)} 个 · 耗时 ${elapsedText}`;
     }
     if (summary && summary.totalFiles > 0) {
-      return `已就绪，将写入 ${fmtInt(writeCount)} 个文件，传输 ${fmtBytes(summary.bytes)}`;
+      const suffix = [
+        deleteCount > 0 ? `，将删除 ${fmtInt(deleteCount)} 个` : '',
+        retained > 0 ? `，保留 ${fmtInt(retained)} 个` : '',
+      ].join('');
+      return `已就绪，将写入 ${fmtInt(writeCount)} 个文件，传输 ${fmtBytes(summary.bytes)}${suffix}`;
     }
     return '请选择源目录与备份目标目录';
   })();
@@ -401,19 +417,32 @@ export default function App() {
                   skip={summary?.skip ?? 0}
                   totalFiles={summary?.totalFiles ?? 0}
                   bytes={summary?.bytes ?? 0}
+                  retained={retained}
                   syncMode={syncMode}
                   onSyncModeChange={handleSyncModeChange}
+                  recycleRecoverable={recycleRecoverable}
                   truncated={planMeta.truncated}
                   totalActions={planMeta.totalActions}
                   previewLimit={planMeta.previewLimit}
                   onRevealArchive={revealArchive}
                 />
 
+                <RecycleBin
+                  api={api}
+                  targetRoot={targetRoot}
+                  disabled={running}
+                  refreshToken={recycleToken}
+                />
+
                 {phase === 'completed' ? (
                   <div className="completion-summary">
                     <span className="completion-summary-title">本次备份结果</span>
                     <span>写入 {fmtInt(writeCount)} 个文件</span>
-                    <span>删除 {fmtInt(deleteCount)} 个文件</span>
+                    <span>
+                      {deleteCount > 0
+                        ? `删除 ${fmtInt(deleteCount)} 个文件${recycleRecoverable ? '（已进入回收站，可还原）' : '（不可恢复）'}`
+                        : `删除 ${fmtInt(deleteCount)} 个文件`}
+                    </span>
                     <span>耗时 {elapsedText}</span>
                   </div>
                 ) : null}
@@ -467,7 +496,20 @@ export default function App() {
               {confirming && state?.confirmReason ? (
                 <div className="banner" data-tone="danger">
                   <IconAlert size={13} className="icon-inline" />
-                  <span>{state.confirmReason}</span>
+                  <div className="banner-body">
+                    <span>{state.confirmReason}</span>
+                    {deleteSamples.length > 0 ? (
+                      <span className="banner-hint">
+                        例如：{deleteSamples.join('、')}
+                        {deleteActions.length > deleteSamples.length ? ' …' : ''}
+                      </span>
+                    ) : null}
+                    <span className="banner-hint">
+                      {recycleRecoverable
+                        ? '这些文件会移入回收站，可随时还原'
+                        : '这些文件会被永久删除，无法找回'}
+                    </span>
+                  </div>
                   <span style={{ flex: '1 1 auto' }} />
                   <button className="btn btn-sm" type="button" onClick={() => setConfirming(false)}>
                     取消
