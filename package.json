@@ -17,7 +17,8 @@
     "test:engine": "tsx test/engine.test.ts",
     "test:aut": "tsx test/auto-sync.test.ts",
     "test:gate": "tsx test/write-gate.test.ts",
-    "test": "npm run test:engine && npm run test:aut && npm run test:gate",
+    "test:dup": "tsx test/dup-finder.test.ts",
+    "test": "npm run test:engine && npm run test:aut && npm run test:gate && npm run test:dup",
     "pack:win": "npm run build && electron-builder --win --x64",
     "pack:linux": "npm run build && electron-builder --linux --x64"
   },

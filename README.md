@@ -23,6 +23,7 @@
 | 人工修复入口 | 只读预检 → 选卷 → 两次确认 → 免责 → 先镜像关键扇区 → 生成审计；**只演练不执行修复**，分区表只导出证据 |
 | 跨平台能力矩阵 | 3 平台 × 3 接口 × 8 文件系统共 72 组，标注可检测 / 可自动处理 / 仅告警 / 不支持 |
 | 自动备份（实时单向同步） | 带开关的单向同步：差异对账 + 事件监听，删除走独立回收站（≥7 天、容量上限）；写入许可由容灾闸门裁决 |
+| 重复文件查找 | 两阶段判定（size 分桶 → 仅同 size 候选算哈希）找出源端内部与源↔目标跨端重复；统一分组报告、判定失败清单、覆盖完整性标注、可导出。**采纳排除后冗余副本不再写入目标端，源端文件一律不删**；排除名单按源目录分组存本机，并接入计划器——被排除副本不产生复制动作，命中排除的孤儿不产生删除动作 |
 | 虚拟列表 | 界面计划清单预览上限 20000 条，虚拟滚动渲染，十万级文件不打爆 IPC；**预览截断不影响后台执行**，全量动作照常跑完 |
 | 失败不伪装成功 | 任一文件动作失败、规划期哈希读取失败或清单写入失败时，状态置为「失败」并保留断点与 `.part` 分片，**绝不报完成** |
 | 误删防护 | 孤儿文件哈希读取失败、或源端同尺寸文件读取失败时，该孤儿**不生成删除动作**；大小写不敏感文件系统上仅大小写变化的文件不单独删除 |
@@ -101,18 +102,25 @@ backup-studio/
 │     ├─ journal.ts         # 账本（写本机 userData）
 │     ├─ copyWorker.ts      # worker 分块复制 / 续传 / 校验
 │     ├─ pool.ts            # worker_threads 复制池
-│     └─ service.ts         # 状态机、介质探测、暂停恢复
+│     ├─ service.ts         # 状态机、介质探测、暂停恢复
+│     ├─ dup/               # 重复文件查找器（REQ-DUP-001）
+│     │  ├─ detect.ts       # 两阶段判定：size 分桶 → SHA-256 分组
+│     │  ├─ exclusions.ts   # 排除名单持久化（按源目录分组，本机权威）
+│     │  └─ index.ts        # 编排：扫描 / 报告 / 采纳 / 撤销 / 导出
+│     └─ aut/               # 自动备份
 ├─ shared/types.ts          # 跨进程类型契约
+├─ shared/dup-types.ts      # 重复查找器类型契约
 ├─ src/                     # 渲染层
 │  ├─ App.tsx
 │  ├─ components/           # 目录选择 / 计划面板 / 进度 / 分栏 / 虚拟列表 / 事件流
 │  ├─ lib/                  # api / format / spring / mock
 │  ├─ hooks/
 │  └─ styles/               # tokens / base / app
-├─ test/                      # 三套测试：引擎 42 例 / 自动备份 10 例 / 写入闸门 8 例
+├─ test/                      # 四套测试：引擎 42 例 / 自动备份 10 例 / 写入闸门 8 例 / 重复查找 18 例
 │  ├─ engine.test.ts          # 引擎与容灾回归
 │  ├─ auto-sync.test.ts       # 自动备份
 │  ├─ write-gate.test.ts      # 写入闸门与容灾桥接
+│  ├─ dup-finder.test.ts      # 重复文件查找器
 │  └─ disk-loss-drill.ts      # 真机拔盘演练脚本（手动执行）
 └─ _refs/desktop-agent-ui/  # 设计规范参考
 ```
@@ -149,7 +157,8 @@ npm.cmd run build          # 渲染层 Vite 构建 + 主进程 tsc 编译
 npm.cmd run test:engine    # 引擎测试（需先 build:electron，因为依赖编译后的 copyWorker.js）
 npm.cmd run test:aut       # 自动备份独立测试
 npm.cmd run test:gate      # 写入闸门与容灾桥接测试
-npm.cmd run test           # 一次跑完上面三套
+npm.cmd run test:dup       # 重复文件查找器测试
+npm.cmd run test           # 一次跑完上面四套
 npm.cmd start              # 构建后启动 Electron
 npm.cmd run pack:win       # 打包 Windows NSIS 安装包 → release/
 npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
@@ -162,14 +171,14 @@ npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
 
 ## CI 双平台构建
 
-- `.github/workflows/ci.yml` —— push / PR 触发：类型检查 → 构建 → 引擎测试 → 自动同步测试 → 写入闸门测试（已实际运行通过）
+- `.github/workflows/ci.yml` —— push / PR 触发：类型检查 → 构建 → 引擎测试 → 自动同步测试 → 写入闸门测试 → 重复查找测试（前四步已实际运行通过；重复查找测试为新增步骤，**尚未在 CI 上实际执行**）
 - `.github/workflows/release.yml` —— 打 tag `v*.*.*` 触发：Windows NSIS + Linux AppImage/deb 构建并上传 Release（**尚未执行验证**）
 
 ---
 
 ## 测试
 
-`npm.cmd run test` 一次跑完三套用例（共 60 项）：
+`npm.cmd run test` 一次跑完四套用例（共 78 项）：
 
 ### 引擎测试 `npm.cmd run test:engine`
 
@@ -243,6 +252,10 @@ npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
 
 覆盖 **8** 个场景：目标不可达时禁止写入、可达目标按卷级事实决定放行、卷需人工检查时标记 `repair-required` 并拒写、隔离观察时禁止写入、闸门结论不变时 `epoch` 稳定而结论变化时 `epoch` 改变、卷健康未知一律拒写、仅在完整校验证明备份集完好时才授权清理回收项、许可对象满足自动备份的拒写契约。
 
+### 重复文件查找测试 `npm.cmd run test:dup`
+
+覆盖 **18** 个场景：源端内部重复分组与字典序规范副本、size 分桶前置（唯一尺寸不进哈希阶段）、跨端重复归类、源/目标同路径同内容不算重复、哈希读取失败的文件不参与分组、连续扫描结果确定性、零字节组不提供排除入口、排除名单抑制复制动作但源端文件数统计不变、命中排除名单的孤儿不产生删除动作、采纳排除后源端文件一个不动、撤销排除恢复复制、目标端既有冗余副本默认不被处置、扫描全程只读、报告导出 JSON/CSV 为全量、排除名单持久化、源端不可达明确报错、源与目标互相包含拒绝扫描、不可采纳的重复组不能被排除。
+
 ---
 
 ## 界面规范落地清单
@@ -277,6 +290,7 @@ npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
 - 渲染层 mock 后端仅供浏览器预览界面，不参与真实备份。
 - 真实 Electron 原生窗口尚未取证，界面证据仍取自渲染层浏览器。
 - 诊断包导出、审计日志、备用介质切换、多配对调度尚未实现。
+- **重复文件查找的目标端冗余回收尚未实现**：当前只识别并报告目标端既有冗余副本，不清理它们——目标端是用户的恢复点，回收需要先证明「另有内容完全相同且校验通过的副本」并经逐项授权。详见 `docs/REQUIREMENTS-003-DUPLICATE-FINDER.md` §11 待确认项 #1。
 
 ## License
 

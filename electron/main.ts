@@ -3,12 +3,14 @@ import path from 'node:path';
 import { BackupService } from './engine/service';
 import { AutoSync } from './engine/aut';
 import { createWritePermit } from './engine/aut/bridge';
+import { DuplicateFinder } from './engine/dup';
 import type { SyncMode } from '../shared/types';
 import type { AutoPairInput } from '../shared/aut-types';
 
 let mainWindow: BrowserWindow | null = null;
 let service: BackupService | null = null;
 let autoSync: AutoSync | null = null;
+let duplicateFinder: DuplicateFinder | null = null;
 
 const THEME_COLORS = {
   dark: { background: '#0b0b0a', overlay: '#151515', symbol: '#a9a9a4' },
@@ -193,6 +195,20 @@ function registerAutoIpc(): void {
   ipcMain.handle('aut:restore', async (_event, id: string) => aut.restore(id));
 }
 
+function registerDupIpc(): void {
+  const dup = duplicateFinder;
+  if (!dup) throw new Error('重复文件查找器尚未初始化');
+
+  ipcMain.handle('dup:status', async () => dup.status());
+  ipcMain.handle('dup:scan', async (_event, sourceRoot: string, targetRoot: string) =>
+    dup.scan(sourceRoot, targetRoot),
+  );
+  ipcMain.handle('dup:adopt', async (_event, hashes: string[]) => dup.adopt(hashes));
+  ipcMain.handle('dup:revoke', async (_event, hashes?: string[]) => dup.revoke(hashes));
+  ipcMain.handle('dup:export', async (_event, format: 'json' | 'csv') => dup.exportReport(format));
+  ipcMain.handle('dup:cancel', async () => dup.cancel());
+}
+
 void app.whenReady().then(() => {
   service = new BackupService(app.getPath('userData'));
   service.on('state', (state) => broadcast('backup:state', state));
@@ -205,8 +221,17 @@ void app.whenReady().then(() => {
   // 自动备份的写入许可由容灾模块裁决，不自行判定。
   autoSync = new AutoSync(path.join(app.getPath('userData'), 'aut'), createWritePermit(service));
 
+  // 重复文件查找器：只读扫描源端与目标端，排除名单写本机 userData。
+  // 排除名单改变的是「写什么」，必须与备份计划同源，因此把名单来源注入给备份服务。
+  duplicateFinder = new DuplicateFinder(path.join(app.getPath('userData'), 'dup'), {
+    onExclusionsChanged: (_sourceRoot, reason) => service?.invalidatePlan(reason),
+  });
+  const finder = duplicateFinder;
+  service.setExclusionProvider((sourceRoot) => finder.exclusionPaths(sourceRoot));
+
   registerIpc();
   registerAutoIpc();
+  registerDupIpc();
   createWindow();
   void autoSync.start();
 

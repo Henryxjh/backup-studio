@@ -5,6 +5,7 @@ import { DirectoryPicker } from './components/DirectoryPicker';
 import { PlanPanel } from './components/PlanPanel';
 import { MediaDiagnostics } from './components/MediaDiagnostics';
 import { AutoSyncPanel } from './components/AutoSync';
+import { DuplicateFinderPanel } from './components/DuplicateFinder';
 import { ProgressPanel } from './components/ProgressPanel';
 import { EventFeed } from './components/EventFeed';
 import { Splitter } from './components/Splitter';
@@ -287,6 +288,16 @@ export default function App() {
             {api ? (
               <div className="section">
                 <AutoSyncPanel api={api.autoSync} sourceRoot={sourceRoot} targetRoot={targetRoot} />
+              </div>
+            ) : null}
+
+            {api ? (
+              <div className="section">
+                <DuplicateFinderPanel
+                  api={api.duplicateFinder}
+                  sourceRoot={sourceRoot}
+                  targetRoot={targetRoot}
+                />
               </div>
             ) : null}
 

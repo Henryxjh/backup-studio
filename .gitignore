@@ -24,6 +24,10 @@ _refs/
 test/bs-*/
 test/backup-studio-journal-*/
 test/.aut-fixture-*/
+test/.dup-fixture-*/
+test/.dup-unit-*/
+test/.dup-plan-*/
+test/.dup-orphan-*/
 test/node-compile-cache/
 test/tsx-*/
 

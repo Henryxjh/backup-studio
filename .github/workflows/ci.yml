@@ -38,3 +38,6 @@ jobs:
 
       - name: Write gate tests
         run: npm run test:gate
+
+      - name: Duplicate finder tests
+        run: npm run test:dup

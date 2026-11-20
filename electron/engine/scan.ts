@@ -10,6 +10,8 @@ export interface ScannedFile {
   relPath: string;
   size: number;
   mtimeMs: number;
+  /** inode 号：用于识别硬链接（同一 inode 的多个路径共享同一份数据） */
+  ino?: number;
 }
 
 export interface ScannedTree {
@@ -72,7 +74,7 @@ export async function scanTree(
 
       try {
         const stat = await fs.stat(path.join(root, childRel));
-        files.set(childRel, { relPath: childRel, size: stat.size, mtimeMs: stat.mtimeMs });
+        files.set(childRel, { relPath: childRel, size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino });
         totalBytes += stat.size;
       } catch (err) {
         errors.push(`${childRel}: ${errorText(err)}`);

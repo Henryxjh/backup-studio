@@ -115,6 +115,10 @@ async function main() {
         gate.evidence.some((e) => e.includes('卷') || e.includes('脏位')),
         '证据链应包含卷状态或脏位',
       );
+    } else if (gate.reachable === false) {
+      // 演练用 U 盘已被拔下：目标不可达时本就该拒写，属于预期结论，不得断言放行
+      assert.equal(gate.allowed, false, '目标不可达时必须禁止写入');
+      assert.equal(gate.volumeHealth, 'unknown');
     } else {
       // 卷已被修复或已健康：此时必须放行，不得残留阻断。
       assert.equal(gate.allowed, true, `卷已健康时应放行，实际：${gate.reason ?? ''}`);

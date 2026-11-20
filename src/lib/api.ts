@@ -8,6 +8,7 @@ import type {
   SyncMode,
 } from '../../shared/types';
 import type { AutoSyncApi } from '../../shared/aut-types';
+import type { DupApi } from '../../shared/dup-types';
 
 export interface PlanPayload {
   actions: PlanAction[];
@@ -52,6 +53,7 @@ export interface BackupAPI {
   quarantine(reason: string): Promise<AppState>;
   releaseQuarantine(): Promise<AppState>;
   autoSync: AutoSyncApi;
+  duplicateFinder: DupApi;
   reveal(targetPath: string): Promise<void>;
   setTheme(mode: 'light' | 'dark' | 'system'): Promise<'light' | 'dark'>;
   onState(cb: (state: AppState) => void): () => void;

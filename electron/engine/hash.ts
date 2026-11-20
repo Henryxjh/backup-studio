@@ -1,6 +1,17 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
+import os from 'node:os';
+
+/**
+ * 哈希并发上限。
+ *
+ * 备份是 I/O 密集而非 CPU 密集：并发数取 CPU-1（上限 8）即可，
+ * 再高只会把磁盘打成随机寻道。计划器与重复检测共用同一口径。
+ */
+export function hashConcurrency(): number {
+  return Math.max(2, Math.min(8, os.cpus().length - 1));
+}
 
 /**
  * 统一使用 SHA-256。

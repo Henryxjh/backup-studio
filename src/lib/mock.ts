@@ -7,6 +7,7 @@ import type {
   SyncMode,
 } from '../../shared/types';
 import type { AutoPair, AutoStatus } from '../../shared/aut-types';
+import type { DupGroup, DupReport, DupStatus } from '../../shared/dup-types';
 import type { BackupAPI, PlanPayload, ProgressPayload, StartOptions } from './api';
 
 type Handler<T> = (payload: T) => void;
@@ -88,6 +89,84 @@ export function createMockApi(): BackupAPI {
     recycle: [],
     recycleBytes: 0,
   });
+
+  // 重复文件查找器的浏览器演示状态：不触碰真实文件系统。
+  let dupReport: DupReport | null = null;
+  let dupExcluded: Record<string, number> = {};
+  const dupCopy = (relPath: string, side: 'source' | 'target' | 'both', size: number, mtimeMs: number) => ({
+    relPath,
+    side,
+    size,
+    mtimeMs,
+    basis: 'computed' as const,
+  });
+  const dupGroups = (): DupGroup[] => [
+    {
+      hash: 'a'.repeat(64),
+      size: 4_410_318,
+      copies: [
+        dupCopy('media/photos/IMG20240712094530.jpg', 'source', 4_410_318, 1_721_026_000_000),
+        dupCopy('media/raw-captures/IMG20240712094530.jpg', 'source', 4_410_318, 1_721_026_000_000),
+      ],
+      relation: 'source-internal',
+      canonical: 'media/photos/IMG20240712094530.jpg',
+      redundant: [
+        dupCopy('media/raw-captures/IMG20240712094530.jpg', 'source', 4_410_318, 1_721_026_000_000),
+      ],
+      reclaimableBytes: 4_410_318,
+      zeroByte: false,
+      hardLinked: false,
+      adoptable: true,
+      copiesTruncated: false,
+    },
+    {
+      hash: 'b'.repeat(64),
+      size: 18_322,
+      copies: [
+        dupCopy('projects/atlas/src/services/backup-engine/worker-pool.ts', 'source', 18_322, 1_721_100_000_000),
+        dupCopy('projects/atlas/src/services/backup-engine/chunk-copier.ts', 'source', 18_322, 1_721_100_000_000),
+        dupCopy('projects/atlas/docs/architecture/backup-protocol.md', 'source', 18_322, 1_721_100_000_000),
+      ],
+      relation: 'source-internal',
+      canonical: 'projects/atlas/docs/architecture/backup-protocol.md',
+      redundant: [
+        dupCopy('projects/atlas/src/services/backup-engine/chunk-copier.ts', 'source', 18_322, 1_721_100_000_000),
+        dupCopy('projects/atlas/src/services/backup-engine/worker-pool.ts', 'source', 18_322, 1_721_100_000_000),
+      ],
+      reclaimableBytes: 36_644,
+      zeroByte: false,
+      hardLinked: false,
+      adoptable: true,
+      copiesTruncated: false,
+    },
+    {
+      hash: 'c'.repeat(64),
+      size: 128_442,
+      copies: [
+        dupCopy('documents/2024年度总结报告.docx', 'source', 128_442, 1_720_000_000_000),
+        dupCopy('2024年度总结报告.docx', 'target', 128_442, 1_720_500_000_000),
+      ],
+      relation: 'cross-side',
+      canonical: 'documents/2024年度总结报告.docx',
+      redundant: [],
+      reclaimableBytes: 0,
+      zeroByte: false,
+      hardLinked: false,
+      adoptable: false,
+      copiesTruncated: false,
+    },
+  ];
+  const dupStatus = (): DupStatus => {
+    return {
+      state: dupReport ? 'ready' : 'idle',
+      report: dupReport,
+      excludedPaths: Object.keys(dupExcluded).sort(),
+      excludedCount: Object.keys(dupExcluded).length,
+      excludedBytes: Object.values(dupExcluded).reduce((sum, n) => sum + n, 0),
+      recent: dupReport ? [{ at: Date.now(), action: '重复扫描完成', detail: '浏览器演示：未连接真实文件系统' }] : [],
+      reason: dupReport ? '浏览器演示：未连接真实文件系统，结论仅供界面预览' : undefined,
+    };
+  };
 
   const pushLog = (level: LogEntry['level'], text: string) => {
     seq += 1;
@@ -316,6 +395,64 @@ export function createMockApi(): BackupAPI {
       },
       async restore() {
         return autoStatus();
+      },
+    },
+
+    duplicateFinder: {
+      async status() {
+        return dupStatus();
+      },
+      async scan(sourceRoot: string, targetRoot: string) {
+        await new Promise((r) => setTimeout(r, 380));
+        const groups = dupGroups();
+        dupReport = {
+          sourceRoot,
+          targetRoot,
+          createdAt: Date.now(),
+          durationMs: 380,
+          groups,
+          truncated: false,
+          totalGroups: groups.length,
+          totalCopies: groups.reduce((n, g) => n + g.copies.length, 0),
+          totalBytes: groups.reduce((n, g) => n + g.size * g.copies.length, 0),
+          reclaimableBytes: groups.reduce((n, g) => n + g.reclaimableBytes, 0),
+          failures: [],
+          complete: true,
+          scannedFiles: 12_480,
+          hashedFiles: 318,
+          sourceErrors: 0,
+          targetErrors: 0,
+        };
+        return dupStatus();
+      },
+      async adopt(hashes: string[]) {
+        const groups = dupReport?.groups ?? [];
+        for (const hash of hashes) {
+          const group = groups.find((g) => g.hash === hash);
+          if (!group) throw new Error('重复组不存在或已失效，请重新扫描');
+          if (!group.adoptable) throw new Error('该重复组不可排除');
+          for (const copy of group.redundant) dupExcluded[copy.relPath] = copy.size;
+        }
+        return dupStatus();
+      },
+      async revoke(hashes?: string[]) {
+        if (!hashes || !hashes.length) {
+          dupExcluded = {};
+          return dupStatus();
+        }
+        const groups = dupReport?.groups ?? [];
+        for (const hash of hashes) {
+          const group = groups.find((g) => g.hash === hash);
+          for (const copy of group?.redundant ?? []) delete dupExcluded[copy.relPath];
+        }
+        return dupStatus();
+      },
+      async exportReport(format: 'json' | 'csv') {
+        const text = format === 'csv' ? 'hash,size,relation,relPath\n' : JSON.stringify(dupReport, null, 2);
+        return { path: `D:\\报告\\duplicate-report.${format}`, bytes: text.length };
+      },
+      async cancel() {
+        return dupStatus();
       },
     },
 

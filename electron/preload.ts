@@ -10,6 +10,7 @@ import type {
   SyncMode,
 } from '../shared/types';
 import type { AutoPairInput, AutoStatus } from '../shared/aut-types';
+import type { DupStatus } from '../shared/dup-types';
 
 export interface StartOptions {
   sourceRoot: string;
@@ -83,6 +84,17 @@ const api = {
     restore: (id: string): Promise<AutoStatus> => ipcRenderer.invoke('aut:restore', id),
   },
 
+  duplicateFinder: {
+    status: (): Promise<DupStatus> => ipcRenderer.invoke('dup:status'),
+    scan: (sourceRoot: string, targetRoot: string): Promise<DupStatus> =>
+      ipcRenderer.invoke('dup:scan', sourceRoot, targetRoot),
+    adopt: (hashes: string[]): Promise<DupStatus> => ipcRenderer.invoke('dup:adopt', hashes),
+    revoke: (hashes?: string[]): Promise<DupStatus> => ipcRenderer.invoke('dup:revoke', hashes),
+    exportReport: (format: 'json' | 'csv'): Promise<{ path: string; bytes: number }> =>
+      ipcRenderer.invoke('dup:export', format),
+    cancel: (): Promise<DupStatus> => ipcRenderer.invoke('dup:cancel'),
+  },
+
   reveal: (targetPath: string): Promise<void> => ipcRenderer.invoke('app:reveal', targetPath),
 
   setTheme: (mode: 'light' | 'dark' | 'system'): Promise<'light' | 'dark'> =>
@@ -110,3 +122,4 @@ export type BackupAPI = typeof api;
 contextBridge.exposeInMainWorld('backupAPI', api);
 
 export type { AppState, LogEntry, MediaAssessment, MediaState, PlanAction, RecoverableJob, ScanResult, SyncMode };
+export type { DupApi, DupStatus } from '../shared/dup-types';

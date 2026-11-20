@@ -1,6 +1,5 @@
-import os from 'node:os';
 import path from 'node:path';
-import { hashFilesDetailed } from './hash';
+import { hashConcurrency, hashFilesDetailed } from './hash';
 import type { ScannedFile, ScannedTree } from './scan';
 import type { Manifest } from './manifest';
 import type { PlanAction, SyncMode } from '../../shared/types';
@@ -12,6 +11,16 @@ export interface PlanInput {
   target: ScannedTree;
   manifest: Manifest | null;
   syncMode: SyncMode;
+  /**
+   * 重复排除名单：被排除的源端相对路径。
+   *
+   * 语义（REQ-DUP-001 FR-09）：
+   * - 被排除的源端副本**不生成复制/更新动作**，但仍计入源端文件数统计
+   * - 被排除的路径在目标端若成为孤儿，**不生成删除动作**——目标端副本默认保留
+   *
+   * 这是排除生效的前提：否则会出现「源端不再写入、目标端却被删掉」的自相矛盾。
+   */
+  excluded?: ReadonlySet<string>;
   onProgress?: (stage: string, done: number, total: number) => void;
 }
 
@@ -44,10 +53,6 @@ export const MAX_PREVIEW_ACTIONS = 20000;
 
 const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
 
-function hashConcurrency(): number {
-  return Math.max(2, Math.min(8, os.cpus().length - 1));
-}
-
 /**
  * 生成备份计划。
  *
@@ -62,6 +67,7 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   const { sourceRoot, targetRoot, source, target, manifest, syncMode } = input;
   const report = input.onProgress ?? (() => {});
   const manifestFiles = manifest?.files ?? {};
+  const excluded = input.excluded ?? new Set<string>();
 
   const srcFiles = source.files;
   const dstFiles = target.files;
@@ -81,6 +87,19 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   // ---- 第一轮：零 I/O 的元数据快判 ----
   report('分类', 0, srcFiles.size);
   for (const src of srcFiles.values()) {
+    // 重复排除：冗余副本不再写入目标端。
+    // 它仍计入 srcFiles.size（源端文件数统计），只是不产生任何写入动作。
+    if (excluded.has(src.relPath)) {
+      identical.push({
+        id: `skip:${src.relPath}`,
+        type: 'skip',
+        relPath: src.relPath,
+        size: src.size,
+        status: 'skipped',
+        note: '已按重复排除规则排除，不写入目标端',
+      });
+      continue;
+    }
     const dst = dstFiles.get(src.relPath);
     if (!dst) {
       newFiles.push(src);
@@ -309,6 +328,9 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   let deleted = 0;
   for (const orphan of orphans) {
     if (consumedOrphans.has(orphan.relPath)) continue;
+    // 命中重复排除名单：目标端副本默认保留。
+    // 排除表示「这份内容由规范副本代表」，不是「可以删掉」。
+    if (excluded.has(orphan.relPath)) continue;
     // 哈希计算失败的孤儿或所属尺寸桶配对不完整时，严禁静默删除
     if (orphanHashRes.errors.has(orphan.relPath) || unsafeOrphanSizes.has(orphan.size)) {
       continue;
