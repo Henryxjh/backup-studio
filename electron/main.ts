@@ -67,6 +67,9 @@ function createWindow(): void {
     void autoSync?.suspend();
   });
 
+  // 重开窗口时恢复自动备份的监听与对账（不改变已保存的开关）。
+  void autoSync?.start();
+
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isSafeExternalUrl(url)) {
       void shell.openExternal(url);
@@ -191,11 +194,29 @@ function registerAutoIpc(): void {
   const aut = autoSync;
   if (!aut) throw new Error('自动备份尚未初始化');
 
+  // 参数白名单：只接受配对/条目 ID 与布尔开关，其余一律拒绝。
+  const pairId = (value: unknown): string => {
+    if (typeof value !== 'string' || !/^[a-f0-9-]{8,64}$/i.test(value)) throw new Error('配对 ID 无效');
+    return value;
+  };
+  const itemId = (value: unknown): string => {
+    if (typeof value !== 'string' || !/^[a-f0-9-]{8,64}$/i.test(value)) throw new Error('条目 ID 无效');
+    return value;
+  };
+  const flag = (value: unknown): boolean => {
+    if (typeof value !== 'boolean') throw new Error('开关参数无效');
+    return value;
+  };
+
   ipcMain.handle('aut:status', async () => aut.status());
-  ipcMain.handle('aut:configure', async (_event, input: AutoPairInput) => aut.configure(input));
-  ipcMain.handle('aut:set-enabled', async (_event, enabled: boolean) => aut.setEnabled(enabled));
-  ipcMain.handle('aut:resume', async () => aut.resume());
-  ipcMain.handle('aut:restore', async (_event, id: string) => aut.restore(id));
+  ipcMain.handle('aut:add-pair', async (_event, input: AutoPairInput) => aut.addPair(input));
+  ipcMain.handle('aut:update-pair', async (_event, id: string, input: Partial<AutoPairInput>) => aut.updatePair(pairId(id), input));
+  ipcMain.handle('aut:remove-pair', async (_event, id: string) => aut.removePair(pairId(id)));
+  ipcMain.handle('aut:set-enabled', async (_event, id: string, enabled: boolean) => aut.setEnabled(pairId(id), flag(enabled)));
+  ipcMain.handle('aut:resume', async (_event, id: string) => aut.resume(pairId(id)));
+  ipcMain.handle('aut:restore', async (_event, id: string, recycleId: string) => aut.restore(pairId(id), itemId(recycleId)));
+  ipcMain.handle('aut:restore-version', async (_event, id: string, versionId: string) => aut.restoreVersion(pairId(id), itemId(versionId)));
+  ipcMain.handle('aut:history', async (_event, id: string) => aut.history(pairId(id)));
 }
 
 function registerDupIpc(): void {
@@ -269,6 +290,8 @@ void app.whenReady().then(() => {
   registerDupIpc();
   createWindow();
   void autoSync.start();
+  // 崩溃或关窗后引擎是全新实例：读一次活动账本，界面才有续传入口。
+  void service.loadRecoverableJob();
 
   nativeTheme.on('updated', () => {
     const palette = THEME_COLORS[themeKey()];

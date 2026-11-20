@@ -27,12 +27,13 @@ export function MediaDiagnostics({ api, root, disabled }: { api: BackupAPI; root
   return <section className="media-diagnostics" aria-label="介质诊断">
     <h3 className="section-title">介质诊断</h3>
     <div className="media-diagnostics-actions">
-      <button className="btn btn-sm" disabled={locked} onClick={() => void inspect(false)}>只读检查</button>
-      <button className="btn btn-sm" disabled={locked} onClick={() => void inspect(true)}>重新枚举</button>
+      <button className="btn btn-sm" disabled={locked} onClick={() => void inspect(false)}>只读检查（不写入目标介质）</button>
+      <button className="btn btn-sm" disabled={locked} onClick={() => void inspect(true)}>重新检测（刷新检测结果，不重置控制器）</button>
       <button className="btn btn-sm" disabled={locked} onClick={() => void perform(async () => {
         const result = await api.exportPartitionEvidence(root); setStatus(`证据编号 ${result.auditId}。${result.guidance}`);
-      })}>导出分区证据</button>
+      })}>导出分区证据（保存到本机诊断目录）</button>
     </div>
+    {!root ? <p className="media-diagnostics-hint">未选择备份目标目录，诊断不可用。</p> : null}
     {report && <>
       <p><strong>{report.assessment.level} / {labels[report.condition]}</strong>（置信度 {Math.round(report.assessment.confidence * 100)}%）</p>
       <p>{report.assessment.suggestion}</p>

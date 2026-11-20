@@ -6,7 +6,19 @@ import type {
   ScanResult,
   SyncMode,
 } from '../../shared/types';
-import type { AutoPair, AutoStatus } from '../../shared/aut-types';
+import type {
+  AutoBlock,
+  AutoCommit,
+  AutoEvent,
+  AutoHistory,
+  AutoPair,
+  AutoPairInput,
+  AutoPairStatus,
+  AutoRecycleEntry,
+  AutoRunState,
+  AutoStatus,
+  AutoVersion,
+} from '../../shared/aut-types';
 import type {
   DupActRequest,
   DupActResult,
@@ -37,10 +49,50 @@ function makeHandlers<T>() {
   };
 }
 
+/** AutoPairInput 的契约默认值（对应 shared/aut-types.ts 的 Required<AutoPairInput>）。 */
+const DEFAULT_PAIR: Required<AutoPairInput> = {
+  sourceRoot: '',
+  targetRoot: '',
+  excludes: [],
+  syncDeletes: false,
+  retentionDays: 7,
+  recycleMaxBytes: 10 * 1024 ** 3,
+  externalChanges: 'pause',
+  pollOnly: false,
+  pollMs: 30000,
+  stableMs: 750,
+  allowSnapshotFiles: false,
+  historyMaxBytes: 50 * 1024 ** 3,
+  historyMaxVersionsPerPath: 20,
+};
+
+/** mock 后端内部保存的单个配对状态。 */
+interface MockPair {
+  pair: AutoPair;
+  state: AutoRunState;
+  available: boolean;
+  polling: boolean;
+  pending: number;
+  attempts: number;
+  reason?: string;
+  block?: AutoBlock;
+  lastSync?: number;
+  recent: AutoEvent[];
+  recycle: AutoRecycleEntry[];
+  recycleBytes: number;
+  historyCounts: { commits: number; versions: number };
+  sessionDeletes: number;
+  unmanagedDeletes: number;
+  history: AutoHistory;
+}
+
 /**
  * 浏览器预览用的模拟后端。
  * 仅在脱离 Electron 渲染层时启用（window.backupAPI 不存在），
  * 用于在普通浏览器里核对界面布局与动效，不参与真实备份。
+ *
+ * 自动备份部分实现了 shared/aut-types.ts 的多配对契约：
+ * status / addPair / updatePair / removePair / setEnabled / resume / restore / restoreVersion / history。
  */
 export function createMockApi(): BackupAPI {
   let seq = 0;
@@ -85,20 +137,147 @@ export function createMockApi(): BackupAPI {
   let current = baseState();
   let timer: number | null = null;
 
-  // 自动备份的浏览器演示状态：不触碰真实文件系统。
-  let autoPair: AutoPair | null = null;
-  let autoEnabled = false;
-  const autoStatus = (): AutoStatus => ({
-    pair: autoPair,
-    state: autoEnabled ? 'idle' : 'off',
-    available: autoPair !== null,
-    polling: autoPair?.pollOnly ?? false,
-    pending: 0,
-    attempts: 0,
-    reason: autoPair ? '浏览器演示：未连接真实文件系统，不进行实际同步' : undefined,
-    recent: [],
-    recycle: [],
-    recycleBytes: 0,
+  // ---- 自动备份的浏览器演示状态：不触碰真实文件系统 ----
+  let pairSeq = 0;
+  const demoNow = Date.now();
+
+  const demoVersions: AutoVersion[] = [
+    {
+      id: 'v-1',
+      pairId: 'demo-pair',
+      relPath: 'documents/合同/供应商合作协议-2025-签署版.pdf',
+      hash: 'a3f91c02be7745d68a1e0c7b93f2d45',
+      size: 1_482_112,
+      at: demoNow - 86_400_000,
+      commitId: 'c-1',
+      kind: 'modify',
+      previousId: undefined,
+    },
+    {
+      id: 'v-2',
+      pairId: 'demo-pair',
+      relPath: 'documents/合同/供应商合作协议-2025-签署版.pdf',
+      hash: 'c81d0f45a3b62e97d5108c4ab6e21f39',
+      size: 1_471_008,
+      at: demoNow - 259_200_000,
+      commitId: 'c-2',
+      kind: 'add',
+    },
+    {
+      id: 'v-3',
+      pairId: 'demo-pair',
+      relPath: 'media/photos/IMAG20240712094530.jpg',
+      hash: '5f2b9c1d84e07a63b91f0c2d7e58a401',
+      size: 4_820_224,
+      at: demoNow - 172_800_000,
+      commitId: 'c-3',
+      kind: 'modify',
+    },
+  ];
+
+  const demoCommits: AutoCommit[] = [
+    {
+      id: 'c-1',
+      pairId: 'demo-pair',
+      at: demoNow - 86_400_000,
+      changes: [
+        { relPath: 'documents/合同/供应商合作协议-2025-签署版.pdf', kind: 'modify', hash: 'a3f91c02be7745d68a1e0c7b93f2d45', size: 1_482_112, versionId: 'v-1' },
+        { relPath: 'notes/会议纪要/2025-03-18 周会同步.md', kind: 'modify', hash: '77c0a1b93f4e25d80c6b1e3947a5d082', size: 12_880 },
+      ],
+    },
+    {
+      id: 'c-2',
+      pairId: 'demo-pair',
+      at: demoNow - 259_200_000,
+      changes: [
+        { relPath: 'documents/合同/供应商合作协议-2025-签署版.pdf', kind: 'add', hash: 'c81d0f45a3b62e97d5108c4ab6e21f39', size: 1_471_008, versionId: 'v-2' },
+      ],
+    },
+    {
+      id: 'c-3',
+      pairId: 'demo-pair',
+      at: demoNow - 172_800_000,
+      changes: [
+        { relPath: 'media/photos/IMAG20240712094530.jpg', kind: 'modify', hash: '5f2b9c1d84e07a63b91f0c2d7e58a401', size: 4_820_224, versionId: 'v-3' },
+      ],
+    },
+  ];
+
+  const demoRecycle: AutoRecycleEntry[] = [
+    {
+      id: 'r-1',
+      relPath: 'archives/legacy/系统迁移方案-归档版本.zip',
+      size: 87_654_321,
+      at: demoNow - 43_200_000,
+      expiresAt: demoNow + 604_800_000,
+      kind: 'delete',
+      hash: '9be41d7c02a5f83610dc47e9b3a6208',
+    },
+    {
+      id: 'r-2',
+      relPath: 'documents/2024年度总结报告.docx',
+      size: 2_411_520,
+      at: demoNow - 8_640_000,
+      expiresAt: demoNow + 691_200_000,
+      kind: 'replace',
+      hash: 'd2c7a91f4e60b83c5d19e7a2f804b6d5',
+      versionId: 'v-1',
+    },
+  ];
+
+  const pairs: MockPair[] = [
+    {
+      pair: {
+        id: 'demo-pair',
+        enabled: true,
+        ...DEFAULT_PAIR,
+        sourceRoot: 'D:\\资料库\\主目录',
+        targetRoot: 'E:\\备份仓\\每日快照',
+        excludes: ['node_modules/**', '*.tmp'],
+        syncDeletes: true,
+        retentionDays: 14,
+        pollOnly: true,
+        pollMs: 60000,
+      },
+      state: 'idle',
+      available: true,
+      polling: true,
+      pending: 3,
+      attempts: 0,
+      reason: '浏览器演示：未连接真实文件系统，不进行实际同步',
+      lastSync: demoNow - 900_000,
+      recent: [
+        { at: demoNow - 900_000, action: '对账完成', detail: '新增 2 / 更新 1 / 删除 0' },
+        { at: demoNow - 1_800_000, action: '回收删除', detail: 'archives/legacy/系统迁移方案-归档版本.zip' },
+      ],
+      recycle: demoRecycle,
+      recycleBytes: demoRecycle.reduce((sum, item) => sum + item.size, 0),
+      historyCounts: { commits: demoCommits.length, versions: demoVersions.length },
+      sessionDeletes: 1,
+      unmanagedDeletes: 4,
+      history: { commits: demoCommits, versions: demoVersions },
+    },
+  ];
+
+  /** 已解除的配对：历史与回收站仍留在原备份介质上，这里只做计数展示。 */
+  let releasedPairCount = 0;
+
+  const toPairStatus = (entry: MockPair): AutoPairStatus => ({
+    pair: entry.pair,
+    state: entry.state,
+    available: entry.available,
+    polling: entry.polling,
+    pending: entry.pending,
+    attempts: entry.attempts,
+    reason: entry.reason,
+    block: entry.block,
+    lastSync: entry.lastSync,
+    recent: entry.recent,
+    recycle: entry.recycle,
+    recycleBytes: entry.recycleBytes,
+    historyCounts: entry.historyCounts,
+    sessionDeletes: entry.sessionDeletes,
+    unmanagedDeletes: entry.unmanagedDeletes,
   });
 
   // 重复文件检测的浏览器演示状态：不触碰真实文件系统。
@@ -280,6 +459,32 @@ export function createMockApi(): BackupAPI {
     canAct: dupPhase === 'ready' || dupPhase === 'done',
   });
 
+  const aggregateState = (): AutoRunState => {
+    if (pairs.some((entry) => entry.state === 'syncing')) return 'syncing';
+    if (pairs.some((entry) => entry.state === 'scanning')) return 'scanning';
+    if (pairs.some((entry) => entry.state === 'error')) return 'error';
+    if (pairs.some((entry) => entry.state === 'waiting')) return 'waiting';
+    if (pairs.some((entry) => entry.state === 'paused')) return 'paused';
+    if (pairs.some((entry) => entry.pair.enabled)) return 'idle';
+    return 'off';
+  };
+
+  const autoStatus = (activePairId?: string): AutoStatus => ({
+    pairs: pairs.map(toPairStatus),
+    state: aggregateState(),
+    activePairId: activePairId ?? pairs[0]?.pair.id,
+  });
+
+  const findPair = (pairId: string): MockPair => {
+    const entry = pairs.find((item) => item.pair.id === pairId);
+    if (!entry) throw new Error(`找不到配对：${pairId}`);
+    return entry;
+  };
+
+  const pushEvent = (entry: MockPair, action: string, detail?: string) => {
+    entry.recent = [{ at: Date.now(), action, detail }, ...entry.recent].slice(0, 50);
+  };
+
   const pushLog = (level: LogEntry['level'], text: string) => {
     seq += 1;
     const entry: LogEntry = { id: seq, ts: Date.now(), level, text };
@@ -312,7 +517,12 @@ export function createMockApi(): BackupAPI {
         relPath,
         size: (i + 1) * 1024 * 37,
         status: 'pending',
-        note: type === 'rename' ? '由 documents/旧版方案.docx 改名，内容一致，无需复制' : undefined,
+        note:
+          type === 'rename'
+            ? '由 documents/旧版方案.docx 改名，内容一致，无需复制'
+            : type === 'skip'
+              ? '内容一致，无需复制'
+              : undefined,
       } as PlanAction;
     });
   };
@@ -391,7 +601,11 @@ export function createMockApi(): BackupAPI {
         if (copied >= total) {
           if (timer) window.clearInterval(timer);
           timer = null;
-          current = { ...current, phase: 'completed' };
+          current = {
+            ...current,
+            phase: 'completed',
+            summary: { ...current.summary, phase: 'completed', copiedBytes: total, elapsedMs: elapsed },
+          };
           state.emit(current);
           pushLog('success', '备份完成');
         }
@@ -479,38 +693,102 @@ export function createMockApi(): BackupAPI {
     },
 
     autoSync: {
-      async status() {
+      async status(): Promise<AutoStatus> {
         return autoStatus();
       },
-      async configure(input) {
-        autoPair = {
-          id: 'demo-pair',
-          enabled: false,
-          sourceRoot: input.sourceRoot,
-          targetRoot: input.targetRoot,
-          excludes: input.excludes ?? [],
-          syncDeletes: input.syncDeletes ?? false,
-          retentionDays: input.retentionDays ?? 7,
-          recycleMaxBytes: input.recycleMaxBytes ?? 10 * 1024 ** 3,
-          externalChanges: input.externalChanges ?? 'pause',
-          pollOnly: input.pollOnly ?? false,
-          pollMs: input.pollMs ?? 30000,
-          stableMs: input.stableMs ?? 750,
-          allowSnapshotFiles: input.allowSnapshotFiles ?? false,
+
+      async addPair(input: AutoPairInput): Promise<AutoStatus> {
+        pairSeq += 1;
+        const entry: MockPair = {
+          pair: {
+            id: `pair-${pairSeq}`,
+            enabled: false,
+            ...DEFAULT_PAIR,
+            ...input,
+            excludes: input.excludes ?? [],
+          },
+          state: 'off',
+          available: true,
+          polling: input.pollOnly ?? false,
+          pending: 0,
+          attempts: 0,
+          reason: '浏览器演示：未连接真实文件系统，不进行实际同步',
+          recent: [],
+          recycle: [],
+          recycleBytes: 0,
+          historyCounts: { commits: 0, versions: 0 },
+          sessionDeletes: 0,
+          unmanagedDeletes: 0,
+          history: { commits: [], versions: [] },
         };
-        autoEnabled = false;
+        pairs.push(entry);
+        return autoStatus(entry.pair.id);
+      },
+
+      async updatePair(pairId: string, input: Partial<AutoPairInput>): Promise<AutoStatus> {
+        const entry = findPair(pairId);
+        entry.pair = {
+          ...entry.pair,
+          ...input,
+          excludes: input.excludes ?? entry.pair.excludes,
+        };
+        entry.polling = entry.pair.pollOnly;
+        pushEvent(entry, '配对设置已更新');
+        return autoStatus(pairId);
+      },
+
+      async removePair(pairId: string): Promise<AutoStatus> {
+        const index = pairs.findIndex((item) => item.pair.id === pairId);
+        if (index < 0) throw new Error(`找不到配对：${pairId}`);
+        // 历史与回收站不随配对删除：它们留在原备份介质上，这里只做计数。
+        releasedPairCount += 1;
+        pairs.splice(index, 1);
+        pushLog('info', `已解除配对，历史与回收站仍保留在原备份介质上（累计解除 ${releasedPairCount} 个）`);
         return autoStatus();
       },
-      async setEnabled(enabled) {
-        if (enabled) autoEnabled = true;
-        else autoEnabled = false;
-        return autoStatus();
+
+      async setEnabled(pairId: string, enabled: boolean): Promise<AutoStatus> {
+        const entry = findPair(pairId);
+        entry.pair.enabled = enabled;
+        entry.state = enabled ? 'idle' : 'off';
+        entry.reason = enabled
+          ? '浏览器演示：未连接真实文件系统，不进行实际同步'
+          : '自动备份已关闭';
+        pushEvent(entry, enabled ? '已开启自动备份' : '已关闭自动备份');
+        return autoStatus(pairId);
       },
-      async resume() {
-        return autoStatus();
+
+      async resume(pairId: string): Promise<AutoStatus> {
+        const entry = findPair(pairId);
+        entry.state = 'idle';
+        entry.lastSync = Date.now();
+        entry.pending = 0;
+        entry.attempts = 0;
+        pushEvent(entry, '重新对账完成');
+        return autoStatus(pairId);
       },
-      async restore() {
-        return autoStatus();
+
+      async restore(pairId: string, recycleId: string): Promise<AutoStatus> {
+        const entry = findPair(pairId);
+        const target = entry.recycle.find((item) => item.id === recycleId);
+        if (!target) throw new Error('找不到回收项');
+        entry.recycle = entry.recycle.filter((item) => item.id !== recycleId);
+        entry.recycleBytes = entry.recycle.reduce((sum, item) => sum + item.size, 0);
+        pushEvent(entry, '已从回收站恢复', target.relPath);
+        return autoStatus(pairId);
+      },
+
+      async restoreVersion(pairId: string, versionId: string): Promise<AutoStatus> {
+        const entry = findPair(pairId);
+        const target = entry.history.versions.find((item) => item.id === versionId);
+        if (!target) throw new Error('找不到历史版本');
+        pushEvent(entry, '已撤回历史版本', target.relPath);
+        return autoStatus(pairId);
+      },
+
+      async history(pairId: string): Promise<AutoHistory> {
+        const entry = findPair(pairId);
+        return entry.history;
       },
     },
 
