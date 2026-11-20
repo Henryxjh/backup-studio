@@ -5,6 +5,7 @@ import type {
   MediaAssessment,
   MediaState,
   PlanAction,
+  RecycleBin,
   RecoverableJob,
   ScanResult,
   SyncMode,
@@ -75,6 +76,15 @@ const api = {
 
   releaseQuarantine: (): Promise<AppState> => ipcRenderer.invoke('backup:release-quarantine'),
 
+  listRecycle: (targetRoot: string): Promise<RecycleBin> =>
+    ipcRenderer.invoke('backup:recycle:list', targetRoot),
+
+  restoreRecycle: (targetRoot: string, id: string, overwrite: boolean): Promise<RecycleBin> =>
+    ipcRenderer.invoke('backup:recycle:restore', targetRoot, id, overwrite),
+
+  removeRecycle: (targetRoot: string, id: string): Promise<RecycleBin> =>
+    ipcRenderer.invoke('backup:recycle:remove', targetRoot, id),
+
   autoSync: {
     status: (): Promise<AutoStatus> => ipcRenderer.invoke('aut:status'),
     addPair: (input: AutoPairInput): Promise<AutoStatus> => ipcRenderer.invoke('aut:add-pair', input),
@@ -117,4 +127,4 @@ export type BackupAPI = typeof api;
 
 contextBridge.exposeInMainWorld('backupAPI', api);
 
-export type { AppState, LogEntry, MediaAssessment, MediaState, PlanAction, RecoverableJob, ScanResult, SyncMode };
+export type { AppState, LogEntry, MediaAssessment, MediaState, PlanAction, RecycleBin, RecoverableJob, ScanResult, SyncMode };

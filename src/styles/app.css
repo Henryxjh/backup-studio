@@ -1104,3 +1104,149 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ============ 非破坏性默认与回收站 ============ */
+
+/* 副标题解释的是后果，不是操作步骤 */
+.mode-option-desc {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-meta);
+  color: var(--text-tertiary);
+}
+
+/* 不可恢复的选项自带危险标记：选中与否都要看得见 */
+.mode-option[data-danger='true'] {
+  background: var(--danger-soft);
+}
+
+.mode-option[data-danger='true'] .mode-option-title {
+  color: var(--danger);
+}
+
+.mode-option[data-danger='true'] .mode-option-desc {
+  color: var(--danger);
+  opacity: 0.75;
+}
+
+/* 删除计数走危险色调，避免与普通统计混在一起 */
+.stat[data-tone='danger'] .stat-value {
+  color: var(--danger);
+}
+
+/* 计划警告：把「会发生什么」摆在执行按钮之前 */
+.plan-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: 8px 10px;
+  border-radius: var(--radius-control);
+  background: var(--bg-inset);
+  color: var(--text-secondary);
+  font-size: var(--fs-meta);
+  line-height: 1.5;
+}
+
+.plan-warning-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.plan-warning[data-tone='recoverable'] {
+  background: var(--accent-soft);
+}
+
+.plan-warning[data-tone='recoverable'] .icon-inline {
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.plan-warning[data-tone='danger'] {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* ============ 回收站 ============ */
+
+.recycle-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.recycle-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.recycle-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 6px var(--sp-3);
+  border-radius: var(--radius-row);
+  font-size: var(--fs-meta);
+}
+
+.recycle-row:hover {
+  background: var(--bg-hover);
+}
+
+.recycle-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-primary);
+}
+
+.recycle-meta {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.recycle-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+/* 彻底删除不可逆，按钮本身就要带危险色 */
+.recycle-actions .btn[data-tone='danger'] {
+  color: var(--danger);
+}
+
+.recycle-actions .btn[data-tone='danger']:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.recycle-error {
+  font-size: var(--fs-meta);
+  color: var(--danger);
+}
+
+/* 确认横幅里的补充说明：沿用既有小字层级，不另起视觉层 */
+.banner-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.banner-hint {
+  font-size: var(--fs-meta);
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+.banner[data-tone='danger'] .banner-hint {
+  color: var(--danger);
+  opacity: 0.85;
+}

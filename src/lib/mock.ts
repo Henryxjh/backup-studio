@@ -3,6 +3,8 @@ import type {
   LogEntry,
   MediaState,
   PlanAction,
+  RecycleBin,
+  RecycleEntry,
   ScanResult,
   SyncMode,
 } from '../../shared/types';
@@ -94,7 +96,7 @@ export function createMockApi(): BackupAPI {
   const baseState = (): AppState => ({
     phase: 'idle',
     media: 'online',
-    syncMode: 'mirror',
+    syncMode: 'copy',
     sourceRoot: '',
     targetRoot: '',
     jobId: null,
@@ -105,6 +107,7 @@ export function createMockApi(): BackupAPI {
       rename: 0,
       delete: 0,
       skip: 0,
+      retained: 0,
       bytes: 0,
       copiedBytes: 0,
       elapsedMs: 0,
@@ -301,7 +304,7 @@ export function createMockApi(): BackupAPI {
     logs.emit(entry);
   };
 
-  const fakeActions = (): PlanAction[] => {
+  const fakeActions = (syncMode: SyncMode): PlanAction[] => {
     const names = [
       'documents/2024年度总结报告.docx',
       'documents/合同/供应商合作协议-2025-签署版.pdf',
@@ -319,22 +322,68 @@ export function createMockApi(): BackupAPI {
     const types: PlanAction['type'][] = ['copy', 'copy', 'copy', 'update', 'copy', 'rename', 'skip', 'delete'];
     return Array.from({ length: 48 }, (_, i) => {
       const relPath = names[i % names.length];
-      const type = types[i % types.length];
+      const rawType = types[i % types.length];
+      // 非破坏性模式下目标端多余文件是「保留」而不是「删除」。
+      const type = rawType === 'delete' && syncMode === 'copy' ? 'retain' : rawType;
       return {
         id: `${type}:${relPath}:${i}`,
         type,
         relPath,
         size: (i + 1) * 1024 * 37,
-        status: 'pending',
+        status: type === 'retain' ? 'skipped' : 'pending',
         note:
           type === 'rename'
             ? '由 documents/旧版方案.docx 改名，内容一致，无需复制'
             : type === 'skip'
               ? '内容一致，无需复制'
-              : undefined,
+              : type === 'retain'
+                ? '源端已不存在，非破坏性模式保留在备份端'
+                : type === 'delete' && syncMode === 'mirror-archive'
+                  ? '源端已不存在，将移入回收站（可还原）'
+                  : type === 'delete'
+                    ? '源端已不存在，将永久删除且不留副本'
+                    : undefined,
       } as PlanAction;
     });
   };
+
+  /**
+   * 手动备份回收站的浏览器演示数据。
+   *
+   * 真实实现在主进程：删除前把副本归档到 `.backup-studio/history`，
+   * 这里只维护一份内存快照，用来核对列表、还原与覆盖确认的界面行为。
+   */
+  let recycleEntries: RecycleEntry[] = [
+    {
+      id: 'r-1',
+      relPath: '旧版/合同-2024.pdf',
+      size: 2_411_520,
+      deletedAt: Date.now() - 86_400_000,
+      jobId: 'demo-job-1',
+    },
+    {
+      id: 'r-2',
+      relPath: '旧版/照片合集.jpg',
+      size: 4_820_224,
+      deletedAt: Date.now() - 259_200_000,
+      jobId: 'demo-job-1',
+    },
+    {
+      // 预置「目标位置已被占用」的条目：还原时先报错，再由用户确认是否覆盖。
+      id: 'busy-1',
+      relPath: '旧版/照片合集-副本.jpg',
+      size: 1_048_576,
+      deletedAt: Date.now() - 43_200_000,
+      jobId: 'demo-job-2',
+    },
+  ];
+
+  /** 每次都返回新对象，调用方拿到的快照不会与内部状态共享数组引用。 */
+  const recycleSnapshot = (targetRoot: string): RecycleBin => ({
+    targetRoot,
+    entries: recycleEntries.map((entry) => ({ ...entry })),
+    totalBytes: recycleEntries.reduce((sum, entry) => sum + entry.size, 0),
+  });
 
   return {
     async pickDirectory(title: string) {
@@ -358,14 +407,18 @@ export function createMockApi(): BackupAPI {
 
     async plan(sourceRoot: string, targetRoot: string, syncMode: SyncMode): Promise<PlanPayload> {
       await new Promise((r) => setTimeout(r, 220));
-      const actions = fakeActions();
+      const actions = fakeActions(syncMode);
+      // 非破坏性模式不产生删除动作，多余文件改为保留。
+      const deleteCount = syncMode === 'copy' ? 0 : 37;
+      const retained = syncMode === 'copy' ? 37 : 0;
       const summary = {
         totalFiles: 12480,
         copy: 218,
         update: 46,
         rename: 12,
-        delete: 37,
+        delete: deleteCount,
         skip: 12167,
+        retained,
         bytes: 3_204_112_233,
         copiedBytes: 0,
         elapsedMs: 0,
@@ -374,11 +427,19 @@ export function createMockApi(): BackupAPI {
         media: 'online' as MediaState,
         phase: 'ready' as AppState['phase'],
       };
+      // 只要有删除就必须确认：删除数 > 0 即确认。
+      const requiresConfirmation = deleteCount > 0;
       const payload: PlanPayload = {
         actions,
         summary,
-        requiresConfirmation: false,
-        confirmReason: '',
+        requiresConfirmation,
+        confirmReason: requiresConfirmation
+          ? `目标端有 ${deleteCount} 个文件在源端已不存在（占目标端 0%）。${
+              syncMode === 'mirror-archive'
+                ? '这些文件会移入回收站，随时可以还原。'
+                : '这些文件将被永久删除，不留副本，无法恢复。'
+            }`
+          : '',
       };
       current = { ...current, sourceRoot, targetRoot, syncMode, actions, summary };
       plan.emit(payload);
@@ -492,6 +553,27 @@ export function createMockApi(): BackupAPI {
     },
 
     async reveal() {},
+
+    async listRecycle(targetRoot: string): Promise<RecycleBin> {
+      return recycleSnapshot(targetRoot);
+    },
+
+    async restoreRecycle(targetRoot: string, id: string, overwrite: boolean): Promise<RecycleBin> {
+      const target = recycleEntries.find((entry) => entry.id === id);
+      if (!target) throw new Error('回收项不存在');
+      // busy- 前缀代表目标位置已被占用：未经确认不得覆盖原文件。
+      if (!overwrite && target.id.startsWith('busy-')) {
+        throw new Error('目标位置已被占用，请确认覆盖后再试');
+      }
+      recycleEntries = recycleEntries.filter((entry) => entry.id !== id);
+      return recycleSnapshot(targetRoot);
+    },
+
+    async removeRecycle(targetRoot: string, id: string): Promise<RecycleBin> {
+      if (!recycleEntries.some((entry) => entry.id === id)) throw new Error('回收项不存在');
+      recycleEntries = recycleEntries.filter((entry) => entry.id !== id);
+      return recycleSnapshot(targetRoot);
+    },
 
     async setTheme(mode) {
       return mode === 'light' ? 'light' : 'dark';

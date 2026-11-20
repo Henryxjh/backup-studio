@@ -4,6 +4,7 @@ import type {
   MediaAssessment,
   MediaState,
   PlanAction,
+  RecycleBin,
   ScanResult,
   SyncMode,
 } from '../../shared/types';
@@ -71,6 +72,12 @@ export interface BackupAPI {
   recover(confirmed: boolean): Promise<AppState>;
   quarantine(reason: string): Promise<AppState>;
   releaseQuarantine(): Promise<AppState>;
+  /** 列出目标端的回收站快照（手动备份删除项的可还原副本）。 */
+  listRecycle(targetRoot: string): Promise<RecycleBin>;
+  /** 还原一条回收项；目标位置已被占用时需显式允许覆盖。 */
+  restoreRecycle(targetRoot: string, id: string, overwrite: boolean): Promise<RecycleBin>;
+  /** 彻底删除一条回收项，副本不可再恢复。 */
+  removeRecycle(targetRoot: string, id: string): Promise<RecycleBin>;
   autoSync: AutoSyncApi;
   reveal(targetPath: string): Promise<void>;
   setTheme(mode: 'light' | 'dark' | 'system'): Promise<'light' | 'dark'>;

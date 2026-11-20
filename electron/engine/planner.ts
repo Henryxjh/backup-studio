@@ -33,6 +33,8 @@ export interface PlanResult {
     rename: number;
     delete: number;
     skip: number;
+    /** 非破坏性模式下保留在目标端的多余文件数 */
+    retained: number;
     bytes: number;
   };
   requiresConfirmation: boolean;
@@ -297,6 +299,7 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
     : null;
 
   let deleted = 0;
+  let retained = 0;
   for (const orphan of orphans) {
     if (consumedOrphans.has(orphan.relPath)) continue;
     // 哈希计算失败的孤儿或所属尺寸桶配对不完整时，严禁静默删除
@@ -311,6 +314,20 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
         continue;
       }
     }
+    if (syncMode === 'copy') {
+      // 非破坏性模式：目标端多余文件一律保留，不删除、不进回收站。
+      retained++;
+      actions.push({
+        id: `retain:${orphan.relPath}`,
+        type: 'retain',
+        relPath: orphan.relPath,
+        dstPath: path.join(targetRoot, orphan.relPath),
+        size: orphan.size,
+        status: 'skipped',
+        note: '源端已不存在，非破坏性模式保留在备份端',
+      });
+      continue;
+    }
     deleted++;
     actions.push({
       id: `delete:${orphan.relPath}`,
@@ -319,7 +336,7 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
       dstPath: path.join(targetRoot, orphan.relPath),
       size: orphan.size,
       status: 'pending',
-      note: syncMode === 'mirror-archive' ? '源端已不存在，归档至历史目录' : '源端已不存在',
+      note: syncMode === 'mirror-archive' ? '源端已不存在，将移入回收站（可还原）' : '源端已不存在，将永久删除且不留副本',
     });
   }
 
@@ -340,13 +357,19 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   // 目标端文件远多于源端，通常意味着选错了源目录或目标目录。
   // 这种情况下静默删除会造成不可逆的数据损失，必须让用户明确确认。
   const orphanRatio = dstFiles.size === 0 ? 0 : deleted / dstFiles.size;
-  const requiresConfirmation =
+  // 只要本次会删除任何一个文件，就必须让用户明确确认。
+  // 旧门槛（30% 孤儿率）会让「删掉 1 个文件」在正常同步里静默发生，这正是 D-01 的要害。
+  const requiresConfirmation = deleted > 0;
+  // 数量异常偏多时在确认文案里额外提醒源目录可能选错。
+  const severe =
     deleted > 0 && (srcFiles.size === 0 || orphanRatio > 0.3 || deleted > Math.max(100, srcFiles.size));
 
   const confirmReason = requiresConfirmation
     ? `目标端有 ${deleted} 个文件在源端已不存在（占目标端 ${Math.round(orphanRatio * 100)}%）。${
-        syncMode === 'mirror-archive' ? '这些文件会被归档到历史目录，不会立即消失。' : '这些文件将被删除。'
-      }`
+        syncMode === 'mirror-archive'
+          ? '这些文件会移入回收站，随时可以还原。'
+          : '这些文件将被永久删除，不留副本，无法恢复。'
+      }${severe ? ' 删除数量异常偏多，请先确认源目录与目标目录没有选错。' : ''}`
     : '';
 
   return {
@@ -362,6 +385,7 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
       rename,
       delete: deleted,
       skip,
+      retained,
       bytes,
     },
     requiresConfirmation,

@@ -24,12 +24,17 @@ export type MediaState = 'unknown' | 'online' | 'lost' | 'restoring' | 'quaranti
 
 /** 运行时可切换的同步语义 */
 export type SyncMode =
-  /** 严格镜像：源中已消失的文件在目标端删除 */
+  /**
+   * 非破坏性同步（默认）：只新增/更新/改名，目标端多余文件一律保留。
+   * 备份不应该造成不可逆的数据丢失，因此这是默认语义。
+   */
+  | 'copy'
+  /** 严格镜像：源中已消失的文件在目标端删除，且不留副本，不可恢复 */
   | 'mirror'
-  /** 镜像并保留历史：删除前归档到 .backup-studio/history */
+  /** 镜像并保留历史：删除前归档到回收站，可在界面里还原 */
   | 'mirror-archive';
 
-export type ActionType = 'copy' | 'update' | 'rename' | 'delete' | 'skip';
+export type ActionType = 'copy' | 'update' | 'rename' | 'delete' | 'skip' | 'retain';
 
 export type ActionStatus =
   | 'pending'
@@ -64,6 +69,8 @@ export interface PlanSummary {
   rename: number;
   delete: number;
   skip: number;
+  /** 非破坏性模式下保留在目标端的多余文件数（不会删除，也不会进回收站） */
+  retained: number;
   /** 本次需要真实写入的字节数 */
   bytes: number;
   copiedBytes: number;
@@ -74,6 +81,30 @@ export interface PlanSummary {
   etaMs: number;
   media: MediaState;
   phase: BackupPhase;
+}
+
+/**
+ * 手动备份回收站条目。
+ *
+ * 实体内容仍存放在 `.backup-studio/history/<jobId>/<relPath>`（归档副本），
+ * 这里只登记可浏览、可还原的元数据。
+ */
+export interface RecycleEntry {
+  id: string;
+  /** 相对目标根的 POSIX 路径：被删除文件在备份端的原位置 */
+  relPath: string;
+  size: number;
+  /** 删除时间（毫秒时间戳） */
+  deletedAt: number;
+  /** 产生该条目的备份任务 id */
+  jobId: string;
+}
+
+/** 手动备份回收站快照 */
+export interface RecycleBin {
+  targetRoot: string;
+  entries: RecycleEntry[];
+  totalBytes: number;
 }
 
 export interface ScanResult {

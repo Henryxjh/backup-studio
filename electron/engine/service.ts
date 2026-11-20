@@ -12,6 +12,7 @@ import { scanTree, META_DIR } from './scan';
 import { buildPlan, type PlanResult } from './planner';
 import { CopyPool, type CopyResult } from './pool';
 import { JournalStore, partFileName, type Journal, type JournalTask } from './journal';
+import { RecycleRecorder, listRecycle, removeRecycle, restoreRecycle } from './recycle';
 import {
   probeMedia,
   sameMedia,
@@ -39,6 +40,7 @@ import type {
   PlanAction,
   QuarantineMark,
   RecoverableJob,
+  RecycleBin,
   ScanResult,
   SyncMode,
   WriteGate,
@@ -64,6 +66,13 @@ function errorCode(err: unknown): string | undefined {
 }
 
 const CASE_INSENSITIVE_PATHS = process.platform === 'win32' || process.platform === 'darwin';
+
+/** 回收站接口只接受绝对路径，避免把相对路径解析到别处去。 */
+function assertRecycleRoot(targetRoot: string): void {
+  if (!targetRoot || !path.isAbsolute(targetRoot)) {
+    throw new Error('回收站目标目录无效');
+  }
+}
 
 function assertDistinctRoots(sourceRoot: string, targetRoot: string): void {
   const norm = (p: string) => {
@@ -151,6 +160,8 @@ export class BackupService extends EventEmitter {
   /** 上次探测结果 */
   private lastProbe: MediaProbe | null = null;
   private actionIndex = new Map<string, PlanAction>();
+  /** 删除阶段的回收站登记器；非「镜像并保留历史」模式为 null */
+  private recycleRecorder: RecycleRecorder | null = null;
   private copiedBytes = 0;
   private totalBytes = 0;
   private startedAt = 0;
@@ -161,7 +172,7 @@ export class BackupService extends EventEmitter {
     this.state = {
       phase: 'idle',
       media: 'unknown',
-      syncMode: 'mirror',
+      syncMode: 'copy',
       sourceRoot: '',
       targetRoot: '',
       jobId: null,
@@ -203,6 +214,7 @@ export class BackupService extends EventEmitter {
       rename: 0,
       delete: 0,
       skip: 0,
+      retained: 0,
       bytes: 0,
       copiedBytes: 0,
       elapsedMs: 0,
@@ -295,6 +307,39 @@ export class BackupService extends EventEmitter {
     return this.planBackup(sourceRoot, targetRoot, syncMode);
   }
 
+  // ---- 回收站 ----
+
+  /** 读取目标端的回收站快照。 */
+  async listRecycleBin(targetRoot: string): Promise<RecycleBin> {
+    assertRecycleRoot(targetRoot);
+    return listRecycle(targetRoot);
+  }
+
+  /**
+   * 把回收项还原回备份端的原位置。
+   *
+   * 还原是一次真实写入，因此和备份走同一套写入闸门：
+   * 介质不可写或处于隔离观察时必须拒绝，而不是硬写。
+   */
+  async restoreRecycleEntry(targetRoot: string, id: string, overwrite: boolean): Promise<RecycleBin> {
+    assertRecycleRoot(targetRoot);
+    if (this.running) throw new Error('备份正在执行，无法还原回收项');
+    await this.guardTargetWrites(targetRoot);
+    const result = await restoreRecycle(targetRoot, id, overwrite);
+    this.log('success', '已从回收站还原一个文件');
+    return result;
+  }
+
+  /** 彻底删除回收项：归档副本一并清掉，不可恢复。 */
+  async removeRecycleEntry(targetRoot: string, id: string): Promise<RecycleBin> {
+    assertRecycleRoot(targetRoot);
+    if (this.running) throw new Error('备份正在执行，无法清理回收站');
+    await this.guardTargetWrites(targetRoot);
+    const result = await removeRecycle(targetRoot, id);
+    this.log('warn', '回收站条目已彻底删除，无法恢复');
+    return result;
+  }
+
   private async planBackup(
     sourceRoot: string,
     targetRoot: string,
@@ -376,8 +421,11 @@ export class BackupService extends EventEmitter {
 
       this.log(
         'info',
-        `计划生成：新增 ${result.summary.copy}，更新 ${result.summary.update}，改名 ${result.summary.rename}，删除 ${result.summary.delete}，跳过 ${result.summary.skip}`,
+        `计划生成：新增 ${result.summary.copy}，更新 ${result.summary.update}，改名 ${result.summary.rename}，删除 ${result.summary.delete}，保留 ${result.summary.retained}，跳过 ${result.summary.skip}`,
       );
+      if (result.summary.retained > 0) {
+        this.log('info', `非破坏性模式：目标端 ${result.summary.retained} 个多余文件将原样保留，不会被删除`);
+      }
       if (result.truncated) {
         this.log('info', `计划清单共 ${result.actions.length} 条，界面仅展示前 ${result.previewActions.length} 条（后台仍完整执行全部动作）`);
       }
@@ -843,7 +891,10 @@ export class BackupService extends EventEmitter {
       if (this.copyCallbackFailure) reasons.push(this.copyCallbackFailure);
       if (directoryFailures) reasons.push(`${directoryFailures} 个目录创建失败`);
       if (plan.hashErrors.length) reasons.push(`${plan.hashErrors.length} 个文件规划期读取失败`);
-      if (actions.some((a) => a.type !== 'delete' && a.status !== 'done')) reasons.push('前置文件操作未完成');
+      // 「保留」是正常结果（status 为 skipped），不算前置操作未完成。
+      if (actions.some((a) => a.type !== 'delete' && a.type !== 'retain' && a.status !== 'done')) {
+        reasons.push('前置文件操作未完成');
+      }
       if (reasons.length) throw new Error(reasons.join('，'));
       await this.assertTargetWritable();
       this.stopJournalFlush();
@@ -851,10 +902,25 @@ export class BackupService extends EventEmitter {
       await this.flushJournal(true, true);
       const manifest = await this.buildManifest(options.targetRoot, plan, this.currentJob!.jobId);
 
-      for (const action of actions.filter((a) => a.type === 'delete')) {
-        await this.assertTargetWritable();
-        await this.performDelete(action);
-        if (action.status === 'failed') throw new Error(`删除未完成：${action.relPath}`);
+      // 删除阶段：可恢复模式下把被删内容登记进回收站。
+      // 登记与删除必须成对出现——删了却没登记，用户就再也找不回那份内容。
+      const recorder =
+        this.state.syncMode === 'mirror-archive'
+          ? new RecycleRecorder(options.targetRoot, this.currentJob!.jobId)
+          : null;
+      this.recycleRecorder = recorder;
+      try {
+        for (const action of actions.filter((a) => a.type === 'delete')) {
+          await this.assertTargetWritable();
+          await this.performDelete(action);
+          if (action.status === 'failed') throw new Error(`删除未完成：${action.relPath}`);
+        }
+      } finally {
+        // 失败的备份也要落盘登记：已经删掉的内容必须能被找回。
+        await recorder?.flush().catch((err: unknown) => {
+          this.log('error', `回收站索引写入失败，已删除的内容仍保留在归档目录：${errorText(err)}`);
+        });
+        this.recycleRecorder = null;
       }
 
       await this.finalize(options, manifest);
@@ -1143,7 +1209,17 @@ export class BackupService extends EventEmitter {
       await fs.unlink(target);
       await syncDirectory(path.dirname(target));
       if (this.state.syncMode === 'mirror-archive') {
-        this.updateAction(action.id, { status: 'archived', note: '已归档至历史目录' });
+        // 归档副本已由 preserveTarget 落到历史目录，这里只登记索引，
+        // 让用户在界面上能看见并还原这份内容。
+        try {
+          await this.recycleRecorder?.record(action.relPath, action.size);
+          this.updateAction(action.id, { status: 'archived', note: '已移入回收站，可还原' });
+        } catch (err) {
+          // 文件已经删掉了，内容也还在归档目录里；只是索引没写成。
+          // 此时把删除判定为失败会让整场备份中断，比索引缺失更糟。
+          this.log('warn', `回收站登记失败（内容仍保留在归档目录，可手动取回）：${errorText(err)}`);
+          this.updateAction(action.id, { status: 'archived', note: '已归档，但回收站索引未更新' });
+        }
       } else {
         this.updateAction(action.id, { status: 'done' });
       }
@@ -1342,7 +1418,9 @@ export class BackupService extends EventEmitter {
     const previous = await readManifest(targetRoot);
     const files: Record<string, ManifestEntry> = Object.create(null);
     for (const action of plan.actions) {
-      if (action.type === 'delete') continue;
+      // 被删除的和被保留的都不是「本次备份进去的文件」，
+      // 写进清单会让下一轮把它们当成已备份内容参与快判。
+      if (action.type === 'delete' || action.type === 'retain') continue;
       const target = path.join(targetRoot, action.relPath);
       const stat = await fs.stat(target);
       const cached = previous?.files[action.relPath];
