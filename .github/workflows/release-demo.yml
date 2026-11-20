@@ -1,0 +1,53 @@
+name: Windows Demo Release
+
+on:
+  push:
+    tags: ['v0.1demo']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - name: Package Windows x64 installer
+        run: npx --no-install electron-builder --win nsis --x64 --publish never '-c.artifactName=v0.1demo.exe'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-demo
+          path: release/v0.1demo.exe
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-demo
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Backup Studio v0.1 Demo
+          draft: false
+          prerelease: true
+          make_latest: 'false'
+          files: artifacts/v0.1demo.exe
+          fail_on_unmatched_files: true
