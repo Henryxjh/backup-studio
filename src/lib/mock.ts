@@ -7,7 +7,18 @@ import type {
   SyncMode,
 } from '../../shared/types';
 import type { AutoPair, AutoStatus } from '../../shared/aut-types';
-import type { DupGroup, DupReport, DupStatus } from '../../shared/dup-types';
+import type {
+  DupActRequest,
+  DupActResult,
+  DupFileEntry,
+  DupGroup,
+  DupItemAction,
+  DupPhase,
+  DupProgress,
+  DupScanResult,
+  DupStatus,
+  DupSuppression,
+} from '../../shared/dup-types';
 import type { BackupAPI, PlanPayload, ProgressPayload, StartOptions } from './api';
 
 type Handler<T> = (payload: T) => void;
@@ -90,83 +101,184 @@ export function createMockApi(): BackupAPI {
     recycleBytes: 0,
   });
 
-  // 重复文件查找器的浏览器演示状态：不触碰真实文件系统。
-  let dupReport: DupReport | null = null;
-  let dupExcluded: Record<string, number> = {};
-  const dupCopy = (relPath: string, side: 'source' | 'target' | 'both', size: number, mtimeMs: number) => ({
+  // 重复文件检测的浏览器演示状态：不触碰真实文件系统。
+  const DUP_ROOT = 'D:\\资料库\\待清理目录';
+  const dupSha = (seed: string) => seed.repeat(64).slice(0, 64);
+  const dupEntry = (
+    id: string,
+    absPath: string,
+    relPath: string,
+    size: number,
+    mtimeMs: number,
+    sha256: string,
+    suspected = false,
+  ): DupFileEntry => ({
+    id,
+    absPath,
     relPath,
-    side,
+    dirPath: absPath.slice(0, Math.max(absPath.lastIndexOf('\\'), absPath.lastIndexOf('/'))),
+    fileName: absPath.slice(absPath.lastIndexOf('\\') + 1),
     size,
     mtimeMs,
-    basis: 'computed' as const,
+    dev: 'demo-dev',
+    ino: `demo-ino-${id}`,
+    sha256,
+    suspected: suspected || undefined,
+    state: 'pending',
   });
-  const dupGroups = (): DupGroup[] => [
+
+  const dupGroups = (): DupGroup[] => {
+    const photoSha = dupSha('a1b2c3d4');
+    const docSha = dupSha('b7c8d9e0');
+    const bigSha = dupSha('f0e1d2c3');
+    const noteShaA = dupSha('11111111');
+    const noteShaB = dupSha('22222222');
+    const conflictDir = `${DUP_ROOT}\\文档`;
+
+    const photoSize = 4_410_318;
+    const docSize = 128_442;
+    const bigSize = 314_572_800;
+
+    return [
+      {
+        id: photoSha,
+        category: 'identical',
+        fingerprint: 'a1b2c3d4',
+        sha256: photoSha,
+        entries: [
+          dupEntry('p1', `${DUP_ROOT}\\照片\\IMG_20240712.jpg`, '照片/IMG_20240712.jpg', photoSize, 1_721_026_000_000, photoSha),
+          dupEntry('p2', `${DUP_ROOT}\\照片\\归档\\IMG_20240712-已删除.jpg`, '照片/归档/IMG_20240712-已删除.jpg', photoSize, 1_721_030_000_000, photoSha),
+          dupEntry('p3', `${DUP_ROOT}\\照片\\IMG_20240712 (1).jpg`, '照片/IMG_20240712 (1).jpg', photoSize, 1_721_090_000_000, photoSha),
+        ],
+        size: photoSize,
+        reclaimableBytes: photoSize * 2,
+        suggestedKeeperId: 'p1',
+      },
+      {
+        id: docSha,
+        category: 'identical',
+        fingerprint: 'b7c8d9e0',
+        sha256: docSha,
+        entries: [
+          dupEntry('d1', `${DUP_ROOT}\\文档\\2024年度总结报告.docx`, '文档/2024年度总结报告.docx', docSize, 1_720_000_000_000, docSha),
+          dupEntry('d2', `${DUP_ROOT}\\归档\\2024年度总结报告-存档.pdf`, '归档/2024年度总结报告-存档.pdf', docSize, 1_720_500_000_000, docSha),
+        ],
+        size: docSize,
+        reclaimableBytes: docSize,
+        suggestedKeeperId: 'd1',
+      },
+      {
+        id: bigSha,
+        category: 'suspected',
+        fingerprint: 'f0e1d2c3',
+        sha256: bigSha,
+        entries: [
+          dupEntry('s1', `${DUP_ROOT}\\视频\\发布会原片.mov`, '视频/发布会原片.mov', bigSize, 1_719_000_000_000, bigSha, true),
+          dupEntry('s2', `${DUP_ROOT}\\视频\\归档\\发布会原片.mov`, '视频/归档/发布会原片.mov', bigSize, 1_719_400_000_000, bigSha, true),
+        ],
+        size: bigSize,
+        reclaimableBytes: bigSize,
+        suggestedKeeperId: 's1',
+      },
+      {
+        id: `${conflictDir}::会议纪要.md`,
+        category: 'same-name-diff-content',
+        fingerprint: '33333333',
+        entries: [
+          dupEntry('c1', `${conflictDir}\\会议纪要.md`, '文档/会议纪要.md', 12_884, 1_721_100_000_000, noteShaA),
+          dupEntry('c2', `${conflictDir}\\会议纪要.md`, '文档/会议纪要.md', 13_210, 1_721_600_000_000, noteShaB),
+        ],
+        size: 13_210,
+        reclaimableBytes: 0,
+        dirPath: conflictDir,
+        fileName: '会议纪要.md',
+      },
+    ];
+  };
+
+  let dupGroupsState: DupGroup[] = [];
+  let dupResult: DupScanResult | null = null;
+  let dupPhase: DupPhase = 'idle';
+  let dupCancelled = false;
+  let dupProgress: DupProgress = {
+    phase: 'idle',
+    label: '待选目录',
+    done: 0,
+    total: 0,
+    bytesRead: 0,
+    throughputBps: 0,
+  };
+  let dupSuppressions: DupSuppression[] = [
     {
-      hash: 'a'.repeat(64),
-      size: 4_410_318,
-      copies: [
-        dupCopy('media/photos/IMG20240712094530.jpg', 'source', 4_410_318, 1_721_026_000_000),
-        dupCopy('media/raw-captures/IMG20240712094530.jpg', 'source', 4_410_318, 1_721_026_000_000),
-      ],
-      relation: 'source-internal',
-      canonical: 'media/photos/IMG20240712094530.jpg',
-      redundant: [
-        dupCopy('media/raw-captures/IMG20240712094530.jpg', 'source', 4_410_318, 1_721_026_000_000),
-      ],
-      reclaimableBytes: 4_410_318,
-      zeroByte: false,
-      hardLinked: false,
-      adoptable: true,
-      copiesTruncated: false,
-    },
-    {
-      hash: 'b'.repeat(64),
-      size: 18_322,
-      copies: [
-        dupCopy('projects/atlas/src/services/backup-engine/worker-pool.ts', 'source', 18_322, 1_721_100_000_000),
-        dupCopy('projects/atlas/src/services/backup-engine/chunk-copier.ts', 'source', 18_322, 1_721_100_000_000),
-        dupCopy('projects/atlas/docs/architecture/backup-protocol.md', 'source', 18_322, 1_721_100_000_000),
-      ],
-      relation: 'source-internal',
-      canonical: 'projects/atlas/docs/architecture/backup-protocol.md',
-      redundant: [
-        dupCopy('projects/atlas/src/services/backup-engine/chunk-copier.ts', 'source', 18_322, 1_721_100_000_000),
-        dupCopy('projects/atlas/src/services/backup-engine/worker-pool.ts', 'source', 18_322, 1_721_100_000_000),
-      ],
-      reclaimableBytes: 36_644,
-      zeroByte: false,
-      hardLinked: false,
-      adoptable: true,
-      copiesTruncated: false,
-    },
-    {
-      hash: 'c'.repeat(64),
-      size: 128_442,
-      copies: [
-        dupCopy('documents/2024年度总结报告.docx', 'source', 128_442, 1_720_000_000_000),
-        dupCopy('2024年度总结报告.docx', 'target', 128_442, 1_720_500_000_000),
-      ],
-      relation: 'cross-side',
-      canonical: 'documents/2024年度总结报告.docx',
-      redundant: [],
-      reclaimableBytes: 0,
-      zeroByte: false,
-      hardLinked: false,
-      adoptable: false,
-      copiesTruncated: false,
+      sha256: dupSha('deadbeef'),
+      fingerprint: 'deadbeef',
+      scopeRoot: DUP_ROOT,
+      scopeMode: 'root',
+      createdAt: Date.now() - 86_400_000,
+      hitCount: 3,
+      samplePaths: [`${DUP_ROOT}\\归档\\归档包 (1).zip`],
+      sampleFileNames: ['归档包 (1).zip'],
     },
   ];
-  const dupStatus = (): DupStatus => {
+
+  const dupStats = () => {
+    const groups = dupGroupsState;
+    const queued = groups.flatMap((group) => group.entries).filter((entry) => entry.state === 'queued');
+    const touched = new Set(
+      groups.filter((group) => group.entries.some((entry) => entry.state === 'queued')).map((group) => group.id),
+    );
     return {
-      state: dupReport ? 'ready' : 'idle',
-      report: dupReport,
-      excludedPaths: Object.keys(dupExcluded).sort(),
-      excludedCount: Object.keys(dupExcluded).length,
-      excludedBytes: Object.values(dupExcluded).reduce((sum, n) => sum + n, 0),
-      recent: dupReport ? [{ at: Date.now(), action: '重复扫描完成', detail: '浏览器演示：未连接真实文件系统' }] : [],
-      reason: dupReport ? '浏览器演示：未连接真实文件系统，结论仅供界面预览' : undefined,
+      reclaimableBytes: groups
+        .filter((group) => group.category !== 'same-name-diff-content')
+        .reduce((sum, group) => sum + group.reclaimableBytes, 0),
+      pendingDeleteBytes: queued.reduce((sum, entry) => sum + entry.size, 0),
+      pendingDeleteCount: queued.length,
+      pendingDeleteGroups: touched.size,
     };
   };
+
+  const dupBuildResult = (root: string): DupScanResult => {
+    const groups = dupGroupsState;
+    const identicalGroups = groups.filter((group) => group.category === 'identical');
+    const suspectedGroups = groups.filter((group) => group.category === 'suspected');
+    const nameConflictGroups = groups.filter((group) => group.category === 'same-name-diff-content');
+    return {
+      root,
+      summary: {
+        root,
+        totalFiles: 12_840,
+        scannedBytes: 45_218_998_016,
+        skippedEmpty: 37,
+        skippedTooSmall: 12,
+        skippedSymlink: 4,
+        skippedSuppressed: dupSuppressions.length,
+        identicalGroups: identicalGroups.length,
+        nameConflictGroups: nameConflictGroups.length,
+        suspectedGroups: suspectedGroups.length,
+        durationMs: 42_300,
+      },
+      groups,
+      identicalGroups,
+      suspectedGroups,
+      nameConflictGroups,
+      failures: [],
+      stats: dupStats(),
+      complete: true,
+      truncated: false,
+    };
+  };
+
+  const dupStatus = (): DupStatus => ({
+    phase: dupPhase,
+    progress: dupProgress,
+    result: dupResult,
+    suppressions: dupSuppressions,
+    recent: dupResult
+      ? [{ at: Date.now(), action: '重复检测完成', detail: '浏览器演示：未连接真实文件系统', outcome: 'ok' }]
+      : [],
+    reason: dupResult ? '浏览器演示：未连接真实文件系统，结论仅供界面预览' : undefined,
+    canAct: dupPhase === 'ready' || dupPhase === 'done',
+  });
 
   const pushLog = (level: LogEntry['level'], text: string) => {
     seq += 1;
@@ -207,6 +319,7 @@ export function createMockApi(): BackupAPI {
 
   return {
     async pickDirectory(title: string) {
+      if (title.includes('检测')) return 'D:\\资料库\\待清理目录';
       return title.includes('源') ? 'D:\\资料库\\主目录' : 'E:\\备份仓\\每日快照';
     },
 
@@ -356,7 +469,10 @@ export function createMockApi(): BackupAPI {
       return current;
     },
 
-    async reveal() {},
+    async reveal(targetPath: string) {
+      // 浏览器演示：没有真实文件系统，按演示约定模拟「扫描后该文件已不存在」
+      if (targetPath.includes('已删除')) throw new Error('文件已不存在或不可访问');
+    },
 
     async setTheme(mode) {
       return mode === 'light' ? 'light' : 'dark';
@@ -402,57 +518,154 @@ export function createMockApi(): BackupAPI {
       async status() {
         return dupStatus();
       },
-      async scan(sourceRoot: string, targetRoot: string) {
-        await new Promise((r) => setTimeout(r, 380));
-        const groups = dupGroups();
-        dupReport = {
-          sourceRoot,
-          targetRoot,
-          createdAt: Date.now(),
-          durationMs: 380,
-          groups,
-          truncated: false,
-          totalGroups: groups.length,
-          totalCopies: groups.reduce((n, g) => n + g.copies.length, 0),
-          totalBytes: groups.reduce((n, g) => n + g.size * g.copies.length, 0),
-          reclaimableBytes: groups.reduce((n, g) => n + g.reclaimableBytes, 0),
-          failures: [],
-          complete: true,
-          scannedFiles: 12_480,
-          hashedFiles: 318,
-          sourceErrors: 0,
-          targetErrors: 0,
+      async scan(root: string) {
+        dupCancelled = false;
+        dupGroupsState = dupGroups();
+        const stages: DupPhase[] = ['scanning', 'bucketing', 'partial-hashing', 'hashing', 'summarizing'];
+        const labels: Record<string, string> = {
+          scanning: '扫描目录',
+          bucketing: '大小分桶',
+          'partial-hashing': '局部哈希',
+          hashing: '全量哈希',
+          summarizing: '汇总',
+        };
+        for (const stage of stages) {
+          if (dupCancelled) break;
+          dupPhase = stage;
+          for (let step = 0; step < 8; step += 1) {
+            await new Promise((r) => setTimeout(r, 70));
+            if (dupCancelled) break;
+            dupProgress = {
+              phase: stage,
+              label: labels[stage],
+              done: (step + 1) * 125,
+              total: 1000,
+              bytesRead: (step + 1) * 5_242_880,
+              throughputBps: 5_242_880,
+              etaMs: (8 - step) * 700,
+            };
+          }
+        }
+        if (dupCancelled) {
+          dupPhase = 'cancelled';
+          dupProgress = { phase: 'cancelled', label: '已取消', done: 0, total: 0, bytesRead: 0, throughputBps: 0 };
+          return dupStatus();
+        }
+        dupResult = dupBuildResult(root);
+        dupPhase = 'ready';
+        dupProgress = {
+          phase: 'ready',
+          label: '结果就绪',
+          done: 1000,
+          total: 1000,
+          bytesRead: 45_218_998_016,
+          throughputBps: 0,
         };
         return dupStatus();
       },
-      async adopt(hashes: string[]) {
-        const groups = dupReport?.groups ?? [];
-        for (const hash of hashes) {
-          const group = groups.find((g) => g.hash === hash);
-          if (!group) throw new Error('重复组不存在或已失效，请重新扫描');
-          if (!group.adoptable) throw new Error('该重复组不可排除');
-          for (const copy of group.redundant) dupExcluded[copy.relPath] = copy.size;
+      async cancel() {
+        if (dupPhase === 'scanning' || dupPhase === 'bucketing' || dupPhase === 'partial-hashing' || dupPhase === 'hashing' || dupPhase === 'summarizing') {
+          dupCancelled = true;
+          dupPhase = 'cancelled';
+          dupProgress = { phase: 'cancelled', label: '已取消', done: 0, total: 0, bytesRead: 0, throughputBps: 0 };
         }
         return dupStatus();
       },
-      async revoke(hashes?: string[]) {
-        if (!hashes || !hashes.length) {
-          dupExcluded = {};
-          return dupStatus();
+      async markAction(_root: string, itemIds: string[], action: DupItemAction) {
+        for (const group of dupGroupsState) {
+          for (const entry of group.entries) {
+            if (!itemIds.includes(entry.id)) continue;
+            if (action === 'keep') entry.state = 'kept';
+            else if (action === 'delete') entry.state = 'queued';
+          }
         }
-        const groups = dupReport?.groups ?? [];
-        for (const hash of hashes) {
-          const group = groups.find((g) => g.hash === hash);
-          for (const copy of group?.redundant ?? []) delete dupExcluded[copy.relPath];
+        if (dupResult) dupResult = dupBuildResult(dupResult.root);
+        return dupStatus();
+      },
+      async keepGroup(_root: string, groupId: string, keeperId: string) {
+        const group = dupGroupsState.find((item) => item.id === groupId);
+        if (!group) return dupStatus();
+        for (const entry of group.entries) entry.state = entry.id === keeperId ? 'kept' : 'queued';
+        if (dupResult) dupResult = dupBuildResult(dupResult.root);
+        return dupStatus();
+      },
+      async act(root: string, request: DupActRequest): Promise<DupActResult> {
+        dupPhase = 'acting';
+        const items: DupActResult['items'] = [];
+        let reclaimedBytes = 0;
+        for (const item of request.items) {
+          const group = dupGroupsState.find((g) => g.id === item.groupId);
+          const entry = group?.entries.find((e) => e.id === item.id);
+          if (!entry) {
+            items.push({ id: item.id, absPath: item.absPath, outcome: 'failed', reason: '条目已失效，请重新检测' });
+            continue;
+          }
+          entry.state = 'deleted';
+          reclaimedBytes += entry.size;
+          items.push({ id: item.id, absPath: item.absPath, outcome: 'deleted', landedTo: 'system-trash' });
         }
+        dupResult = dupBuildResult(root);
+        dupPhase = 'done';
+        dupProgress = { phase: 'done', label: '已完成', done: 1000, total: 1000, bytesRead: 0, throughputBps: 0 };
+        return {
+          items,
+          deleted: items.filter((item) => item.outcome === 'deleted').length,
+          skipped: 0,
+          blocked: 0,
+          failed: items.filter((item) => item.outcome === 'failed').length,
+          reclaimedBytes,
+          degradedToQuarantine: false,
+        };
+      },
+      async suppress(root: string, sha256: string, scopeMode: 'root' | 'global', samplePaths: string[]) {
+        const sampleFileNames = samplePaths
+          .map((path) => path.slice(path.lastIndexOf('\\') + 1))
+          .filter(Boolean);
+        dupSuppressions = [
+          ...dupSuppressions.filter((item) => item.sha256 !== sha256),
+          {
+            sha256,
+            fingerprint: sha256.slice(0, 8),
+            scopeRoot: root,
+            scopeMode,
+            createdAt: Date.now(),
+            hitCount: 0,
+            samplePaths,
+            sampleFileNames,
+          },
+        ];
+        for (const group of dupGroupsState) {
+          if (group.sha256 === sha256) group.suppressed = true;
+        }
+        if (dupResult) dupResult = dupBuildResult(dupResult.root);
+        return dupStatus();
+      },
+      async listSuppressions() {
+        return dupSuppressions;
+      },
+      async revokeSuppression(sha256?: string) {
+        const revoked = new Set(sha256 ? [sha256] : dupSuppressions.map((item) => item.sha256));
+        dupSuppressions = dupSuppressions.filter((item) => !revoked.has(item.sha256));
+        for (const group of dupGroupsState) {
+          if (!group.sha256 || !revoked.has(group.sha256)) continue;
+          group.suppressed = false;
+          for (const entry of group.entries) entry.state = 'pending';
+        }
+        if (dupResult) dupResult = dupBuildResult(dupResult.root);
         return dupStatus();
       },
       async exportReport(format: 'json' | 'csv') {
-        const text = format === 'csv' ? 'hash,size,relation,relPath\n' : JSON.stringify(dupReport, null, 2);
+        const text = format === 'csv' ? 'fingerprint,size,relPath\n' : JSON.stringify(dupResult, null, 2);
         return { path: `D:\\报告\\duplicate-report.${format}`, bytes: text.length };
       },
-      async cancel() {
-        return dupStatus();
+      async restoreQuarantine(id: string) {
+        return { restored: false, reason: `浏览器演示：未连接真实文件系统，未还原隔离区条目 ${id}` };
+      },
+      async reveal(root: string, absPath: string) {
+        // 浏览器演示：按演示约定模拟「扫描后该文件已不存在」
+        if (!root) throw new Error('当前没有扫描结果，请先执行重复文件检测');
+        if (absPath.includes('已删除')) throw new Error('文件已不存在或不可访问');
+        return { revealed: true };
       },
     },
 

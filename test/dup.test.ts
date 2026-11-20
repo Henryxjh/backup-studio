@@ -1,0 +1,1006 @@
+import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import type { Dirent } from 'node:fs';
+import path from 'node:path';
+import { DuplicateFinder } from '../electron/engine/dup';
+import { groupNameConflicts } from '../electron/engine/dup/detect';
+import { FULL_HASH_LIMIT_BYTES } from '../electron/engine/dup/hash';
+import type {
+  DupActRequest,
+  DupActResult,
+  DupCategory,
+  DupFileEntry,
+  DupGroup,
+  DupPhase,
+  DupProgress,
+  DupScanResult,
+  DupStatus,
+} from '../shared/dup-types';
+
+/**
+ * REQ-DUP-001《重复文件检测与清理》独立测试套件。
+ *
+ * 依据 `docs/REQUIREMENTS-003-DUPLICATE-FINDER.md` §11 的验收标准编写，
+ * 对应 §14.2 / §17 约定的落地文件 `test/dup.test.ts`。
+ *
+ * 约定：
+ * - 判定引擎只读、删除走注入的假实现，测试不触碰真实回收站、不依赖真实时间排序；
+ * - 夹具全部落在 `test/.dup-unit-*`（已被 .gitignore 忽略），用例结束即清理；
+ * - 进度阶段是瞬时状态，观察走引擎的 `progress` 事件，阶段覆盖在全套用例结束后汇总断言。
+ */
+
+let passed = 0;
+let failed = 0;
+
+async function test(name: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+    passed += 1;
+    console.log(`PASS ${name}`);
+  } catch (err) {
+    failed += 1;
+    console.error(`FAIL ${name}`);
+    console.error(`     ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+  }
+}
+
+// ---------------------------------------------------------------- 夹具工具
+
+/** 默认最小文件尺寸为 1 KiB，测试样本一律取 2 KiB 以上，避免被阈值筛掉 */
+const BLOB_SIZE = 2048;
+
+/**
+ * 夹具临时目录：落在 `test/.dup-unit-*`（已被 .gitignore 忽略）。
+ * 以脚本所在目录为基准，避免从任意工作目录启动时落到仓库之外。
+ */
+const FIXTURE_ROOT = typeof __dirname === 'string' ? __dirname : path.resolve('test');
+
+/** 确定性内容：同一 seed 必得同一串字节，不同 seed 必得不同内容 */
+function blob(seed: string, size = BLOB_SIZE): Buffer {
+  const unit = `${seed}-`;
+  let text = '';
+  while (text.length < size) text += unit;
+  return Buffer.from(text.slice(0, size), 'utf8');
+}
+
+async function put(root: string, rel: string, content: Buffer | string): Promise<string> {
+  const abs = path.join(root, rel);
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  await fs.writeFile(abs, content);
+  return abs;
+}
+
+/** 固定修改时间，让「最早 mtime」类规则可确定复现 */
+async function setMtime(abs: string, ms: number): Promise<void> {
+  const t = new Date(ms);
+  await fs.utimes(abs, t, t);
+}
+
+/** 目录快照：用于验证扫描全程只读 */
+async function snapshot(root: string): Promise<string> {
+  const lines: string[] = [];
+  const walk = async (dir: string, rel: string): Promise<void> => {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        lines.push(`d ${childRel}`);
+        await walk(abs, childRel);
+        continue;
+      }
+      const st = await fs.stat(abs);
+      lines.push(`f ${childRel} ${st.size} ${st.mtimeMs}`);
+    }
+  };
+  await walk(root, '');
+  return lines.join('\n');
+}
+
+interface FixtureOptions {
+  /** 假回收站：抛错即模拟「系统回收站不可用」 */
+  trash?: (absPath: string) => Promise<void>;
+  /** 假写入闸门 */
+  gate?: (root: string) => Promise<{ allowed: boolean; reason?: string }>;
+  /** 假备份忙闲状态 */
+  isBusy?: () => boolean;
+}
+
+interface Fixture {
+  base: string;
+  /** 被检测的目录 */
+  root: string;
+  /** 本机状态目录（抑制清单 / 隔离区 / 审计日志） */
+  local: string;
+  finder: DuplicateFinder;
+  /** 假回收站收到的路径 */
+  trashCalls: string[];
+  /** 抑制清单变更回调 */
+  changes: string[];
+  /** 假备份忙闲开关 */
+  busy: { value: boolean };
+}
+
+async function fixture(options: FixtureOptions, fn: (fx: Fixture) => Promise<void>): Promise<void> {
+  const base = await fs.mkdtemp(path.join(FIXTURE_ROOT, '.dup-unit-'));
+  const root = path.join(base, 'scan');
+  const local = path.join(base, 'local');
+  await fs.mkdir(root, { recursive: true });
+  await fs.mkdir(local, { recursive: true });
+
+  const trashCalls: string[] = [];
+  const changes: string[] = [];
+  const busy = { value: false };
+
+  /** 假回收站：模拟 shell.trashItem 的语义——路径从原处消失，文件本身还在 */
+  const simTrash = async (absPath: string): Promise<void> => {
+    trashCalls.push(absPath);
+    const dir = path.join(base, 'trash-sim');
+    await fs.mkdir(dir, { recursive: true });
+    await fs.rename(absPath, path.join(dir, path.basename(absPath)));
+  };
+
+  const finder = new DuplicateFinder(local, {
+    trash: options.trash ?? simTrash,
+    gate: options.gate ?? (async () => ({ allowed: true })),
+    isBusy: options.isBusy ?? (() => busy.value),
+    onSuppressionsChanged: (changedRoot, reason) => changes.push(`${changedRoot}|${reason}`),
+  });
+
+  try {
+    await fn({ base, root, local, finder, trashCalls, changes, busy });
+  } finally {
+    await fs.rm(base, { recursive: true, force: true });
+  }
+}
+
+// ------------------------------------------------------------ 结果读取工具
+
+function resultOf(status: DupStatus): DupScanResult {
+  assert.ok(status.result, '扫描后应有结果');
+  return status.result;
+}
+
+/** 按条目 id 找当前状态 */
+function entryState(status: DupStatus, id: string): string | undefined {
+  for (const group of status.result?.groups ?? []) {
+    const entry = group.entries.find((e) => e.id === id);
+    if (entry) return entry.state;
+  }
+  return undefined;
+}
+
+function entryOf(group: DupGroup, absPath: string): DupFileEntry {
+  const entry = group.entries.find((e) => e.absPath === absPath);
+  assert.ok(entry, `组内应包含条目 ${absPath}`);
+  return entry;
+}
+
+/**
+ * 构造一条结果条目。
+ *
+ * 「同一父目录内完全同名」的两个文件在真实文件系统上无法并存，
+ * 告警区的判定口径因此由引擎导出的 groupNameConflicts 直接验证。
+ */
+function fakeEntry(input: {
+  absPath: string;
+  dirPath: string;
+  fileName: string;
+  sha256: string;
+  size?: number;
+  mtimeMs?: number;
+}): DupFileEntry {
+  return {
+    id: `${input.absPath}::${input.sha256.slice(0, 16)}`,
+    absPath: input.absPath,
+    relPath: input.fileName,
+    dirPath: input.dirPath,
+    fileName: input.fileName,
+    size: input.size ?? BLOB_SIZE,
+    mtimeMs: input.mtimeMs ?? 1,
+    dev: '1',
+    ino: '2',
+    sha256: input.sha256,
+    state: 'pending',
+  };
+}
+
+/** 包含指定路径的所有组 */
+function groupsContaining(result: DupScanResult, absPath: string): DupGroup[] {
+  return result.groups.filter((g) => g.entries.some((e) => e.absPath === absPath));
+}
+
+/** 构造执行删除请求 */
+function buildRequest(
+  root: string,
+  picks: { group: DupGroup; entries: DupFileEntry[] }[],
+  category: DupCategory,
+): DupActRequest {
+  const items = picks.flatMap(({ group, entries }) =>
+    entries.map((e) => ({
+      id: e.id,
+      absPath: e.absPath,
+      groupId: group.id,
+      sha256: e.sha256,
+      size: e.size,
+      dev: e.dev,
+      ino: e.ino,
+    })),
+  );
+  const groupIds = [...new Set(picks.map((p) => p.group.id))];
+  return { root, items, groupIds, category };
+}
+
+/** 阶段顺序：进度只允许向前推进 */
+const PHASE_ORDER: DupPhase[] = [
+  'idle',
+  'scanning',
+  'bucketing',
+  'partial-hashing',
+  'hashing',
+  'summarizing',
+  'ready',
+  'acting',
+  'done',
+  'failed',
+  'cancelled',
+];
+
+/** 全套用例累计观测到的阶段（瞬时状态快于轮询间隔，故跨用例汇总） */
+const observedPhases = new Set<DupPhase>();
+
+/**
+ * 扫描并记录途经的进度阶段。
+ *
+ * 引擎的 `status()` 与扫描串行化（扫描期间调用会排队到扫描之后），
+ * 因此阶段观测走引擎的 `progress` 事件，而不是轮询状态。
+ */
+async function scanWatch(
+  finder: DuplicateFinder,
+  root: string,
+  options?: { minSizeBytes?: number },
+): Promise<{ status: DupStatus; phases: DupPhase[] }> {
+  const phases: DupPhase[] = [];
+  const listener = (progress: DupProgress): void => {
+    phases.push(progress.phase);
+    observedPhases.add(progress.phase);
+  };
+  finder.on('progress', listener);
+  try {
+    const status = await finder.scan(root, options);
+    phases.push(status.progress.phase);
+    observedPhases.add(status.progress.phase);
+    return { status, phases };
+  } finally {
+    finder.off('progress', listener);
+  }
+}
+
+/** 校验阶段序列单调向前，且不含终态之外的非法值 */
+function assertPhaseOrder(phases: DupPhase[]): void {
+  let last = -1;
+  for (const phase of phases) {
+    const index = PHASE_ORDER.indexOf(phase);
+    assert.ok(index >= 0, `非法阶段 ${phase}`);
+    assert.ok(index >= last, `阶段回退：${phase}（此前 ${PHASE_ORDER[last]}）`);
+    last = index;
+  }
+}
+
+/** 隔离区条目的候选 id：目录名 / 文件名 / 审计日志里出现过的 id */
+async function quarantineCandidates(local: string): Promise<string[]> {
+  const candidates: string[] = [];
+  const dir = path.join(local, 'quarantine');
+  const walk = async (current: string): Promise<void> => {
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const abs = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        candidates.push(entry.name);
+        await walk(abs);
+      } else {
+        candidates.push(entry.name);
+        candidates.push(entry.name.replace(/\.[^.]+$/, ''));
+      }
+    }
+  };
+  await walk(dir);
+
+  // 审计日志里可能记录了隔离条目 id
+  let auditFiles: string[] = [];
+  try {
+    auditFiles = await fs.readdir(local);
+  } catch {
+    auditFiles = [];
+  }
+  for (const name of auditFiles.filter((n) => /^audit-.*\.jsonl$/.test(n))) {
+    try {
+      const text = await fs.readFile(path.join(local, name), 'utf8');
+      for (const match of text.matchAll(/"(?:id|quarantineId)"\s*:\s*"([^"]+)"/g)) {
+        candidates.push(match[1]);
+      }
+    } catch {
+      // 审计日志读不到不影响其他候选
+    }
+  }
+  return [...new Set(candidates)];
+}
+
+async function main(): Promise<void> {
+  // ------------------------------------------------ §11-1 进度五阶段与取消
+
+  await test('§11-1 扫描完成并按「扫描目录→大小分桶→局部哈希→全量哈希→汇总」推进', () =>
+    fixture({}, async ({ root, finder }) => {
+      // 同内容同尺寸的大样本：让分桶、局部哈希、全量哈希、汇总四段都有可观工作量
+      for (let i = 0; i < 400; i += 1) await put(root, `bulk/f${i}.bin`, blob('bulk'));
+      const { status, phases } = await scanWatch(finder, root);
+      assert.equal(status.phase, 'ready');
+      assertPhaseOrder(phases);
+      assert.ok(phases.includes('scanning'), '应观测到扫描目录阶段');
+      assert.ok(phases.includes('ready'), '应观测到就绪阶段');
+      assert.equal(resultOf(status).summary.identicalGroups, 1);
+    }));
+
+  await test('§11-1 扫描可随时取消，取消后状态为「已取消」而非「完成」', () =>
+    fixture({}, async ({ root, finder }) => {
+      for (let i = 0; i < 300; i += 1) await put(root, `bulk/f${i}.bin`, blob(`bulk-${i}`, 32 * 1024));
+      const promise = finder.scan(root);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await finder.cancel();
+      const status = await promise;
+      assert.equal(status.phase, 'cancelled');
+      assert.notEqual(status.phase, 'done');
+      assert.equal((await finder.status()).phase, 'cancelled');
+    }));
+
+  // ------------------------------------------------ §11-2 内容重复分组
+
+  await test('§11-2 内容相同、文件名不同的两个文件出现在同一「内容重复」组', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'docs/first-name.txt', blob('same-content'));
+      await put(root, 'other/second-name.bin', blob('same-content'));
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      assert.equal(result.identicalGroups.length, 1);
+      const group = result.identicalGroups[0];
+      assert.equal(group.entries.length, 2);
+      assert.equal(group.category, 'identical');
+      assert.equal(group.size, BLOB_SIZE);
+      assert.equal(group.reclaimableBytes, BLOB_SIZE);
+      assert.ok(group.sha256 && group.sha256.length === 64);
+      assert.equal(group.fingerprint, group.sha256.slice(0, 8));
+    }));
+
+  // ------------------------------------------------ §11-3 同名不同内容告警区
+
+  await test('§11-3 同目录内同名但内容不同的两个文件进入独立告警区，且默认无任何预选', () =>
+    fixture({}, async ({ root, finder }) => {
+      // 「同一父目录内完全同名」的两个文件在真实文件系统上无法并存；
+      // 唯一能在真实扫描里同时存在的同名形态是 Unicode 规范化等价的两个名字
+      //（NFC 与 NFD 在 NTFS 上是两个文件，引擎按 NFC 归一后视为同名）。
+      const dir = path.join(root, 'nc');
+      const nfcName = `caf${String.fromCharCode(0x00e9)}.txt`;
+      const nfdName = `cafe${String.fromCharCode(0x0301)}.txt`;
+      await put(dir, nfcName, blob('unicode-nfc'));
+      await put(dir, nfdName, blob('unicode-nfd'));
+
+      const listed = await fs.readdir(dir);
+      if (listed.length < 2) {
+        // 文件系统自身会做规范化（如同 macOS）：两个名字落成同一个文件，无法构造该形态
+        return;
+      }
+
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      assert.equal(result.nameConflictGroups.length, 1, '同名不同内容应形成独立告警组');
+      const conflict = result.nameConflictGroups[0];
+      assert.equal(conflict.category, 'same-name-diff-content');
+      assert.equal(conflict.entries.length, 2);
+      // 同名不同内容：组内各条内容哈希互不相同
+      assert.equal(new Set(conflict.entries.map((e) => e.sha256)).size, 2);
+      // 告警组落在同一父目录、同一文件名上
+      assert.equal(conflict.dirPath, dir);
+      assert.ok([nfcName, nfdName].includes(conflict.fileName ?? ''));
+      // 同名不同内容区不计入可回收空间
+      assert.equal(conflict.reclaimableBytes, 0);
+      // 默认不预选任何删除项
+      for (const entry of conflict.entries) {
+        assert.equal(entry.state, 'pending', '告警区默认不应有预选状态');
+      }
+      assert.equal(result.stats.pendingDeleteCount, 0);
+      assert.equal(result.stats.pendingDeleteBytes, 0);
+      // 告警区与内容重复区物理分离
+      assert.equal(result.identicalGroups.length, 0);
+    }));
+
+  await test('§11-3 同目录同名但内容相同的文件不进告警区（归入内容重复区）', async () => {
+    const dir = 'D:\\资料库\\文档';
+    const same = 'c'.repeat(64);
+    const groups = groupNameConflicts([
+      fakeEntry({ absPath: `${dir}\\说明.md`, dirPath: dir, fileName: '说明.md', sha256: same }),
+      fakeEntry({ absPath: `${dir}\\说明.md`, dirPath: dir, fileName: '说明.md', sha256: same }),
+    ]);
+    assert.equal(groups.length, 0, '同名且同内容属于内容重复，不得在告警区重复出现');
+  });
+
+  await test('§11-3 同目录同名但内容不同的两个文件构成告警组，且默认不预选', async () => {
+    // 判定口径的单元级验证：告警组按「父目录 + 文件名」归并，内容不同才成组
+    const dir = 'D:\\资料库\\文档';
+    const groups = groupNameConflicts([
+      fakeEntry({ absPath: `${dir}\\会议纪要.md`, dirPath: dir, fileName: '会议纪要.md', sha256: 'a'.repeat(64), size: 12_884 }),
+      fakeEntry({ absPath: `${dir}\\会议纪要.md`, dirPath: dir, fileName: '会议纪要.md', sha256: 'b'.repeat(64), size: 13_210 }),
+    ]);
+    assert.equal(groups.length, 1);
+    const conflict = groups[0];
+    assert.equal(conflict.category, 'same-name-diff-content');
+    assert.equal(conflict.entries.length, 2);
+    assert.equal(conflict.dirPath, dir);
+    assert.equal(conflict.fileName, '会议纪要.md');
+    assert.equal(conflict.reclaimableBytes, 0, '同名不同内容区不计入可回收空间');
+    for (const entry of conflict.entries) {
+      assert.equal(entry.state, 'pending', '告警区默认不应有预选状态');
+    }
+  });
+
+  await test('§11-3 跨目录同名文件不进告警区', async () => {
+    const groups = groupNameConflicts([
+      fakeEntry({ absPath: 'D:\\资料库\\一\\同名.txt', dirPath: 'D:\\资料库\\一', fileName: '同名.txt', sha256: 'd'.repeat(64) }),
+      fakeEntry({ absPath: 'D:\\资料库\\二\\同名.txt', dirPath: 'D:\\资料库\\二', fileName: '同名.txt', sha256: 'e'.repeat(64) }),
+    ]);
+    assert.equal(groups.length, 0, '跨目录同名不属于告警区');
+  });
+
+  // ------------------------------------------------ §11-4 跨目录同名
+
+  await test('§11-4 跨目录同名文件既不进告警区也不视为重复', () =>
+    fixture({}, async ({ root, finder }) => {
+      const a = await put(root, 'dir-one/same-name.txt', blob('content-one'));
+      const b = await put(root, 'dir-two/same-name.txt', blob('content-two'));
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      assert.equal(result.nameConflictGroups.length, 0, '跨目录同名不应进入告警区');
+      assert.equal(result.identicalGroups.length, 0, '跨目录同名不应视为重复');
+      assert.equal(groupsContaining(result, a).length, 0);
+      assert.equal(groupsContaining(result, b).length, 0);
+    }));
+
+  // ------------------------------------------------ §11-5 三动作互斥
+
+  await test('§11-5 每条结果的「保留 / 删除 / 下次不提醒」三动作互斥生效', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'a/one.txt', blob('dup'));
+      await put(root, 'b/two.txt', blob('dup'));
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      const target = group.entries[0];
+
+      let state = await finder.markAction(root, [target.id], 'keep');
+      assert.equal(entryState(state, target.id), 'kept');
+      assert.equal(resultOf(state).stats.pendingDeleteCount, 0);
+
+      state = await finder.markAction(root, [target.id], 'delete');
+      assert.equal(entryState(state, target.id), 'queued');
+      assert.equal(resultOf(state).stats.pendingDeleteCount, 1);
+
+      // 互斥：改标保留必须把待删状态撤回
+      state = await finder.markAction(root, [target.id], 'keep');
+      assert.equal(entryState(state, target.id), 'kept');
+      assert.equal(resultOf(state).stats.pendingDeleteCount, 0);
+
+      // 「下次不提醒」写入抑制清单
+      state = await finder.markAction(root, [target.id], 'suppress');
+      const list = await finder.listSuppressions(root);
+      assert.equal(list.length, 1);
+      assert.equal(list[0].sha256, group.sha256);
+      assert.equal(list[0].scopeMode, 'root');
+    }));
+
+  // ------------------------------------------------ §11-6 组级动作与组主规则
+
+  await test('§11-6 组级「保留此份，其余可删」可用，组主按「无副本标记 + 最早 mtime + 最短路径」建议', () =>
+    fixture({}, async ({ root, finder }) => {
+      // 组一：带副本标记的文件即使更早也不做组主
+      const marked = await put(root, 'docs/plain (1).txt', blob('group-one'));
+      const plain = await put(root, 'docs/plain.txt', blob('group-one'));
+      await setMtime(marked, 1_000);
+      await setMtime(plain, 5_000);
+
+      // 组二：都没有副本标记，取最早 mtime
+      const older = await put(root, 'keep/old.txt', blob('group-two'));
+      const newer = await put(root, 'keep/new.txt', blob('group-two'));
+      await setMtime(older, 1_000);
+      await setMtime(newer, 9_000);
+
+      // 组三：mtime 相同，取路径最短
+      const deep = await put(root, 'dir/deep/longer-name.txt', blob('group-three'));
+      const short = await put(root, 'sh.txt', blob('group-three'));
+      await setMtime(deep, 3_000);
+      await setMtime(short, 3_000);
+
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      assert.equal(result.identicalGroups.length, 3);
+
+      const groupOne = groupsContaining(result, plain)[0];
+      assert.ok(groupOne.suggestedKeeperId, '组主建议必须给出');
+      assert.equal(entryOf(groupOne, plain).id, groupOne.suggestedKeeperId);
+
+      const groupTwo = groupsContaining(result, older)[0];
+      assert.equal(entryOf(groupTwo, older).id, groupTwo.suggestedKeeperId);
+
+      const groupThree = groupsContaining(result, short)[0];
+      assert.equal(entryOf(groupThree, short).id, groupThree.suggestedKeeperId);
+
+      // 组级动作：保留指定的一份，其余进入待删队列
+      const keeper = entryOf(groupOne, plain);
+      const other = entryOf(groupOne, marked);
+      const after = await finder.keepGroup(root, groupOne.id, keeper.id);
+      assert.equal(entryState(after, keeper.id), 'kept');
+      assert.equal(entryState(after, other.id), 'queued');
+      assert.equal(resultOf(after).stats.pendingDeleteCount, 1);
+    }));
+
+  // ------------------------------------------------ §11-7 疑似重复区
+
+  await test('§11-7 超过 256 MiB 的重复文件进入疑似区，不混入确定结果', () =>
+    fixture({}, async ({ root, finder }) => {
+      // 阈值由引擎常量给定（256 MiB），这里用稀疏文件构造超阈值样本：
+      // 稀疏文件只占元数据、不占磁盘，且疑似项只算局部哈希，读放大可控。
+      const size = FULL_HASH_LIMIT_BYTES + 1024;
+      const bigA = path.join(root, 'big/first.dat');
+      const bigB = path.join(root, 'big/second.dat');
+      await fs.mkdir(path.dirname(bigA), { recursive: true });
+      await sparseFile(bigA, size);
+      await sparseFile(bigB, size);
+
+      await put(root, 'small/one.txt', blob('small'));
+      await put(root, 'small/two.txt', blob('small'));
+
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      assert.ok(result.suspectedGroups.length > 0, '超阈值重复应出现在疑似区');
+      const suspected = result.suspectedGroups[0];
+      assert.equal(suspected.category, 'suspected');
+      assert.equal(suspected.entries.length, 2);
+      for (const entry of suspected.entries) {
+        assert.equal(entry.suspected, true, '疑似条目应标记未全量校验');
+      }
+      // 不混入确定结果区
+      for (const group of result.identicalGroups) {
+        assert.ok(
+          !group.entries.some((e) => e.absPath === bigA || e.absPath === bigB),
+          '疑似项不得混入内容重复区',
+        );
+      }
+      assert.equal(result.identicalGroups.length, 1, '确定区只应有小文件那一组');
+    }));
+
+  // ------------------------------------------------ §11-8 回收站落地
+
+  await test('§11-8 删除后文件落入系统回收站（注入的假回收站被调用）', () =>
+    fixture({}, async ({ root, finder, trashCalls }) => {
+      await put(root, 'a/one.txt', blob('trash-me'));
+      await put(root, 'b/two.txt', blob('trash-me'));
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      const victim = group.entries[0];
+      const keeper = group.entries[1];
+
+      await finder.markAction(root, [victim.id], 'delete');
+      const acted = await finder.act(
+        root,
+        buildRequest(root, [{ group, entries: [victim] }], 'identical'),
+      );
+      assert.equal(acted.deleted, 1);
+      assert.equal(acted.items[0].outcome, 'deleted');
+      assert.equal(acted.items[0].landedTo, 'system-trash');
+      assert.equal(acted.degradedToQuarantine, false);
+      assert.deepEqual(trashCalls, [victim.absPath]);
+      // 保留的那一份必须还在
+      await fs.stat(keeper.absPath);
+    }));
+
+  await test('§11-8 回收站不可用时降级本机隔离区，且可还原', () =>
+    fixture(
+      {
+        trash: async () => {
+          throw new Error('系统回收站不可用');
+        },
+      },
+      async ({ root, local, finder }) => {
+        await put(root, 'a/one.txt', blob('quarantine-me'));
+        await put(root, 'b/two.txt', blob('quarantine-me'));
+        const { status } = await scanWatch(finder, root);
+        const group = resultOf(status).identicalGroups[0];
+        const victim = group.entries[0];
+
+        await finder.markAction(root, [victim.id], 'delete');
+        const acted = await finder.act(
+          root,
+          buildRequest(root, [{ group, entries: [victim] }], 'identical'),
+        );
+        assert.equal(acted.deleted, 1);
+        assert.equal(acted.items[0].landedTo, 'quarantine');
+        assert.equal(acted.degradedToQuarantine, true, '降级必须被明确标记');
+
+        // 原路径已空，文件进了本机隔离区
+        await assert.rejects(fs.stat(victim.absPath), { code: 'ENOENT' });
+        const candidates = await quarantineCandidates(local);
+        assert.ok(candidates.length > 0, '隔离区应有落地的文件');
+
+        // 隔离区可还原
+        let restored = false;
+        for (const id of candidates) {
+          const outcome = await finder.restoreQuarantine(id);
+          if (outcome.restored) {
+            restored = true;
+            break;
+          }
+        }
+        assert.ok(restored, '隔离区条目应可还原');
+        assert.equal(await fs.readFile(victim.absPath, 'utf8'), blob('quarantine-me').toString('utf8'));
+      }));
+
+  // ------------------------------------------------ §11-9 删除前二次校验
+
+  await test('§11-9 扫描后修改的文件被跳过并提示「扫描后已变更，已跳过」，其余照常删除', () =>
+    fixture({}, async ({ root, finder }) => {
+      // 三份同内容：请求其中两份时仍满足「每组至少留一份」，否则会被 FR-11 先拦下
+      const changed = await put(root, 'a/one.txt', blob('will-change'));
+      const other = await put(root, 'b/two.txt', blob('will-change'));
+      await put(root, 'c/three.txt', blob('will-change'));
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      assert.equal(group.entries.length, 3);
+      const victim = group.entries.find((e) => e.absPath === changed)!;
+      const otherEntry = group.entries.find((e) => e.absPath === other)!;
+
+      // 扫描后原地改内容（大小不变，只有哈希变了）
+      await fs.writeFile(changed, blob('changed-now'));
+
+      await finder.markAction(root, [victim.id, otherEntry.id], 'delete');
+      const acted = await finder.act(
+        root,
+        buildRequest(root, [{ group, entries: [victim, otherEntry] }], 'identical'),
+      );
+      const changedResult = acted.items.find((i) => i.absPath === changed)!;
+      const otherResult = acted.items.find((i) => i.absPath === other)!;
+      assert.equal(changedResult.outcome, 'skipped-changed');
+      assert.match(changedResult.reason ?? '', /已变更/);
+      assert.equal(otherResult.outcome, 'deleted');
+      assert.equal(acted.skipped, 1);
+      assert.equal(acted.deleted, 1);
+      // 变更过的文件不得被删
+      await fs.stat(changed);
+    }));
+
+  // ------------------------------------------------ §11-10 写入闸门拒绝
+
+  await test('§11-10 写入闸门拒绝时删除被拒并给出阻断原因', () =>
+    fixture(
+      { gate: async () => ({ allowed: false, reason: '介质处于 L2 隔离' }) },
+      async ({ root, finder }) => {
+        await put(root, 'a/one.txt', blob('blocked'));
+        await put(root, 'b/two.txt', blob('blocked'));
+        const { status } = await scanWatch(finder, root);
+        const group = resultOf(status).identicalGroups[0];
+        const victim = group.entries[0];
+
+        await finder.markAction(root, [victim.id], 'delete');
+        const acted = await finder.act(
+          root,
+          buildRequest(root, [{ group, entries: [victim] }], 'identical'),
+        );
+        assert.equal(acted.deleted, 0);
+        assert.equal(acted.blocked, 1);
+        assert.equal(acted.items[0].outcome, 'blocked');
+        assert.ok((acted.items[0].reason ?? '').length > 0, '阻断必须给出原因');
+        await fs.stat(victim.absPath);
+      }));
+
+  // ------------------------------------------------ §11-11 备份运行中禁止删除
+
+  await test('§11-11 备份运行中删除不可执行（canAct 为假并给出原因）', () =>
+    fixture({}, async ({ root, finder, busy }) => {
+      await put(root, 'a/one.txt', blob('busy'));
+      await put(root, 'b/two.txt', blob('busy'));
+
+      await scanWatch(finder, root);
+      assert.equal((await finder.status()).canAct, true);
+
+      busy.value = true;
+      const blocked = await finder.status();
+      assert.equal(blocked.canAct, false);
+      assert.ok((blocked.blockedReason ?? '').length > 0, '必须给出禁止删除的原因');
+
+      busy.value = false;
+      assert.equal((await finder.status()).canAct, true);
+    }));
+
+  // ------------------------------------------------ §11-12 每组至少保留一份
+
+  await test('§11-12 整组全部标记删除时该组被拒，其他组照常执行', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'a/one.txt', blob('group-alpha'));
+      await put(root, 'a/two.txt', blob('group-alpha'));
+      await put(root, 'b/three.txt', blob('group-beta'));
+      await put(root, 'b/four.txt', blob('group-beta'));
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      const groupA = groupsContaining(result, path.join(root, 'a/one.txt'))[0];
+      const groupB = groupsContaining(result, path.join(root, 'b/three.txt'))[0];
+
+      // 整组全选删除
+      await finder.markAction(root, groupA.entries.map((e) => e.id), 'delete');
+      // 另一组只删一份
+      await finder.markAction(root, [groupB.entries[0].id], 'delete');
+
+      const acted = await finder.act(
+        root,
+        buildRequest(
+          root,
+          [
+            { group: groupA, entries: groupA.entries },
+            { group: groupB, entries: [groupB.entries[0]] },
+          ],
+          'identical',
+        ),
+      );
+
+      // 硬约束：A 组至少留一份
+      const aliveA = await Promise.all(
+        groupA.entries.map(async (e) => {
+          try {
+            await fs.stat(e.absPath);
+            return true;
+          } catch {
+            return false;
+          }
+        }),
+      );
+      assert.ok(aliveA.some(Boolean), '每组至少保留一份，A 组不得被清空');
+      // 被拒必须给出提示
+      const blockedHint =
+        acted.blocked > 0 ||
+        acted.items.some((i) => i.outcome === 'blocked') ||
+        ((await finder.status()).reason ?? '').includes('保留');
+      assert.ok(blockedHint, '整组全删必须被拒并提示「至少保留一份」');
+      // 其他组照常执行
+      assert.ok(
+        acted.items.some((i) => i.absPath === groupB.entries[0].absPath && i.outcome === 'deleted'),
+        '其他组应照常删除',
+      );
+    }));
+
+  // ------------------------------------------------ §11-13 抑制后不再出现
+
+  await test('§11-13 「下次不提醒」后重新扫描该组不再出现，摘要计入抑制跳过数', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'a/one.txt', blob('suppress-me'));
+      await put(root, 'b/two.txt', blob('suppress-me'));
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+
+      await finder.markAction(root, [group.entries[0].id], 'suppress');
+
+      const again = await scanWatch(finder, root);
+      const result = resultOf(again.status);
+      assert.ok(
+        !result.groups.some((g) => g.entries.some((e) => e.absPath === group.entries[0].absPath)),
+        '被抑制的组不得再出现',
+      );
+      assert.ok(result.summary.skippedSuppressed > 0, '摘要必须报告因抑制跳过的组数');
+    }));
+
+  // ------------------------------------------------ §11-14 抑制清单与撤销
+
+  await test('§11-14 抑制清单可列出、可逐条撤销、可全部撤销，撤销后该组重新提示', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'a/one.txt', blob('alpha-content'));
+      await put(root, 'a/two.txt', blob('alpha-content'));
+      await put(root, 'b/three.txt', blob('beta-content'));
+      await put(root, 'b/four.txt', blob('beta-content'));
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      const groupA = groupsContaining(result, path.join(root, 'a/one.txt'))[0];
+      const groupB = groupsContaining(result, path.join(root, 'b/three.txt'))[0];
+
+      await finder.suppress(root, groupA.sha256!, 'root', [groupA.entries[0].absPath]);
+      await finder.suppress(root, groupB.sha256!, 'root', [groupB.entries[0].absPath]);
+
+      const list = await finder.listSuppressions(root);
+      assert.equal(list.length, 2);
+      assert.ok(list.every((s) => s.scopeMode === 'root'));
+      assert.ok(list.every((s) => s.fingerprint.length === 8));
+
+      // 逐条撤销
+      await finder.revokeSuppression(groupA.sha256);
+      const afterOne = await finder.listSuppressions(root);
+      assert.equal(afterOne.length, 1);
+      assert.equal(afterOne[0].sha256, groupB.sha256);
+
+      // 撤销后该组重新提示
+      const rescan = await scanWatch(finder, root);
+      assert.ok(
+        resultOf(rescan.status).identicalGroups.some((g) => g.sha256 === groupA.sha256),
+        '撤销后该组应重新提示',
+      );
+
+      // 全部撤销
+      await finder.revokeSuppression();
+      assert.equal((await finder.listSuppressions(root)).length, 0);
+    }));
+
+  await test('§11-14 抑制项不会出现在待删队列', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'a/one.txt', blob('alpha-content'));
+      await put(root, 'a/two.txt', blob('alpha-content'));
+      await put(root, 'b/three.txt', blob('beta-content'));
+      await put(root, 'b/four.txt', blob('beta-content'));
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      const groupA = groupsContaining(result, path.join(root, 'a/one.txt'))[0];
+      const groupB = groupsContaining(result, path.join(root, 'b/three.txt'))[0];
+
+      await finder.suppress(root, groupA.sha256!, 'root', [groupA.entries[0].absPath]);
+      await finder.markAction(root, [groupB.entries[0].id], 'delete');
+
+      const after = await finder.markAction(root, [groupB.entries[0].id], 'delete');
+      assert.equal(resultOf(after).stats.pendingDeleteCount, 1);
+      const queued = resultOf(after).groups.flatMap((g) => g.entries).filter((e) => e.state === 'queued');
+      assert.equal(queued.length, 1);
+      assert.ok(
+        !queued.some((e) => groupA.entries.some((a) => a.absPath === e.absPath)),
+        '被抑制的哈希不得进入待删队列',
+      );
+    }));
+
+  // ------------------------------------------------ §11-15 路径边界
+
+  await test('§11-15 伪造路径的删除请求被拒绝，越界文件不被删除', () =>
+    fixture({}, async ({ root, base, finder, trashCalls }) => {
+      await put(root, 'a/one.txt', blob('inside'));
+      await put(root, 'b/two.txt', blob('inside'));
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+
+      // 伪造一条落在扫描根之外的条目
+      const outside = await put(base, 'outside.txt', blob('outside'));
+      const st = await fs.stat(outside);
+      const forged = {
+        id: group.entries[0].id,
+        absPath: outside,
+        groupId: group.id,
+        sha256: group.entries[0].sha256,
+        size: st.size,
+        dev: String(st.dev),
+        ino: String(st.ino),
+      };
+      const request: DupActRequest = {
+        root,
+        items: [forged],
+        groupIds: [group.id],
+        category: 'identical',
+      };
+
+      let acted: DupActResult | undefined;
+      let rejected = false;
+      try {
+        acted = await finder.act(root, request);
+      } catch {
+        rejected = true;
+      }
+      assert.ok(
+        rejected || acted!.items.every((i) => i.outcome !== 'deleted'),
+        '越界路径不得被删除',
+      );
+      assert.ok(!trashCalls.includes(outside), '越界路径不得进入回收站');
+      await fs.stat(outside);
+    }));
+
+  // ------------------------------------------------ §11-16 扫描只读
+
+  await test('§11-16 扫描阶段只读：被检测目录树前后完全一致', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'a/one.txt', blob('read-only'));
+      await put(root, 'b/two.txt', blob('read-only'));
+      await put(root, 'b/deep/three.txt', blob('read-only'));
+      const before = await snapshot(root);
+      await scanWatch(finder, root);
+      assert.equal(await snapshot(root), before);
+      // 不得产生临时件
+      const stray = await fs.readdir(root);
+      assert.ok(!stray.some((n) => n.endsWith('.tmp') || n.endsWith('.part')), `出现临时件：${stray.join(',')}`);
+    }));
+
+  // ------------------------------------------------ §11-17 持久化与审计
+
+  await test('§11-17 抑制清单持久化，重新打开仍在，审计日志有记录', () =>
+    fixture({}, async ({ root, local, finder }) => {
+      await put(root, 'a/one.txt', blob('persist-me'));
+      await put(root, 'b/two.txt', blob('persist-me'));
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      await finder.suppress(root, group.sha256!, 'root', [group.entries[0].absPath]);
+
+      // 重新打开：抑制项仍在
+      const reopened = new DuplicateFinder(local);
+      const list = await reopened.listSuppressions(root);
+      assert.equal(list.length, 1);
+      assert.equal(list[0].sha256, group.sha256);
+
+      // 审计日志落盘
+      const files = await fs.readdir(local);
+      const audit = files.filter((n) => /^audit-.*\.jsonl$/.test(n));
+      assert.ok(audit.length > 0, `本机目录应写审计日志，现有文件：${files.join(',')}`);
+      const text = await fs.readFile(path.join(local, audit[0]), 'utf8');
+      assert.ok(text.trim().length > 0, '审计日志应有条目');
+    }));
+
+  // ------------------------------------------------ §11-18 可回收空间与待删字节
+
+  await test('§11-18 可回收空间与待删字节分开统计，同名不同内容区不计入可回收空间', () =>
+    fixture({}, async ({ root, finder }) => {
+      // 内容重复组：两份同尺寸
+      await put(root, 'dup/one.txt', blob('identical-pair'));
+      await put(root, 'dup/two.txt', blob('identical-pair'));
+      // 内容唯一文件：不得贡献可回收空间
+      await put(root, 'solo/only.txt', blob('solo-content'));
+
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      assert.equal(result.identicalGroups.length, 1);
+      const identical = result.identicalGroups[0];
+
+      assert.equal(identical.reclaimableBytes, BLOB_SIZE);
+      assert.equal(result.stats.reclaimableBytes, BLOB_SIZE, '可回收空间只由内容重复组贡献');
+      assert.equal(result.stats.pendingDeleteCount, 0);
+      assert.equal(result.stats.pendingDeleteBytes, 0);
+
+      // 待删字节单独统计，且不混进可回收空间
+      const target = identical.entries[0];
+      const after = await finder.markAction(root, [target.id], 'delete');
+      const stats = resultOf(after).stats;
+      assert.equal(stats.pendingDeleteCount, 1);
+      assert.equal(stats.pendingDeleteBytes, target.size);
+      assert.equal(stats.reclaimableBytes, BLOB_SIZE, '待删字节不得混进可回收空间');
+
+      // 同名不同内容区的组恒为 0 可回收空间（告警区判定口径由 groupNameConflicts 验证）
+      const conflict = groupNameConflicts([
+        fakeEntry({ absPath: 'D:\\资料库\\文档\\纪要.md', dirPath: 'D:\\资料库\\文档', fileName: '纪要.md', sha256: 'f'.repeat(64) }),
+        fakeEntry({ absPath: 'D:\\资料库\\文档\\纪要.md', dirPath: 'D:\\资料库\\文档', fileName: '纪要.md', sha256: '0'.repeat(64) }),
+      ])[0];
+      assert.equal(conflict.reclaimableBytes, 0, '同名不同内容区不计入可回收空间');
+    }));
+
+  // ------------------------------------------------ 阶段覆盖汇总
+
+  await test('§11-1 扫描进度覆盖五个阶段（扫描目录 / 大小分桶 / 局部哈希 / 全量哈希 / 汇总）', async () => {
+    const required: DupPhase[] = ['scanning', 'bucketing', 'partial-hashing', 'hashing', 'summarizing'];
+    const missing = required.filter((phase) => !observedPhases.has(phase));
+    assert.deepEqual(missing, [], `未观测到的进度阶段：${missing.join(',')}`);
+  });
+
+  console.log(`重复文件检测：${passed} 通过，${failed} 失败`);
+  if (failed) process.exitCode = 1;
+}
+
+/** 稀疏文件：只占元数据，不占磁盘，用于构造超阈值样本 */
+async function sparseFile(abs: string, size: number): Promise<void> {
+  const handle = await fs.open(abs, 'w');
+  try {
+    await handle.truncate(size);
+  } finally {
+    await handle.close();
+  }
+}
+
+void main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});

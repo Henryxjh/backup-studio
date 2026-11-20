@@ -10,7 +10,13 @@ import type {
   SyncMode,
 } from '../shared/types';
 import type { AutoPairInput, AutoStatus } from '../shared/aut-types';
-import type { DupStatus } from '../shared/dup-types';
+import type {
+  DupActRequest,
+  DupActResult,
+  DupItemAction,
+  DupStatus,
+  DupSuppression,
+} from '../shared/dup-types';
 
 export interface StartOptions {
   sourceRoot: string;
@@ -86,13 +92,28 @@ const api = {
 
   duplicateFinder: {
     status: (): Promise<DupStatus> => ipcRenderer.invoke('dup:status'),
-    scan: (sourceRoot: string, targetRoot: string): Promise<DupStatus> =>
-      ipcRenderer.invoke('dup:scan', sourceRoot, targetRoot),
-    adopt: (hashes: string[]): Promise<DupStatus> => ipcRenderer.invoke('dup:adopt', hashes),
-    revoke: (hashes?: string[]): Promise<DupStatus> => ipcRenderer.invoke('dup:revoke', hashes),
+    scan: (root: string, options?: { minSizeBytes?: number }): Promise<DupStatus> =>
+      ipcRenderer.invoke('dup:scan', root, options),
+    cancel: (): Promise<DupStatus> => ipcRenderer.invoke('dup:cancel'),
+    markAction: (root: string, itemIds: string[], action: DupItemAction): Promise<DupStatus> =>
+      ipcRenderer.invoke('dup:markAction', root, itemIds, action),
+    keepGroup: (root: string, groupId: string, keeperId: string): Promise<DupStatus> =>
+      ipcRenderer.invoke('dup:keepGroup', root, groupId, keeperId),
+    act: (root: string, request: DupActRequest): Promise<DupActResult> => ipcRenderer.invoke('dup:act', root, request),
+    suppress: (root: string, sha256: string, scopeMode: 'root' | 'global', samplePaths: string[]): Promise<DupStatus> =>
+      ipcRenderer.invoke('dup:suppress', root, sha256, scopeMode, samplePaths),
+    listSuppressions: (root: string): Promise<DupSuppression[]> => ipcRenderer.invoke('dup:suppressions', root),
+    revokeSuppression: (sha256?: string): Promise<DupStatus> => ipcRenderer.invoke('dup:revokeSuppression', sha256),
     exportReport: (format: 'json' | 'csv'): Promise<{ path: string; bytes: number }> =>
       ipcRenderer.invoke('dup:export', format),
-    cancel: (): Promise<DupStatus> => ipcRenderer.invoke('dup:cancel'),
+    restoreQuarantine: (id: string): Promise<{ restored: boolean; path?: string; reason?: string }> =>
+      ipcRenderer.invoke('dup:restoreQuarantine', id),
+    /**
+     * 受校验的「定位文件」：路径必须落在本次扫描根之内且是本次扫描的真实条目。
+     * 与既有 `api.reveal` 的区别：这里会先做路径边界校验，伪造路径一律拒绝。
+     */
+    reveal: (root: string, absPath: string): Promise<{ revealed: boolean }> =>
+      ipcRenderer.invoke('dup:reveal', root, absPath),
   },
 
   reveal: (targetPath: string): Promise<void> => ipcRenderer.invoke('app:reveal', targetPath),
@@ -122,4 +143,4 @@ export type BackupAPI = typeof api;
 contextBridge.exposeInMainWorld('backupAPI', api);
 
 export type { AppState, LogEntry, MediaAssessment, MediaState, PlanAction, RecoverableJob, ScanResult, SyncMode };
-export type { DupApi, DupStatus } from '../shared/dup-types';
+export type { DupApi, DupStatus, DupActRequest, DupActResult, DupItemAction, DupSuppression } from '../shared/dup-types';

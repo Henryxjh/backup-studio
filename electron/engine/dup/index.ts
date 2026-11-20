@@ -1,319 +1,825 @@
-import path from 'node:path';
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import type {
+  DupActRequest,
+  DupActResult,
   DupApi,
   DupEvent,
-  DupExclusionEntry,
+  DupFileEntry,
   DupGroup,
-  DupReport,
-  DupState,
+  DupItemAction,
+  DupProgress,
+  DupScanResult,
+  DupScanSummary,
+  DupStats,
   DupStatus,
+  DupSuppression,
 } from '../../../shared/dup-types';
-import { readManifest, writeJsonAtomic } from '../manifest';
-import { scanTree } from '../scan';
-import { checkRoot, inside } from '../aut/config';
-import { detectDuplicates, MAX_PREVIEW_GROUPS } from './detect';
-import { ExclusionStore } from './exclusions';
+import { DEFAULT_MIN_SIZE_BYTES, scanDupTree } from './scan';
+import { detectDuplicates } from './detect';
+import { executeAct, QuarantineStore, type ActRegistryEntry } from './act';
+import { AuditLog } from './audit';
+import {
+  SuppressionStore,
+  bumpHitCount,
+  findSuppression,
+  normalizeRoot,
+  type SuppressionRecord,
+} from './suppress';
 
-export type { DupApi, DupEvent, DupGroup, DupReport, DupState, DupStatus } from '../../../shared/dup-types';
+export type {
+  DupActRequest,
+  DupActResult,
+  DupApi,
+  DupEvent,
+  DupGroup,
+  DupScanResult,
+  DupStatus,
+  DupSuppression,
+} from '../../../shared/dup-types';
+export { DEFAULT_MIN_SIZE_BYTES } from './scan';
+export { detectDuplicates, pickGroupKeeper, groupNameConflicts } from './detect';
+export { executeAct, QuarantineStore } from './act';
+
+/** 渲染层预览的分组上限；截断只影响呈现，统计始终基于全量 */
+export const MAX_PREVIEW_GROUPS = 2000;
 
 export interface DuplicateFinderOptions {
-  /** 排除名单变更时通知宿主：备份侧的旧计划必须立即失效 */
-  onExclusionsChanged?: (sourceRoot: string, reason: string) => void;
+  /**
+   * 回收站落地。
+   *
+   * 生产环境传 Electron `shell.trashItem`；测试注入假实现。
+   * **抛错视为回收站不可用** → 降级到本机隔离区（FR-08）。
+   */
+  trash?: (absPath: string) => Promise<void>;
+  /** 写入闸门；返回 { allowed, reason? }（FR-10） */
+  gate?: (root: string) => Promise<{ allowed: boolean; reason?: string }>;
+  /** 备份 / 自动同步是否在运行；运行中禁止删除（FR-10） */
+  isBusy?: () => boolean;
+  /** 本机状态目录；默认取构造函数的 `localDirectory` */
+  localDirectory?: string;
+  /** 抑制清单变更回调：备份侧的旧计划必须立即失效 */
+  onSuppressionsChanged?: (root: string, reason: string) => void;
+  /**
+   * 在系统文件管理器中定位文件。
+   *
+   * 生产环境传 Electron `shell.showItemInFolder`；测试可注入假实现。
+   * 引擎只负责**判定路径是否可被定位**（FR-20），真正的系统调用由宿主提供。
+   */
+  revealFile?: (absPath: string) => void;
+}
+
+/** 路径边界校验结果 */
+export interface PathVerdict {
+  allowed: boolean;
+  reason?: string;
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**
- * 重复文件查找器。
+ * 重复文件检测与清理的引擎侧实现（REQ-DUP-001）。
  *
- * 与自动备份（REQ-AUT-001）同构：状态与报告落**本机** `userData`，
- * 目标介质只是被读取的对象，绝不写入——备份端是用户的恢复点，
- * 往里塞工具状态会污染恢复语义。
+ * 与自动备份（REQ-AUT-001）同构：状态、抑制清单、审计与隔离区全部落**本机** userData，
+ * 被检测目录只是被读取的对象，绝不写入——检测阶段零写副作用。
  *
- * 扫描全程只读：只做 stat / read / 目录遍历，不创建目录、不产生临时件。
+ * 删除是唯一的写动作，因此它必须过写入闸门、与备份互斥、逐条二次校验，
+ * 并且**只进回收站**（FR-08）。
  */
-export class DuplicateFinder implements DupApi {
-  private readonly store: ExclusionStore;
+export class DuplicateFinder extends EventEmitter implements DupApi {
   private readonly options: DuplicateFinderOptions;
-  private state: DupState = 'idle';
-  private reason: string | undefined;
+  /** 本机状态目录 */
+  readonly localDirectory: string;
+  private readonly store: SuppressionStore;
+  private readonly auditLog: AuditLog;
+  private readonly quarantine: QuarantineStore;
+
+  private phase: DupStatus['phase'] = 'idle';
+  private progress: DupProgress = { phase: 'idle', label: '待命', done: 0, total: 0, bytesRead: 0, throughputBps: 0 };
+  private result: DupScanResult | null = null;
+  /** 全量结果：导出用，不受预览截断影响 */
+  private fullResult: DupScanResult | null = null;
   private recent: DupEvent[] = [];
-  private report: DupReport | null = null;
-  /** 全量报告：导出用，不受预览截断影响 */
-  private full: DupReport | null = null;
-  private sourceRoot = '';
-  private cancelled = false;
-  private running = false;
+  private reason: string | undefined;
+  private blockedReason: string | undefined;
+  private suppressionItems: SuppressionRecord[] = [];
+  /** 扫描结果登记表：绝对路径 → 条目（FR-20 路径边界校验的唯一依据） */
+  private registry = new Map<string, ActRegistryEntry>();
+  /** 组 → 组内全部条目 id（FR-11 至少留一份） */
+  private groupMembers = new Map<string, string[]>();
+  private currentRoot = '';
+  /**
+   * 操作序号：每次「扫描 / 执行删除」在**请求时**分配一个递增序号。
+   *
+   * 取消请求可能早于操作真正启动到达（用户点取消的瞬间，扫描还在排队），
+   * 若取消只改一个布尔量，扫描开头会把它重置掉，取消就丢了。
+   * 改用序号比对，取消就一定能落到「用户当时看到的那一次操作」上（FR-15）。
+   */
+  private operationToken = 0;
+  /** 被请求取消的操作序号 */
+  private cancelToken = 0;
   private tail: Promise<unknown> = Promise.resolve();
   private readonly loaded: Promise<void>;
+  private progressStartedAt = Date.now();
 
-  constructor(readonly localDirectory: string, options: DuplicateFinderOptions = {}) {
-    this.store = new ExclusionStore(path.join(localDirectory, 'exclusions.json'));
+  constructor(localDirectory: string, options: DuplicateFinderOptions = {}) {
+    super();
     this.options = options;
-    this.loaded = this.store.read().then(() => undefined, () => undefined);
+    this.localDirectory = options.localDirectory ?? localDirectory;
+    this.store = new SuppressionStore(path.join(this.localDirectory, 'suppressions.json'));
+    this.auditLog = new AuditLog(this.localDirectory, [this.localDirectory]);
+    this.quarantine = new QuarantineStore(path.join(this.localDirectory, 'quarantine'));
+    this.loaded = this.store
+      .read()
+      .then((items) => {
+        this.suppressionItems = items;
+      })
+      .catch(() => undefined);
   }
 
+  /** 串行化操作：扫描、动作、持久化之间不允许并发交错 */
   private run<T>(fn: () => Promise<T>): Promise<T> {
     const running = this.tail.then(() => this.loaded).then(fn);
-    this.tail = running.catch(() => {});
+    this.tail = running.catch(() => undefined);
     return running;
   }
 
-  private event(action: string, detail?: string): void {
-    this.recent.unshift({ at: Date.now(), action, detail });
+  /** 记录一条内存事件（界面最近事件流） */
+  private event(action: string, detail?: string, outcome?: DupEvent['outcome']): void {
+    this.recent.unshift({ at: Date.now(), action, detail, outcome });
     this.recent.length = Math.min(100, this.recent.length);
+    this.emit('event', this.recent[0]);
   }
 
-  /**
-   * 排除路径集合，供计划器使用（绑定源目录）。
-   *
-   * 排除记录以 realpath 为键写入，而计划器拿到的是界面传入的原始路径；
-   * 目录联接或符号链接下两者不同，漏匹配会让排除静默失效。
-   * 这里把两种形式都算上——匹配不上只是「不排除」，属于安全侧失败。
-   */
-  async exclusionPaths(sourceRoot: string): Promise<Set<string>> {
-    await this.loaded;
-    const all = await this.store.read();
-    if (!all) return new Set();
-    const paths = new Set<string>();
-    for (const key of await this.sourceKeys(sourceRoot)) {
-      for (const rel of Object.keys(all.bySource[key] ?? {})) paths.add(rel);
+  /** 审计日志：只写本机，绝对路径按安全模块规则脱敏 */
+  private audit(entry: Parameters<AuditLog['append']>[0]): Promise<void> {
+    return this.auditLog.append(entry);
+  }
+
+  /** 更新阶段进度：已处理/总数、已读字节、吞吐与预计剩余 */
+  private setProgress(phase: DupProgress['phase'], label: string, done: number, total: number, bytesRead: number): void {
+    const now = Date.now();
+    const elapsedMs = Math.max(1, now - this.progressStartedAt);
+    const throughputBps = bytesRead > 0 ? Math.round((bytesRead / elapsedMs) * 1000) : 0;
+    const etaMs = done > 0 && total > done ? Math.round(((total - done) / done) * elapsedMs) : undefined;
+    this.phase = phase;
+    this.progress = { phase, label, done, total, bytesRead, throughputBps, etaMs };
+    this.emit('progress', this.progress);
+  }
+
+  /** 刷新「删除是否被禁止」：备份或自动同步运行中一律禁用（FR-10） */
+  private refreshBlocked(): void {
+    if (this.options.isBusy?.()) {
+      this.blockedReason = '备份任务或自动同步正在运行，删除动作已禁用';
+    } else {
+      this.blockedReason = undefined;
     }
-    return paths;
   }
 
-  /** 排除名单条目，供报告标注使用 */
-  async exclusionEntries(sourceRoot: string): Promise<Record<string, DupExclusionEntry>> {
-    await this.loaded;
-    const all = await this.store.read();
-    if (!all) return {};
-    const merged: Record<string, DupExclusionEntry> = {};
-    for (const key of await this.sourceKeys(sourceRoot)) {
-      Object.assign(merged, all.bySource[key] ?? {});
-    }
-    return merged;
-  }
-
-  /** 源目录的等价键集合：原始路径 + realpath */
-  private async sourceKeys(sourceRoot: string): Promise<string[]> {
-    const keys = new Set<string>([sourceRoot]);
-    try {
-      keys.add(await fs.realpath(sourceRoot));
-    } catch {
-      // 目录不可达时按原样匹配，匹配不上只是不生效
-    }
-    return [...keys];
-  }
-
-  private async view(): Promise<DupStatus> {
-    await this.loaded;
-    const all = await this.store.read();
-    // 尚未扫描时不知道当前源目录，退回展示全部已知排除记录；
-    // 扫描过则只展示该源目录下的排除（名单按源目录分组）。
-    const entries = this.sourceRoot
-      ? all?.bySource?.[this.sourceRoot] ?? {}
-      : Object.assign({}, ...Object.values(all?.bySource ?? {}));
-    const paths = Object.keys(entries);
-    const excludedBytes = paths.reduce((sum, rel) => sum + (entries[rel]?.size ?? 0), 0);
+  private view(): DupStatus {
+    this.refreshBlocked();
     return {
-      state: this.state,
-      report: this.report,
-      excludedPaths: paths.sort(),
-      excludedCount: paths.length,
-      excludedBytes,
+      phase: this.phase,
+      progress: this.progress,
+      result: this.result,
+      suppressions: this.suppressionItems.map(toSuppression),
       recent: this.recent,
       reason: this.reason,
+      blockedReason: this.blockedReason,
+      canAct: (this.phase === 'ready' || this.phase === 'done') && !this.blockedReason,
     };
   }
 
-  status = (): Promise<DupStatus> => this.view();
+  /** 当前状态 */
+  status = (): Promise<DupStatus> => this.run(async () => this.view());
 
-  scan = (sourceRoot: string, targetRoot: string): Promise<DupStatus> =>
-    this.run(async () => {
-      if (this.running) throw new Error('重复扫描正在执行');
-      this.running = true;
-      this.cancelled = false;
-      this.state = 'scanning';
-      this.reason = undefined;
-      const started = Date.now();
+  /**
+   * 扫描一个目录（FR-02）。
+   *
+   * 语义边界：只读扫描；跳过符号链接、0 字节文件与低于阈值的文件；
+   * 扫描期间对被检测目录不产生任何写副作用。
+   */
+  scan = (root: string, options?: { minSizeBytes?: number }): Promise<DupStatus> => {
+    // 操作序号在「请求时」分配：取消请求可能早于扫描真正启动到达，
+    // 若等到执行体里再分配序号，那次取消就会被扫描开头的重置冲掉（FR-15）。
+    const token = ++this.operationToken;
+    return this.run(async () => {
+      if (typeof root !== 'string' || !root.trim()) throw new Error('请选择要检测重复文件的目录');
+      const resolved = path.resolve(root);
+      let stat: import('node:fs').Stats;
       try {
-        // 路径边界校验：源与目标相同或互相包含时，扫描结果没有意义。
-        if (inside(sourceRoot, targetRoot) || inside(targetRoot, sourceRoot)) {
-          throw new Error('源目录与备份目录不能相同或互相包含');
-        }
-        const realSource = await checkRoot(sourceRoot);
-        const realTarget = await checkRoot(targetRoot);
-        this.sourceRoot = realSource;
-
-        const [source, target, manifest, exclusions] = await Promise.all([
-          scanTree(realSource, { excludeMetaDir: false }),
-          scanTree(realTarget, { excludeMetaDir: true }),
-          readManifest(realTarget),
-          this.store.entries(realSource),
-        ]);
-
-        this.state = 'hashing';
-        const result = await detectDuplicates({
-          sourceRoot: realSource,
-          targetRoot: realTarget,
-          source,
-          target,
-          manifest,
-          exclusions,
-          isCancelled: () => this.cancelled,
-        });
-
-        if (result.cancelled) {
-          this.state = 'idle';
-          this.reason = '扫描已取消';
-          this.event('扫描已取消');
-          return this.view();
-        }
-
-        // 覆盖完整性：扫描有不可读子树、或有文件判定失败，都意味着报告不是全量结论。
-        // 判定失败的文件「未被判定」，不等于「不重复」——不能拿它冒充完整扫描。
-        const complete =
-          source.errors.length === 0 && target.errors.length === 0 && result.failures.length === 0;
-        const totalCopies = result.groups.reduce((sum, group) => sum + group.copies.length, 0);
-        const totalBytes = result.groups.reduce((sum, group) => sum + group.size * group.copies.length, 0);
-        const reclaimableBytes = result.groups.reduce((sum, group) => sum + group.reclaimableBytes, 0);
-
-        const build = (groups: DupGroup[]): DupReport => ({
-          sourceRoot: realSource,
-          targetRoot: realTarget,
-          createdAt: Date.now(),
-          durationMs: Date.now() - started,
-          groups,
-          truncated: result.groups.length > groups.length,
-          totalGroups: result.groups.length,
-          totalCopies,
-          totalBytes,
-          reclaimableBytes,
-          failures: result.failures,
-          complete,
-          scannedFiles: result.scannedFiles,
-          hashedFiles: result.hashedFiles,
-          sourceErrors: source.errors.length,
-          targetErrors: target.errors.length,
-        });
-
-        this.full = build(result.groups);
-        this.report = build(result.groups.slice(0, MAX_PREVIEW_GROUPS));
-        this.state = 'ready';
-        this.event(
-          '重复扫描完成',
-          `发现 ${result.groups.length} 组重复，可回收 ${reclaimableBytes} 字节`,
-        );
-        if (!complete) {
-          this.reason = '扫描不完整：部分子树不可读，结论仅供参考';
-        }
-        return this.view();
+        stat = await fs.stat(resolved);
       } catch (err) {
-        this.state = 'error';
-        this.reason = err instanceof Error ? err.message : String(err);
-        this.event('重复扫描失败', this.reason);
-        throw err;
-      } finally {
-        this.running = false;
+        throw new Error(`无法访问所选目录：${errorText(err)}`);
       }
-    });
+      if (!stat.isDirectory()) throw new Error('所选路径不是目录');
+      this.reason = undefined;
+      this.result = null;
+      this.fullResult = null;
+      this.registry = new Map();
+      this.groupMembers = new Map();
+      this.currentRoot = resolved;
+      this.progressStartedAt = Date.now();
+      this.setProgress('scanning', '扫描目录', 0, 0, 0);
+      const started = Date.now();
 
-  /** 采纳排除：按重复组整组采纳，冗余副本不再写入目标端 */
-  adopt = (hashes: string[]): Promise<DupStatus> =>
+      const scanned = await scanDupTree(resolved, {
+        minSizeBytes: options?.minSizeBytes ?? DEFAULT_MIN_SIZE_BYTES,
+        isCancelled: () => this.cancelToken === token,
+        onProgress: (done, total) => this.setProgress('scanning', '扫描目录', done, total, 0),
+      });
+
+      if (scanned.cancelled || this.cancelToken === token) {
+        this.phase = 'cancelled';
+        this.reason = '扫描已取消';
+        this.event('扫描已取消');
+        await this.audit({ at: Date.now(), action: '扫描取消', outcome: 'skipped', reason: '用户取消' });
+        return this.view();
+      }
+
+      this.progressStartedAt = Date.now();
+      // 命中抑制的哈希：累计命中次数并落盘（FR-13）
+      const suppressedHashes = new Set<string>();
+      const detected = await detectDuplicates({
+        root: resolved,
+        candidates: scanned.candidates,
+        isCancelled: () => this.cancelToken === token,
+        onProgress: (update) => {
+          if (update.phase !== this.progress.phase) this.progressStartedAt = Date.now();
+          this.setProgress(update.phase, update.label, update.done, update.total, update.bytesRead);
+        },
+        isSuppressed: (hash) => Boolean(findSuppression(this.suppressionItems, hash, resolved)),
+        onSuppressed: (hash) => {
+          suppressedHashes.add(hash);
+        },
+      });
+
+      if (suppressedHashes.size > 0) {
+        for (const hash of suppressedHashes) bumpHitCount(this.suppressionItems, hash, resolved);
+        await this.store.write(this.suppressionItems);
+      }
+
+      if (detected.cancelled || this.cancelToken === token) {
+        this.phase = 'cancelled';
+        this.reason = '扫描已取消（保留已完成的判定结果）';
+        this.event('扫描已取消');
+        await this.audit({ at: Date.now(), action: '扫描取消', outcome: 'skipped', reason: '用户取消' });
+        return this.view();
+      }
+
+      // 汇总阶段：分阶段可见是硬要求（FR-15）
+      this.setProgress('summarizing', '汇总', 0, 0, detected.bytesRead);
+
+      const summary: DupScanSummary = {
+        root: resolved,
+        totalFiles: scanned.totalFiles,
+        scannedBytes: scanned.scannedBytes,
+        skippedEmpty: scanned.skippedEmpty,
+        skippedTooSmall: scanned.skippedTooSmall,
+        skippedSymlink: scanned.skippedSymlink,
+        skippedSuppressed: detected.skippedSuppressed,
+        identicalGroups: detected.identicalGroups.length,
+        nameConflictGroups: detected.nameConflictGroups.length,
+        suspectedGroups: detected.suspectedGroups.length,
+        durationMs: Date.now() - started,
+      };
+
+      const allGroups = [...detected.identicalGroups, ...detected.suspectedGroups, ...detected.nameConflictGroups];
+      const stats = computeStats(allGroups);
+      const complete = scanned.errors.length === 0 && detected.failures.length === 0;
+      const truncated = allGroups.length > MAX_PREVIEW_GROUPS;
+
+      const full: DupScanResult = {
+        root: resolved,
+        summary,
+        groups: allGroups,
+        identicalGroups: detected.identicalGroups,
+        suspectedGroups: detected.suspectedGroups,
+        nameConflictGroups: detected.nameConflictGroups,
+        failures: detected.failures,
+        stats,
+        complete,
+        truncated,
+      };
+      this.fullResult = full;
+      this.result = truncated
+        ? {
+            ...full,
+            groups: allGroups.slice(0, MAX_PREVIEW_GROUPS),
+            identicalGroups: detected.identicalGroups.slice(0, MAX_PREVIEW_GROUPS),
+            suspectedGroups: detected.suspectedGroups.slice(0, MAX_PREVIEW_GROUPS),
+            nameConflictGroups: detected.nameConflictGroups.slice(0, MAX_PREVIEW_GROUPS),
+          }
+        : full;
+
+      this.buildRegistry(allGroups);
+      // 取消优先于完成：用户在扫描途中点了取消，就不能报「完成」（FR-15）。
+      if (this.cancelToken === token) {
+        this.phase = 'cancelled';
+        this.reason = '扫描已取消（保留已完成的判定结果）';
+        this.setProgress('cancelled', '已取消', allGroups.length, allGroups.length, detected.bytesRead);
+        this.event('扫描已取消', undefined, 'skipped');
+        await this.audit({ at: Date.now(), action: '扫描取消', outcome: 'skipped', reason: '用户取消' });
+        return this.view();
+      }
+      this.phase = 'ready';
+      this.setProgress('ready', '完成', allGroups.length, allGroups.length, detected.bytesRead);
+      this.event(
+        '扫描完成',
+        `发现 ${detected.identicalGroups.length} 组内容重复、${detected.nameConflictGroups.length} 组同名不同内容、${detected.suspectedGroups.length} 组疑似重复`,
+        'ok',
+      );
+      await this.audit({
+        at: Date.now(),
+        action: '扫描',
+        outcome: 'ok',
+        reason: `文件 ${summary.totalFiles} 个，重复组 ${summary.identicalGroups} 个，因抑制跳过 ${summary.skippedSuppressed} 组`,
+      });
+      if (!complete) {
+        this.reason = '扫描不完整：部分文件不可读或判定失败，结论仅供参考';
+      }
+      return this.view();
+    });
+  }
+
+  /** 建立扫描结果登记表与分组成员表（FR-11、FR-20） */
+  private buildRegistry(groups: DupGroup[]): void {
+    this.registry = new Map();
+    this.groupMembers = new Map();
+    for (const group of groups) {
+      const ids: string[] = [];
+      for (const entry of group.entries) {
+        this.registry.set(entry.absPath, {
+          id: entry.id,
+          absPath: entry.absPath,
+          relPath: entry.relPath,
+          sha256: entry.sha256,
+          size: entry.size,
+          dev: entry.dev,
+          ino: entry.ino,
+          suspected: entry.suspected,
+          groupId: group.id,
+        });
+        ids.push(entry.id);
+      }
+      this.groupMembers.set(group.id, ids);
+    }
+  }
+
+  /** 断言请求针对的扫描根与当前扫描一致 */
+  private assertRoot(root: string): void {
+    if (typeof root !== 'string' || !root.trim()) throw new Error('缺少扫描根');
+    if (normalizeRoot(root) !== normalizeRoot(this.currentRoot)) {
+      throw new Error('当前扫描根与请求不一致，请重新扫描');
+    }
+  }
+
+  /** 当前扫描结果中登记的绝对路径集合（主进程校验用） */
+  knownEntries(root: string): ReadonlySet<string> {
+    if (normalizeRoot(root) !== normalizeRoot(this.currentRoot)) return new Set<string>();
+    return new Set(this.registry.keys());
+  }
+
+  /**
+   * 校验一个路径是否可被主进程操作（reveal 等）。
+   *
+   * 语义边界：必须落在本次扫描根之内，**且**确实是本次扫描结果中的条目。
+   */
+  verifyEntry = async (root: string, absPath: string): Promise<PathVerdict> => {
+    if (typeof absPath !== 'string' || !absPath.trim()) return { allowed: false, reason: '路径无效' };
+    if (normalizeRoot(root) !== normalizeRoot(this.currentRoot)) return { allowed: false, reason: '当前没有匹配的扫描结果，请重新扫描' };
+    const resolved = path.resolve(absPath);
+    const relative = path.relative(this.currentRoot, resolved);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+      return { allowed: false, reason: '路径不在本次扫描根目录之内' };
+    }
+    if (!this.registry.has(resolved)) {
+      return { allowed: false, reason: '路径不在本次扫描结果内，已拒绝' };
+    }
+    try {
+      await fs.stat(resolved);
+    } catch {
+      return { allowed: false, reason: '文件已不存在或不可访问' };
+    }
+    return { allowed: true };
+  };
+
+  /**
+   * 以「当前扫描根」为基准校验一个路径。
+   *
+   * 供主进程的 `app:reveal` 使用：渲染层只给路径，判定依据始终在主进程，
+   * 且只能命中本次扫描结果中的真实条目（FR-14、FR-20）。
+   */
+  verifyScannedPath = async (absPath: string): Promise<PathVerdict> => {
+    if (!this.currentRoot) return { allowed: false, reason: '当前没有扫描结果，请先执行重复文件检测' };
+    return this.verifyEntry(this.currentRoot, absPath);
+  };
+
+  /**
+   * 受校验的「定位文件」（FR-14、FR-20）。
+   *
+   * 路径必须落在本次扫描根之内**且**是本次扫描结果中的真实条目；
+   * 文件已不存在或不可访问时抛出明确错误，**不静默失败**。
+   * 真正「打开系统文件管理器」的动作由注入的 `revealFile` 完成——
+   * 引擎不直接依赖 Electron，测试里可注入假实现。
+   */
+  reveal = async (root: string, absPath: string): Promise<{ revealed: boolean }> => {
+    const verdict = await this.verifyEntry(root, absPath);
+    if (!verdict.allowed) throw new Error(verdict.reason ?? '路径校验未通过，已拒绝定位');
+    if (!this.options.revealFile) throw new Error('当前环境不支持在文件管理器中定位');
+    this.options.revealFile(path.resolve(absPath));
+    return { revealed: true };
+  };
+
+  /**
+   * 逐条标记动作（FR-06）。
+   *
+   * 三个动作互斥：保留 / 删除 / 下次不提醒。
+   * 动作只在本次会话内作用于列表状态，持久化只保存抑制项与审计日志。
+   */
+  markAction = (root: string, itemIds: string[], action: DupItemAction): Promise<DupStatus> =>
     this.run(async () => {
-      if (!this.full) throw new Error('请先执行重复扫描');
-      if (!Array.isArray(hashes) || hashes.length === 0) throw new Error('请选择要排除的重复组');
-      const sourceRoot = this.full.sourceRoot;
-      const added: Record<string, DupExclusionEntry> = {};
-      let count = 0;
-      for (const hash of hashes) {
-        const group = this.full.groups.find((g) => g.hash === hash);
-        if (!group) throw new Error('重复组不存在或已失效，请重新扫描');
-        if (!group.adoptable) {
-          throw new Error(
-            group.zeroByte
-              ? '零字节文件不提供排除入口'
-              : group.hardLinked
-                ? '硬链接副本共享同一份数据，不提供排除入口'
-                : '该重复组没有可排除的冗余副本',
-          );
-        }
-        for (const copy of group.redundant) {
-          added[copy.relPath] = { hash: group.hash, size: copy.size, mtimeMs: copy.mtimeMs };
-          count += 1;
+      this.assertRoot(root);
+      const result = this.result;
+      if (!result) throw new Error('尚未扫描，没有可标记的结果');
+      if (!Array.isArray(itemIds) || itemIds.length === 0) throw new Error('请选择要标记的条目');
+      if (action !== 'keep' && action !== 'delete' && action !== 'suppress') throw new Error('无效的动作');
+
+      const suppressed: DupGroup[] = [];
+      for (const itemId of itemIds) {
+        for (const group of result.groups) {
+          const entry = group.entries.find((item) => item.id === itemId);
+          if (!entry) continue;
+          if (action === 'keep') {
+            entry.state = 'kept';
+            entry.note = '已保留';
+          } else if (action === 'delete') {
+            entry.state = 'queued';
+            entry.note = '已进入待删队列';
+          } else {
+            await this.addSuppression(root, group, entry);
+            suppressed.push(group);
+          }
         }
       }
-      await this.store.put(sourceRoot, added);
-      this.event('已采纳排除', `${count} 个冗余副本不再写入目标端`);
-      this.options.onExclusionsChanged?.(sourceRoot, '排除名单已变更，旧备份计划失效，请重新扫描');
+
+      if (suppressed.length > 0) {
+        this.dropGroups(suppressed);
+      }
+      this.refreshStats();
+      this.event('标记动作', `${action} × ${itemIds.length} 条`);
+      await this.audit({ at: Date.now(), action: `标记:${action}`, outcome: 'ok', reason: `${itemIds.length} 条` });
       return this.view();
     });
 
-  /** 撤销排除：不给哈希则撤销该源目录下的全部 */
-  revoke = (hashes?: string[]): Promise<DupStatus> =>
+  /**
+   * 组级动作：保留此份，其余可删（FR-07）。
+   *
+   * 组主只是建议：这里执行的是用户显式指定的保留项。
+   */
+  keepGroup = (root: string, groupId: string, keeperId: string): Promise<DupStatus> =>
     this.run(async () => {
-      const sourceRoot = this.sourceRoot || this.full?.sourceRoot;
-      if (!sourceRoot) throw new Error('尚未扫描，没有可撤销的排除记录');
-      const entries = await this.store.entries(sourceRoot);
-      let relPaths: string[] | undefined;
-      if (hashes && hashes.length) {
-        const all = this.full?.groups ?? [];
-        relPaths = [];
-        for (const hash of hashes) {
-          const group = all.find((g) => g.hash === hash);
-          if (!group) throw new Error('重复组不存在或已失效，请重新扫描');
-          relPaths.push(...group.redundant.map((copy) => copy.relPath));
+      this.assertRoot(root);
+      const result = this.result;
+      if (!result) throw new Error('尚未扫描，没有可操作的结果');
+      const group = result.groups.find((item) => item.id === groupId);
+      if (!group) throw new Error('该组不存在或已失效，请重新扫描');
+      const keeper = group.entries.find((item) => item.id === keeperId);
+      if (!keeper) throw new Error('保留项不在该组内');
+      for (const entry of group.entries) {
+        if (entry.id === keeper.id) {
+          entry.state = 'kept';
+          entry.note = '已保留';
+        } else {
+          entry.state = 'queued';
+          entry.note = '已进入待删队列';
         }
       }
-      const target = relPaths ?? Object.keys(entries);
-      await this.store.remove(sourceRoot, target);
-      this.event('已撤销排除', `${target.length} 个副本恢复备份`);
-      this.options.onExclusionsChanged?.(sourceRoot, '排除名单已变更，旧备份计划失效，请重新扫描');
+      this.refreshStats();
+      this.event('保留此份', `其余 ${group.entries.length - 1} 份进入待删队列`);
+      await this.audit({ at: Date.now(), action: '保留此份', groupId, outcome: 'ok', reason: keeper.relPath });
       return this.view();
     });
 
-  /** 导出全量报告到本机目录；不受界面预览截断影响 */
+  /**
+   * 执行删除（FR-08 ~ FR-11、FR-20、FR-21）。
+   *
+   * 逐条独立：任何一条的校验失败或落地失败都不影响其余条目。
+   */
+  act = (root: string, request: DupActRequest): Promise<DupActResult> => {
+    // 与扫描同一套序号语义：取消只影响「用户看到的那一次执行」（FR-15）
+    const token = ++this.operationToken;
+    return this.run(async () => {
+      this.assertRoot(root);
+      if (!request || !Array.isArray(request.items)) throw new Error('删除请求格式无效');
+      if (request.items.length === 0) throw new Error('请先选择要删除的文件');
+      this.phase = 'acting';
+      this.setProgress('acting', '执行删除', 0, request.items.length, 0);
+
+      const outcome = await executeAct({
+        root: this.currentRoot,
+        items: request.items,
+        category: request.category,
+        registry: this.registry,
+        groupMembers: this.groupMembers,
+        gate: this.options.gate,
+        isBusy: this.options.isBusy,
+        trash: this.options.trash,
+        quarantineDirectory: path.join(this.localDirectory, 'quarantine'),
+        isSuppressed: (hash) => Boolean(findSuppression(this.suppressionItems, hash, this.currentRoot)),
+        audit: (entry) => this.audit(entry),
+        isCancelled: () => this.cancelToken === token,
+      });
+
+      // 逐条回写条目状态：结果必须与界面所见一致
+      for (const item of outcome.items) {
+        const entry = this.findEntry(item.id);
+        if (!entry) continue;
+        if (item.outcome === 'deleted') entry.state = 'deleted';
+        else if (item.outcome === 'skipped-changed') entry.state = 'skipped';
+        else if (item.outcome === 'blocked') entry.state = 'blocked';
+        else entry.state = 'failed';
+        entry.note = item.reason;
+      }
+
+      this.refreshStats();
+      const failed = outcome.failed + outcome.blocked;
+      if (this.cancelToken === token) {
+        // 取消后不得报完成（FR-15）
+        this.phase = 'cancelled';
+        this.reason = '已取消，部分条目未处理';
+      } else if (failed > 0) {
+        this.phase = 'failed';
+        this.reason = `有 ${failed} 个文件未被删除（被拒绝或失败），详见逐条结果`;
+      } else {
+        this.phase = 'done';
+        this.reason = undefined;
+      }
+      this.setProgress(this.phase, '执行完成', outcome.items.length, outcome.items.length, 0);
+      this.event(
+        '删除执行完成',
+        `成功 ${outcome.deleted}，跳过 ${outcome.skipped}，被拒 ${outcome.blocked}，失败 ${outcome.failed}`,
+        failed > 0 ? 'failed' : 'ok',
+      );
+      return outcome;
+    });
+  }
+
+  /**
+   * 抑制：把内容哈希写入黑名单（FR-12）。
+   *
+   * 命中抑制的组在下次扫描时整组跳过；撤销后重新提示。
+   */
+  suppress = (root: string, sha256: string, scopeMode: 'root' | 'global', samplePaths: string[]): Promise<DupStatus> =>
+    this.run(async () => {
+      this.assertRoot(root);
+      if (typeof sha256 !== 'string' || !/^[0-9a-f]{16,}$/i.test(sha256)) throw new Error('内容哈希无效');
+      if (scopeMode !== 'root' && scopeMode !== 'global') throw new Error('抑制作用域无效');
+      const result = this.result;
+      const group = result?.groups.find((item) => item.sha256 === sha256);
+      await this.writeSuppression(root, sha256, scopeMode, group, samplePaths ?? []);
+      if (group) this.dropGroups([group]);
+      this.refreshStats();
+      this.event('下次不提醒', `已抑制 ${sha256.slice(0, 8)}`);
+      await this.audit({ at: Date.now(), action: '抑制', outcome: 'ok', reason: `${sha256.slice(0, 8)}（${scopeMode}）` });
+      return this.view();
+    });
+
+  /** 抑制清单（FR-13） */
+  listSuppressions = (root: string): Promise<DupSuppression[]> =>
+    this.run(async () => {
+      void root;
+      return this.suppressionItems.map(toSuppression);
+    });
+
+  /**
+   * 撤销抑制项（FR-13）。
+   *
+   * 不传哈希表示撤销全部；撤销后该组下次扫描重新提示。
+   */
+  revokeSuppression = (sha256?: string): Promise<DupStatus> =>
+    this.run(async () => {
+      const result = await this.store.remove(sha256);
+      this.suppressionItems = result.items;
+      this.event('撤销抑制', `撤销 ${result.removed} 条`);
+      this.options.onSuppressionsChanged?.(this.currentRoot, '抑制清单已变更，旧备份计划失效，请重新扫描');
+      await this.audit({ at: Date.now(), action: '撤销抑制', outcome: 'ok', reason: `${result.removed} 条` });
+      return this.view();
+    });
+
+  /** 导出全量报告到本机文件（不受预览截断影响） */
   exportReport = (format: 'json' | 'csv'): Promise<{ path: string; bytes: number }> =>
     this.run(async () => {
-      if (!this.full) throw new Error('请先执行重复扫描');
+      const full = this.fullResult;
+      if (!full) throw new Error('尚未扫描，没有可导出的报告');
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const file = path.join(this.localDirectory, `duplicate-report-${stamp}.${format === 'csv' ? 'csv' : 'json'}`);
+      await fs.mkdir(this.localDirectory, { recursive: true });
       if (format === 'csv') {
-        const rows = ['hash,size,relation,relPath,side,mtimeMs,role'];
-        for (const group of this.full.groups) {
-          for (const copy of group.copies) {
-            const role =
-              copy.relPath === group.canonical
-                ? 'canonical'
-                : group.redundant.some((r) => r.relPath === copy.relPath)
-                  ? 'redundant'
-                  : 'other';
+        const rows = ['groupId,category,fingerprint,groupSize,reclaimableBytes,absPath,relPath,fileName,size,mtimeMs,state'];
+        for (const group of full.groups) {
+          for (const entry of group.entries) {
             rows.push(
               [
-                group.hash,
+                group.id,
+                group.category,
+                group.fingerprint,
                 group.size,
-                group.relation,
-                JSON.stringify(copy.relPath),
-                copy.side,
-                copy.mtimeMs,
-                role,
+                group.reclaimableBytes,
+                entry.absPath,
+                entry.relPath,
+                entry.fileName,
+                entry.size,
+                entry.mtimeMs,
+                entry.state,
               ].join(','),
             );
           }
         }
         const text = `${rows.join('\n')}\n`;
-        await fs.mkdir(this.localDirectory, { recursive: true });
+        const file = path.join(this.localDirectory, `duplicate-report-${stamp}.csv`);
         await fs.writeFile(file, text, 'utf8');
         return { path: file, bytes: Buffer.byteLength(text, 'utf8') };
       }
-      await writeJsonAtomic(file, this.full);
-      const text = JSON.stringify(this.full, null, 2);
+      const file = path.join(this.localDirectory, `duplicate-report-${stamp}.json`);
+      const text = JSON.stringify(full, null, 2);
+      await fs.writeFile(file, text, 'utf8');
       return { path: file, bytes: Buffer.byteLength(text, 'utf8') };
     });
 
-  cancel = (): Promise<DupStatus> =>
+  /** 还原隔离区中的文件（FR-08 降级路径） */
+  restoreQuarantine = (id: string): Promise<{ restored: boolean; path?: string; reason?: string }> =>
     this.run(async () => {
-      this.cancelled = true;
-      this.event('已请求取消扫描');
-      return this.view();
+      if (typeof id !== 'string' || !id.trim()) throw new Error('隔离区记录标识无效');
+      const result = await this.quarantine.restore(id);
+      this.event(result.restored ? '已还原隔离文件' : '还原失败', result.reason ?? result.path);
+      await this.audit({
+        at: Date.now(),
+        action: '还原隔离文件',
+        outcome: result.restored ? 'ok' : 'failed',
+        reason: result.reason ?? result.path,
+      });
+      return result;
     });
+
+  /**
+   * 取消扫描或取消剩余删除项（FR-15）。
+   *
+   * **不进操作队列**：取消必须立即生效，不能排在正在执行的扫描/删除之后。
+   * 取消后状态为 `cancelled`，**不得报完成**。
+   */
+  cancel = async (): Promise<DupStatus> => {
+    // 取消落到「当前这次操作」上：即便它还在排队，也会被这次取消命中。
+    this.cancelToken = this.operationToken;
+    // 取消优先于完成：无论扫描是「仍在跑」还是「刚好跑完」，用户点了取消就不能报完成（FR-15）。
+    // 已算出的结果仍留在会话里，但状态是「已取消」，删除入口随之关闭——结果不完整，不可当真。
+    if (this.phase !== 'idle') {
+      this.phase = 'cancelled';
+      this.reason = '已取消，本次检测结果不完整，可重新检测';
+    }
+    this.event('已请求取消');
+    await this.audit({ at: Date.now(), action: '请求取消', outcome: 'skipped', reason: '用户取消' });
+    return this.view();
+  };
+
+  /**
+   * 供备份侧使用的「被排除相对路径」集合。
+   *
+   * 新版抑制黑名单以**内容哈希**为键，备份侧仍需要「哪些相对路径被排除」，
+   * 因此由这里从抑制记录里映射出相对路径：
+   * 只取 `scopeMode === 'root'` 且作用域根匹配该源目录的抑制项。
+   */
+  exclusionPaths = async (sourceRoot: string): Promise<ReadonlySet<string>> => {
+    await this.loaded;
+    const root = normalizeRoot(sourceRoot);
+    const paths = new Set<string>();
+    for (const item of this.suppressionItems) {
+      if (item.scopeMode !== 'root') continue;
+      const scope = normalizeRoot(item.scopeRoot);
+      const scopeReal = item.scopeRootReal ? normalizeRoot(item.scopeRootReal) : '';
+      if (scope !== root && scopeReal !== root) continue;
+      for (const absolute of item.paths ?? []) {
+        const relative = path.relative(path.resolve(item.scopeRoot), path.resolve(absolute));
+        if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
+        paths.add(relative.split(path.sep).join('/'));
+      }
+    }
+    return paths;
+  };
+
+  // ---- 内部辅助 ----
+
+  /** 写入一条抑制项并通知备份侧 */
+  private async addSuppression(root: string, group: DupGroup, entry: DupFileEntry): Promise<void> {
+    const sha256 = group.sha256 ?? entry.sha256;
+    await this.writeSuppression(root, sha256, 'root', group, group.entries.map((item) => item.absPath));
+  }
+
+  /** 抑制项落盘：内容哈希为键，作用域默认为当前扫描根 */
+  private async writeSuppression(
+    root: string,
+    sha256: string,
+    scopeMode: 'root' | 'global',
+    group: DupGroup | undefined,
+    samplePaths: string[],
+  ): Promise<void> {
+    const scopeRoot = scopeMode === 'global' ? root : this.currentRoot;
+    let scopeRootReal = scopeRoot;
+    try {
+      scopeRootReal = await fs.realpath(scopeRoot);
+    } catch {
+      scopeRootReal = scopeRoot;
+    }
+    const paths = group ? group.entries.map((entry) => entry.absPath) : samplePaths;
+    const record: SuppressionRecord = {
+      sha256,
+      fingerprint: sha256.slice(0, 8),
+      scopeRoot,
+      scopeMode,
+      createdAt: Date.now(),
+      hitCount: 0,
+      samplePaths: (samplePaths.length ? samplePaths : paths).slice(0, 5),
+      sampleFileNames: (group ? group.entries.map((entry) => entry.fileName) : []).slice(0, 5),
+      paths,
+      scopeRootReal,
+    };
+    this.suppressionItems = await this.store.put(record);
+    this.options.onSuppressionsChanged?.(root, '抑制清单已变更，旧备份计划失效，请重新扫描');
+  }
+
+  /** 把被抑制的组从结果中移除（撤销后可重新提示） */
+  private dropGroups(groups: DupGroup[]): void {
+    if (!this.result) return;
+    const ids = new Set(groups.map((group) => group.id));
+    for (const group of groups) group.suppressed = true;
+    this.result.groups = this.result.groups.filter((group) => !ids.has(group.id));
+    this.result.identicalGroups = this.result.identicalGroups.filter((group) => !ids.has(group.id));
+    this.result.suspectedGroups = this.result.suspectedGroups.filter((group) => !ids.has(group.id));
+    this.result.nameConflictGroups = this.result.nameConflictGroups.filter((group) => !ids.has(group.id));
+    if (this.fullResult) {
+      this.fullResult.groups = this.fullResult.groups.filter((group) => !ids.has(group.id));
+      this.fullResult.identicalGroups = this.fullResult.identicalGroups.filter((group) => !ids.has(group.id));
+      this.fullResult.suspectedGroups = this.fullResult.suspectedGroups.filter((group) => !ids.has(group.id));
+      this.fullResult.nameConflictGroups = this.fullResult.nameConflictGroups.filter((group) => !ids.has(group.id));
+    }
+  }
+
+  /** 按条目 id 在当前结果中查找 */
+  private findEntry(id: string): DupFileEntry | undefined {
+    for (const group of this.result?.groups ?? []) {
+      const entry = group.entries.find((item) => item.id === id);
+      if (entry) return entry;
+    }
+    return undefined;
+  }
+
+  /** 重算统计：可回收空间与待删字节必须分开呈现（FR-17） */
+  private refreshStats(): void {
+    if (!this.result) return;
+    const all = [...this.result.groups];
+    const stats = computeStats(all);
+    this.result.stats = {
+      ...stats,
+      pendingDeleteBytes: all.reduce(
+        (sum, group) => sum + group.entries.filter((entry) => entry.state === 'queued').reduce((s, entry) => s + entry.size, 0),
+        0,
+      ),
+      pendingDeleteCount: all.reduce((sum, group) => sum + group.entries.filter((entry) => entry.state === 'queued').length, 0),
+      pendingDeleteGroups: all.filter((group) => group.entries.some((entry) => entry.state === 'queued')).length,
+    };
+  }
+}
+
+/** 抑制项 → 跨进程契约结构 */
+function toSuppression(record: SuppressionRecord): DupSuppression {
+  return {
+    sha256: record.sha256,
+    fingerprint: record.fingerprint ?? record.sha256.slice(0, 8),
+    scopeRoot: record.scopeRoot,
+    scopeMode: record.scopeMode,
+    createdAt: record.createdAt,
+    hitCount: record.hitCount,
+    samplePaths: record.samplePaths ?? [],
+    sampleFileNames: record.sampleFileNames ?? [],
+  };
+}
+
+/**
+ * 统计：可回收空间只由内容重复组贡献，同名不同内容区不计入（FR-17）。
+ *
+ * 疑似组按同样口径计入，但界面必须标注「未全量校验，不保证一致」。
+ */
+function computeStats(groups: DupGroup[]): DupStats {
+  const reclaimableBytes = groups
+    .filter((group) => group.category !== 'same-name-diff-content')
+    .reduce((sum, group) => sum + group.reclaimableBytes, 0);
+  const queued = groups.flatMap((group) => group.entries.filter((entry) => entry.state === 'queued'));
+  return {
+    reclaimableBytes,
+    pendingDeleteBytes: queued.reduce((sum, entry) => sum + entry.size, 0),
+    pendingDeleteCount: queued.length,
+    pendingDeleteGroups: groups.filter((group) => group.entries.some((entry) => entry.state === 'queued')).length,
+  };
 }

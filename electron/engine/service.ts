@@ -211,6 +211,15 @@ export class BackupService extends EventEmitter {
   }
 
   /**
+   * 备份是否正在执行。
+   *
+   * 重复文件检测的删除动作据此禁用（FR-10）：删除与备份并发会破坏 manifest 与断点。
+   */
+  isBusy(): boolean {
+    return this.running || this.diagnosing;
+  }
+
+  /**
    * 注入重复排除名单来源。
    *
    * 排除名单按源目录分组，源目录用 realpath 归一（目录联接/符号链接下

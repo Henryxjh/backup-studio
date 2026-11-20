@@ -5,7 +5,7 @@ import { DirectoryPicker } from './components/DirectoryPicker';
 import { PlanPanel } from './components/PlanPanel';
 import { MediaDiagnostics } from './components/MediaDiagnostics';
 import { AutoSyncPanel } from './components/AutoSync';
-import { DuplicateFinderPanel } from './components/DuplicateFinder';
+import { DuplicateFinderPage } from './components/DuplicateFinder';
 import { ProgressPanel } from './components/ProgressPanel';
 import { EventFeed } from './components/EventFeed';
 import { Splitter } from './components/Splitter';
@@ -16,6 +16,9 @@ import { fmtBytes, fmtInt } from './lib/format';
 import type { AppState, BackupPhase, ScanResult, SyncMode } from '../shared/types';
 
 type StepState = 'idle' | 'active' | 'done';
+
+/** 视图：备份主线与「重复文件检测」独立页面（FR-01） */
+type AppView = 'backup' | 'dup';
 
 function Step({ label, state }: { label: string; state: StepState }) {
   return (
@@ -52,6 +55,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [allowMassDelete, setAllowMassDelete] = useState(false);
+  const [view, setView] = useState<AppView>('backup');
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('backup-studio-theme');
@@ -246,15 +250,28 @@ export default function App() {
           Backup Studio
         </div>
 
-        <nav className="steps">
-          <Step label="目录" state={step1} />
-          <span className="step-sep" aria-hidden="true" />
-          <Step label="计划" state={step2} />
-          <span className="step-sep" aria-hidden="true" />
-          <Step label="执行" state={step3} />
-        </nav>
+        {view === 'backup' ? (
+          <nav className="steps">
+            <Step label="目录" state={step1} />
+            <span className="step-sep" aria-hidden="true" />
+            <Step label="计划" state={step2} />
+            <span className="step-sep" aria-hidden="true" />
+            <Step label="执行" state={step3} />
+          </nav>
+        ) : null}
 
         <div style={{ flex: '1 1 auto' }} />
+
+        <button
+          className="btn btn-sm no-drag"
+          type="button"
+          aria-label="重复文件检测"
+          aria-pressed={view === 'dup'}
+          data-active={view === 'dup'}
+          onClick={() => setView(view === 'dup' ? 'backup' : 'dup')}
+        >
+          重复文件检测
+        </button>
 
         <button
           className="btn btn-icon no-drag"
@@ -267,6 +284,14 @@ export default function App() {
         </button>
       </header>
 
+      {view === 'dup' ? (
+        <DuplicateFinderPage
+          api={api.duplicateFinder}
+          pickDirectory={api.pickDirectory}
+          onBack={() => setView('backup')}
+          backupRunning={running}
+        />
+      ) : (
       <div className="workspace" ref={workspaceRef}>
         <section className="pane pane-left">
           <div className="pane-body">
@@ -288,16 +313,6 @@ export default function App() {
             {api ? (
               <div className="section">
                 <AutoSyncPanel api={api.autoSync} sourceRoot={sourceRoot} targetRoot={targetRoot} />
-              </div>
-            ) : null}
-
-            {api ? (
-              <div className="section">
-                <DuplicateFinderPanel
-                  api={api.duplicateFinder}
-                  sourceRoot={sourceRoot}
-                  targetRoot={targetRoot}
-                />
               </div>
             ) : null}
 
@@ -418,6 +433,7 @@ export default function App() {
           </div>
         </section>
       </div>
+      )}
     </div>
   );
 }

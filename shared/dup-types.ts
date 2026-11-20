@@ -1,137 +1,353 @@
 /**
- * 重复文件查找器的跨进程类型契约。
+ * 重复文件检测与清理（REQ-DUP-001）的跨进程类型契约。
  *
- * 与 `aut-types.ts` 同构：主进程与渲染层共用同一份定义，避免 IPC 两侧结构漂移。
+ * 依据 `docs/REQUIREMENTS-003-DUPLICATE-FINDER.md` §9.1 定版，并按实现需要做最小扩展
+ * （扩展处均有 `扩展` 注释说明）。与 `aut-types.ts` 同构：主进程与渲染层共用同一份定义，
+ * 避免 IPC 两侧结构漂移。
+ *
+ * 术语与口径：
+ * - **内容重复**：两个及以上文件内容哈希相同，**与文件名是否相同无关**（§5）。
+ * - **同名不同内容**：同一父目录内同名、但内容哈希不同（§5），是独立告警类，不是重复。
+ * - **疑似重复**：大文件跳过全量校验，仅凭「大小 + 首尾局部哈希」判定（FR-03）。
+ * - **抑制**：以内容哈希为键的黑名单，命中整组跳过（FR-12）。
  */
 
-/** 重复副本所属端 */
-export type DupSide = 'source' | 'target';
+/** 结果类别：内容重复 / 同名不同内容 / 疑似重复 */
+export type DupCategory = 'identical' | 'same-name-diff-content' | 'suspected';
 
 /**
- * 重复组内的关系类型。
+ * 检测页状态机（§7.1）。
  *
- * - `source-internal`：副本全在源端（源目录自身存在多份相同内容）
- * - `cross-side`：源端与目标端各有副本且相对路径不同（跨端重复）
+ * `idle` 未选目录；`scanning` 遍历目录；`bucketing` 大小分桶；`partial-hashing` 局部哈希；
+ * `hashing` 全量哈希；`summarizing` 汇总；`ready` 结果就绪；`acting` 执行删除；
+ * `done` 动作完成；`failed` 失败；`cancelled` 用户取消。
+ *
+ * 任一阶段被取消一律为 `cancelled`，不得置为 `done`。
  */
-export type DupRelation = 'source-internal' | 'cross-side';
+export type DupPhase =
+  | 'idle'
+  | 'scanning'
+  | 'bucketing'
+  | 'partial-hashing'
+  | 'hashing'
+  | 'summarizing'
+  | 'ready'
+  | 'acting'
+  | 'done'
+  | 'failed'
+  | 'cancelled';
 
-/** 哈希来源：实算 or 复用清单/排除记录中的历史值 */
-export type DupBasis = 'computed' | 'manifest' | 'exclusion';
+/** 单条结果的动作状态（§7.2） */
+export type DupItemState =
+  /** 未处理 */
+  | 'pending'
+  /** 用户选择「保留」 */
+  | 'kept'
+  /** 已进入待删队列 */
+  | 'queued'
+  /** 已删除（进回收站或隔离区） */
+  | 'deleted'
+  /** 扫描后已变更，已跳过 */
+  | 'skipped'
+  /** 被写入闸门或备份互斥阻断 */
+  | 'blocked'
+  /** 删除失败 */
+  | 'failed';
 
-/** 单个副本。相对路径相同且内容相同的源端/目标端文件合并为一条 `both` 副本 */
-export interface DupCopy {
+/** 单个文件条目 */
+export interface DupFileEntry {
+  /** 稳定标识：`absPath` + 内容哈希前缀，同一根目录内唯一 */
+  id: string;
+  /** 绝对路径 */
+  absPath: string;
+  /** 相对扫描根的路径 */
   relPath: string;
-  side: DupSide | 'both';
+  /** 父目录绝对路径：同名判定以「同一父目录」为界（FR-05） */
+  dirPath: string;
+  /** 文件名（含扩展名） */
+  fileName: string;
+  /** 字节数 */
   size: number;
+  /** 修改时间（毫秒） */
   mtimeMs: number;
-  basis: DupBasis;
-  /** 硬链接：同一 inode 共享同一份数据，删其一不影响其他 */
-  inode?: string;
+  /** 文件身份：用于删除前二次校验（FR-09、FR-20） */
+  dev: string;
+  /** 文件身份：inode */
+  ino: string;
+  /** 内容哈希；疑似项为局部哈希（此时 `suspected` 为 true） */
+  sha256: string;
+  /** 首尾 64 KiB 局部哈希（FR-03 第二级） */
+  partialHash?: string;
+  /** 疑似重复：未做全量校验 */
+  suspected?: boolean;
+  /** 动作状态 */
+  state: DupItemState;
+  /** 说明：为什么被跳过 / 被拒绝 / 为什么建议保留 */
+  note?: string;
 }
 
+/** 一个结果组 */
 export interface DupGroup {
-  /** 内容哈希（SHA-256） */
-  hash: string;
+  /** 稳定标识：内容重复用哈希，同名不同内容用「父目录 + 文件名」派生 */
+  id: string;
+  /** 类别 */
+  category: DupCategory;
+  /** 短哈希指纹：SHA-256 前 8 位十六进制（FR-04） */
+  fingerprint: string;
+  /**
+   * 内容哈希。
+   *
+   * 内容重复 / 疑似组为组内共有的哈希；同名不同内容组没有共同哈希，为 `undefined`。
+   */
+  sha256?: string;
+  /** 组内条目 */
+  entries: DupFileEntry[];
+  /** 单份大小（字节） */
   size: number;
-  copies: DupCopy[];
-  relation: DupRelation;
-  /** 规范副本的相对路径；以源端目录结构为准，源端无副本时为 undefined */
-  canonical?: string;
-  /** 冗余副本（均在源端）；可被排除。带完整元数据，排除记录需要源端 mtime 才能安全复用哈希 */
-  redundant: DupCopy[];
-  /** 本组可回收字节：冗余副本总大小 */
+  /**
+   * 可回收空间 =（份数 − 1）× 单份大小；同名不同内容组恒为 0（FR-17）。
+   */
   reclaimableBytes: number;
-  /** 零字节组：所有零字节文件互为重复，不提供采纳入口 */
-  zeroByte: boolean;
-  /** 硬链接组：同一 inode 多路径，不可互相排除 */
-  hardLinked: boolean;
-  /** 是否可采纳排除 */
-  adoptable: boolean;
-  /** 副本列表是否被截断（组内副本过多时只保留前若干条） */
-  copiesTruncated: boolean;
+  /** 建议保留项的条目 id（FR-07 组主规则）；仅建议，不自动删除 */
+  suggestedKeeperId?: string;
+  /** 父目录（同名不同内容组）；内容重复组为 undefined */
+  dirPath?: string;
+  /** 文件名（同名不同内容组） */
+  fileName?: string;
+  /** 该组是否处于抑制黑名单中 */
+  suppressed?: boolean;
 }
 
-/** 判定失败：无法完成哈希计算的文件，不参与任何分组 */
+/** 判定失败：无法完成哈希的文件，不参与任何分组 */
 export interface DupFailure {
+  absPath: string;
   relPath: string;
-  side: DupSide;
   reason: string;
 }
 
-export interface DupReport {
-  sourceRoot: string;
-  targetRoot: string;
-  createdAt: number;
+/** 扫描摘要（FR-17、§9.1） */
+export interface DupScanSummary {
+  /** 扫描根 */
+  root: string;
+  /** 参与判定的文件总数 */
+  totalFiles: number;
+  /** 扫描到的总字节 */
+  scannedBytes: number;
+  /** 跳过的 0 字节文件数 */
+  skippedEmpty: number;
+  /** 跳过的低于最小尺寸的文件数 */
+  skippedTooSmall: number;
+  /** 跳过的符号链接数 */
+  skippedSymlink: number;
+  /** 因抑制黑名单跳过的组数 */
+  skippedSuppressed: number;
+  /** 内容重复组数 */
+  identicalGroups: number;
+  /** 同名不同内容组数 */
+  nameConflictGroups: number;
+  /** 疑似重复组数 */
+  suspectedGroups: number;
+  /** 耗时（毫秒） */
   durationMs: number;
-  /** 分组列表（可能已按预览上限截断；统计始终基于全量） */
-  groups: DupGroup[];
-  truncated: boolean;
-  totalGroups: number;
-  totalCopies: number;
-  /** 重复组涉及的总字节 */
-  totalBytes: number;
-  /** 全部可采纳组的冗余副本总字节 */
+}
+
+/** 统计（FR-17）：可回收空间与待删字节必须分开呈现 */
+export interface DupStats {
+  /** 可回收空间：仅由内容重复组贡献（疑似组按同样口径计入但不保证一致，需界面标注） */
   reclaimableBytes: number;
+  /** 待删字节：当前待删队列的总字节 */
+  pendingDeleteBytes: number;
+  /** 待删文件数 */
+  pendingDeleteCount: number;
+  /** 涉及组数 */
+  pendingDeleteGroups: number;
+}
+
+/** 扫描进度（FR-15） */
+export interface DupProgress {
+  /** 当前阶段 */
+  phase: DupPhase;
+  /** 阶段显示名 */
+  label: string;
+  /** 已处理数 */
+  done: number;
+  /** 总数 */
+  total: number;
+  /** 已读字节 */
+  bytesRead: number;
+  /** 当前吞吐（字节/秒） */
+  throughputBps: number;
+  /** 预计剩余（毫秒）；无法估算时为 undefined */
+  etaMs?: number;
+}
+
+/** 扫描结果 */
+export interface DupScanResult {
+  /** 扫描根 */
+  root: string;
+  /** 摘要 */
+  summary: DupScanSummary;
+  /** 全部组 */
+  groups: DupGroup[];
+  /** 内容重复组 */
+  identicalGroups: DupGroup[];
+  /** 疑似重复组 */
+  suspectedGroups: DupGroup[];
+  /** 同名不同内容组（独立告警区） */
+  nameConflictGroups: DupGroup[];
+  /** 判定失败清单 */
   failures: DupFailure[];
-  /** 覆盖完整性：false 表示扫描不完整，报告不可当作全量结论 */
+  /** 统计 */
+  stats: DupStats;
+  /** 覆盖完整性：false 表示扫描不完整，结论仅供参考 */
   complete: boolean;
-  /** 参与判定的文件数 */
-  scannedFiles: number;
-  /** 实际参与哈希计算的文件数（size 分桶后才有哈希成本） */
-  hashedFiles: number;
-  /** 源端 / 目标端扫描错误数 */
-  sourceErrors: number;
-  targetErrors: number;
+  /** 组列表是否被截断（预览上限；统计始终基于全量） */
+  truncated: boolean;
 }
 
-/** 排除名单中的一条记录 */
-export interface DupExclusionEntry {
-  /** 内容哈希：排除时的判定依据 */
-  hash: string;
-  size: number;
-  mtimeMs: number;
+/** 抑制项（FR-12）：以内容哈希为键 */
+export interface DupSuppression {
+  /** 内容哈希 */
+  sha256: string;
+  /** 短指纹 */
+  fingerprint: string;
+  /** 作用域根目录 */
+  scopeRoot: string;
+  /** 作用域模式：当前根 / 全局 */
+  scopeMode: 'root' | 'global';
+  /** 抑制时间 */
+  createdAt: number;
+  /** 累计命中次数 */
+  hitCount: number;
+  /** 样例绝对路径 */
+  samplePaths: string[];
+  /** 样例文件名 */
+  sampleFileNames: string[];
 }
 
-/**
- * 排除名单。
- *
- * 按源目录分组：**绑定源目录，不随目标介质切换而迁移或失效**。
- * 记录 mtime 与哈希，用于在下一次扫描时安全复用历史哈希（size+mtime 同时吻合才复用）。
- */
-export interface DupExclusion {
-  version: 1;
-  bySource: Record<string, Record<string, DupExclusionEntry>>;
-  updatedAt: number;
+/** 单条动作结果 */
+export interface DupActItemResult {
+  /** 条目 id */
+  id: string;
+  /** 绝对路径 */
+  absPath: string;
+  /** 结果 */
+  outcome: 'deleted' | 'skipped-changed' | 'blocked' | 'failed';
+  /** 原因说明 */
+  reason?: string;
+  /** 落地方式：系统回收站 / 本机隔离区 */
+  landedTo?: 'system-trash' | 'quarantine';
+  /** 隔离区条目 id：降级落地时给出，界面据此提供「还原」入口（FR-08） */
+  quarantineId?: string;
 }
 
-export type DupState = 'idle' | 'scanning' | 'hashing' | 'ready' | 'error';
+/** 批量动作结果 */
+export interface DupActResult {
+  /** 逐条结果 */
+  items: DupActItemResult[];
+  /** 成功删除数 */
+  deleted: number;
+  /** 跳过数（扫描后已变更） */
+  skipped: number;
+  /** 被闸门阻断数 */
+  blocked: number;
+  /** 失败数 */
+  failed: number;
+  /** 实际释放字节 */
+  reclaimedBytes: number;
+  /** 是否发生过降级：本机隔离区（FR-08） */
+  degradedToQuarantine: boolean;
+}
 
+/** 逐条动作：保留 / 删除 / 下次不提醒（FR-06） */
+export type DupItemAction = 'keep' | 'delete' | 'suppress';
+
+/** 执行删除的请求（FR-09、FR-10、FR-18、FR-20） */
+export interface DupActRequest {
+  /** 扫描根；主进程据此做路径边界校验 */
+  root: string;
+  /** 待删条目：主进程必须逐条校验它确实来自本次扫描结果 */
+  items: {
+    id: string;
+    absPath: string;
+    groupId: string;
+    /** 扫描时记录的内容哈希 */
+    sha256: string;
+    size: number;
+    dev: string;
+    ino: string;
+  }[];
+  /** 涉及的组 id：用于「每组至少保留一份」校验（FR-11） */
+  groupIds: string[];
+  /** 确认类别：同名不同内容区需要两次确认（FR-18） */
+  category: DupCategory;
+}
+
+/** 事件流条目（审计脱敏后写入，FR-19） */
 export interface DupEvent {
   at: number;
+  /** 动作类型 */
   action: string;
+  /** 明细（已脱敏） */
   detail?: string;
+  /** 结果 */
+  outcome?: 'ok' | 'skipped' | 'blocked' | 'failed';
 }
 
+/** 检测页整体状态 */
 export interface DupStatus {
-  state: DupState;
-  /** 预览用报告（可能已截断；导出仍是全量） */
-  report: DupReport | null;
-  /** 当前排除名单的源端相对路径 */
-  excludedPaths: string[];
-  excludedCount: number;
-  excludedBytes: number;
+  /** 当前阶段 */
+  phase: DupPhase;
+  /** 进度 */
+  progress: DupProgress;
+  /** 扫描结果；未扫描时为 null */
+  result: DupScanResult | null;
+  /** 抑制清单 */
+  suppressions: DupSuppression[];
+  /** 最近事件 */
   recent: DupEvent[];
+  /** 全局原因说明（失败 / 取消 / 降级等） */
   reason?: string;
+  /** 删除是否被禁止（备份运行中 / 闸门不放行） */
+  blockedReason?: string;
+  /** 删除入口是否可用 */
+  canAct: boolean;
 }
 
+/** 渲染层可调用的接口（主进程是唯一写入点，FR-20） */
 export interface DupApi {
+  /** 当前状态 */
   status(): Promise<DupStatus>;
-  scan(sourceRoot: string, targetRoot: string): Promise<DupStatus>;
-  /** 采纳排除：按重复组哈希整组采纳 */
-  adopt(hashes: string[]): Promise<DupStatus>;
-  /** 撤销排除：给定哈希则撤销对应组，不给则撤销全部 */
-  revoke(hashes?: string[]): Promise<DupStatus>;
+  /** 扫描一个目录（FR-02） */
+  scan(root: string, options?: { minSizeBytes?: number }): Promise<DupStatus>;
+  /** 取消扫描或取消剩余删除项（FR-15） */
+  cancel(): Promise<DupStatus>;
+  /** 逐条标记动作（会话内状态；FR-06） */
+  markAction(root: string, itemIds: string[], action: DupItemAction): Promise<DupStatus>;
+  /** 组级动作：保留此份，其余可删（FR-07） */
+  keepGroup(root: string, groupId: string, keeperId: string): Promise<DupStatus>;
+  /** 执行删除（二次校验 + 闸门 + 回收站落地；FR-08/09/10/11/18/20） */
+  act(root: string, request: DupActRequest): Promise<DupActResult>;
+  /** 抑制：把内容哈希写入黑名单（FR-12） */
+  suppress(
+    root: string,
+    sha256: string,
+    scopeMode: 'root' | 'global',
+    samplePaths: string[],
+  ): Promise<DupStatus>;
+  /** 抑制清单（FR-13） */
+  listSuppressions(root: string): Promise<DupSuppression[]>;
+  /** 撤销单条 / 全部抑制（FR-13） */
+  revokeSuppression(sha256?: string): Promise<DupStatus>;
   /** 导出全量报告到本机文件 */
   exportReport(format: 'json' | 'csv'): Promise<{ path: string; bytes: number }>;
-  cancel(): Promise<DupStatus>;
+  /** 还原隔离区中的文件（FR-08 降级路径） */
+  restoreQuarantine(id: string): Promise<{ restored: boolean; path?: string; reason?: string }>;
+  /**
+   * 受校验的「定位文件」：路径必须落在本次扫描根之内，且确实是本次扫描结果中的条目。
+   *
+   * 与备份主页那条无校验的定位通道不同，这里由主进程做边界判定，
+   * 伪造路径一律拒绝；文件已不存在时抛出明确错误，不静默失败（FR-14、FR-20）。
+   */
+  reveal(root: string, absPath: string): Promise<{ revealed: boolean }>;
 }

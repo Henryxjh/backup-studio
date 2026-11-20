@@ -92,6 +92,12 @@ export class AutoSync implements AutoSyncApi {
     return structuredClone({ pair, available, reason, block, state, polling: this.polling || !!pair?.pollOnly, pending: Number(queue.dirty || this.requested), attempts: queue.attempts, recent, recycle, recycleBytes: recycleBytes(recycle), lastSync });
   }
   status = () => this.view();
+  /**
+   * 自动同步是否正在执行。
+   *
+   * 重复文件检测的删除动作据此禁用（FR-10）：删正在被同步的文件会破坏 manifest 与断点。
+   */
+  isRunning = (): boolean => this.state === 'scanning' || this.state === 'syncing';
   configure = (input: AutoPairInput) => this.run(async () => {
     if (this.data.pair?.enabled) throw new Error('先关闭自动备份再修改设置');
     this.data.pair = await makePair(input, this.localDirectory, this.data.pair);
