@@ -176,6 +176,25 @@ export class BackupService extends EventEmitter {
     };
   }
 
+  /**
+   * 启动时载入活动账本，把「上次中断、可续传」的任务暴露给渲染层。
+   *
+   * 崩溃或关窗后引擎是全新实例，构造器里的 `recoverableJob` 永远是 null；
+   * 界面据此无法显示恢复入口，用户只会被引擎错误文案引导去点一个不存在的按钮。
+   * 这里只读活动账本，不做任何写入，也不改变断点内容。
+   */
+  async loadRecoverableJob(): Promise<RecoverableJob | null> {
+    try {
+      this.state.recoverableJob = await this.findRecoverableJob();
+    } catch (err) {
+      // 账本损坏时不得阻断启动，但也绝不能把「读不出来」当成「没有可恢复任务」。
+      this.log('error', `无法读取活动任务账本：${errorText(err)}`);
+      this.state.recoverableJob = null;
+    }
+    this.emitState();
+    return this.state.recoverableJob;
+  }
+
   private emptySummary() {
     return {
       totalFiles: 0,
@@ -249,6 +268,7 @@ export class BackupService extends EventEmitter {
       targetBytes: target.totalBytes,
       durationMs: now() - started,
       errors: [...source.errors, ...target.errors],
+      skippedSymlinks: source.skippedSymlinks + target.skippedSymlinks,
     };
 
     this.log(
@@ -257,6 +277,10 @@ export class BackupService extends EventEmitter {
     );
     for (const err of result.errors.slice(0, 5)) {
       this.log('warn', `扫描告警：${err}`);
+    }
+    if (result.skippedSymlinks) {
+      // 符号链接被跳过意味着这部分内容不会进入备份，必须让用户看见而不是静默丢失。
+      this.log('warn', `扫描跳过 ${result.skippedSymlinks} 个符号链接（默认不跟随）`);
     }
     this.setPhase('idle');
     return result;

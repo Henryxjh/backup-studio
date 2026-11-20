@@ -87,6 +87,8 @@ export interface ScanResult {
   durationMs: number;
   /** 扫描期间无法读取的路径 */
   errors: string[];
+  /** 扫描期间跳过的符号链接数量；符号链接默认不跟随 */
+  skippedSymlinks?: number;
 }
 
 export interface LogLevel {

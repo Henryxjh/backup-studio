@@ -1,24 +1,41 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { getApi, type BackupAPI } from './lib/api';
+import { getApi, type BackupAPI, type ScanOutcome } from './lib/api';
 import { createMockApi } from './lib/mock';
 import { DirectoryPicker } from './components/DirectoryPicker';
 import { PlanPanel } from './components/PlanPanel';
 import { MediaDiagnostics } from './components/MediaDiagnostics';
 import { AutoSyncPanel } from './components/AutoSync';
 import { ProgressPanel } from './components/ProgressPanel';
+import { RecoverCard } from './components/RecoverCard';
 import { EventFeed } from './components/EventFeed';
 import { Splitter } from './components/Splitter';
 import { IconAlert, IconCheck, IconLayers, IconMoon, IconRefresh, IconSun } from './components/Icons';
 import { useSpringValue } from './hooks/useSpringValue';
 import { POP_SPRING } from './lib/spring';
-import { fmtBytes, fmtInt } from './lib/format';
-import type { AppState, BackupPhase, ScanResult, SyncMode } from '../shared/types';
+import { fmtBytes, fmtDuration, fmtInt } from './lib/format';
+import type { AppState, BackupPhase, SyncMode } from '../shared/types';
 
 type StepState = 'idle' | 'active' | 'done';
 
+/**
+ * 顶层工作区。
+ *
+ * 预留：REQ-DUP-001「重复文件检测」尚未实现，这里不放一个点了没反应的假入口。
+ * 等引擎与扫描能力就绪后，在本数组追加
+ *   { id: 'dup', label: '重复文件检测' }
+ * 即可得到与「手动备份」「自动备份」并列的独立顶层入口；
+ * 该入口渲染自己的扫描与清理视图，不打断手动备份主线。
+ */
+const WORKSPACES = [
+  { id: 'manual', label: '手动备份' },
+  { id: 'auto', label: '自动备份' },
+] as const;
+
+type WorkspaceId = (typeof WORKSPACES)[number]['id'];
+
 function Step({ label, state }: { label: string; state: StepState }) {
   return (
-    <span className="step" data-state={state}>
+    <span className="step" data-state={state} title="流程指示，仅表示当前进度，不可点击">
       <span className="step-dot" />
       {label}
     </span>
@@ -38,19 +55,32 @@ const PHASE_LABEL: Record<BackupPhase, string> = {
   interrupted: '已中断',
 };
 
+/** 目标端的归档目录（与 electron/engine/manifest.ts 的 historyDir 对齐）。 */
+const ARCHIVE_DIR = '.backup-studio/history';
+
+function joinPath(root: string, rel: string): string {
+  const sep = root.includes('\\') ? '\\' : '/';
+  return `${root.replace(/[\\/]+$/, '')}${sep}${rel.replace(/\//g, sep)}`;
+}
+
 export default function App() {
   const api = useMemo<BackupAPI>(() => getApi() ?? createMockApi(), []);
   const workspaceRef = useRef<HTMLDivElement>(null);
 
+  const [workspace, setWorkspace] = useState<WorkspaceId>('manual');
   const [sourceRoot, setSourceRoot] = useState('');
   const [targetRoot, setTargetRoot] = useState('');
-  const [scan, setScan] = useState<ScanResult | null>(null);
+  const [scan, setScan] = useState<ScanOutcome | null>(null);
   const [syncMode, setSyncMode] = useState<SyncMode>('mirror');
   const [state, setState] = useState<AppState | null>(null);
   const [collapsed, setCollapsed] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [busyStage, setBusyStage] = useState<'scanning' | 'planning' | 'starting' | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [allowMassDelete, setAllowMassDelete] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const [dismissedFailure, setDismissedFailure] = useState<string | null>(null);
+  const [planMeta, setPlanMeta] = useState<{ truncated?: boolean; totalActions?: number; previewLimit?: number }>({});
+  const [autoTarget, setAutoTarget] = useState('');
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('backup-studio-theme');
@@ -126,6 +156,7 @@ export default function App() {
   const phase = state?.phase ?? 'idle';
   const media = state?.media ?? 'online';
   const summary = state?.summary;
+  const busy = busyStage !== null;
 
   // 完成态：对勾欠阻尼微弹，2.5 秒后自动淡出恢复
   useEffect(() => {
@@ -141,15 +172,24 @@ export default function App() {
   const runScanAndPlan = useCallback(
     async (src: string, dst: string, mode: SyncMode) => {
       if (!src || !dst) return;
-      setBusy(true);
+      setStartError(null);
+      setBusyStage('scanning');
       try {
         const result = await api.scan(src, dst);
         setScan(result);
-        await api.plan(src, dst, mode);
+        setBusyStage('planning');
+        const planned = await api.plan(src, dst, mode);
+        setPlanMeta({
+          truncated: planned.truncated,
+          totalActions: planned.totalActions ?? planned.actions?.length,
+          previewLimit: planned.previewLimit,
+        });
         setAllowMassDelete(false);
         setConfirming(false);
+      } catch (err) {
+        setStartError(err instanceof Error ? err.message : '扫描或生成计划失败');
       } finally {
-        setBusy(false);
+        setBusyStage(null);
       }
     },
     [api],
@@ -163,7 +203,7 @@ export default function App() {
   }, [api, targetRoot, syncMode, runScanAndPlan]);
 
   const handleBrowseTarget = useCallback(async () => {
-    const picked = await api.pickDirectory('选择备份存放的目标目录');
+    const picked = await api.pickDirectory('选择备份存放的备份目标目录');
     if (!picked) return;
     setTargetRoot(picked);
     await runScanAndPlan(sourceRoot, picked, syncMode);
@@ -188,7 +228,8 @@ export default function App() {
         setConfirming(true);
         return;
       }
-      setBusy(true);
+      setStartError(null);
+      setBusyStage('starting');
       try {
         await api.start({
           sourceRoot,
@@ -198,9 +239,10 @@ export default function App() {
           resume: true,
         });
       } catch (err) {
-        console.error('启动备份失败', err);
+        // 引擎原话直接呈现给用户，不再只写进 console。
+        setStartError(err instanceof Error ? err.message : '启动备份失败');
       } finally {
-        setBusy(false);
+        setBusyStage(null);
       }
     },
     [api, sourceRoot, targetRoot, syncMode, allowMassDelete, state?.requiresConfirmation],
@@ -216,24 +258,65 @@ export default function App() {
    * 旧计划里的删除动作一律作废。这一步由主进程强制执行。
    */
   const handleRecover = useCallback(async () => {
-    setBusy(true);
+    setStartError(null);
+    setBusyStage('scanning');
     try {
       if (targetRoot) {
         await api.assess(targetRoot);
       }
       await api.recover(true);
     } catch (err) {
-      // 恢复失败时保留证据，由主进程写入日志
-      console.error('恢复备份失败', err);
+      setStartError(err instanceof Error ? err.message : '恢复备份失败');
     } finally {
-      setBusy(false);
+      setBusyStage(null);
     }
   }, [api, targetRoot]);
 
   const step1: StepState = sourceRoot && targetRoot ? 'done' : 'active';
   const step2: StepState = summary && summary.totalFiles > 0 ? 'done' : sourceRoot && targetRoot ? 'active' : 'idle';
-  const step3: StepState =
-    phase === 'completed' ? 'done' : running ? 'active' : 'idle';
+  const step3: StepState = phase === 'completed' ? 'done' : running ? 'active' : 'idle';
+
+  // 失败/取消时取引擎自己的话术（最近一条 error/warn 日志），不用界面自造措辞。
+  const engineFailure = useMemo(() => {
+    if (phase !== 'failed' && phase !== 'cancelled') return undefined;
+    const logs = state?.logs ?? [];
+    for (let index = logs.length - 1; index >= 0; index -= 1) {
+      const entry = logs[index];
+      if (entry.level === 'error' || entry.level === 'warn') return entry.text;
+    }
+    return '引擎未上报失败原因';
+  }, [phase, state?.logs]);
+
+  const bannerText = startError ?? engineFailure;
+  const showBanner = bannerText !== undefined && bannerText !== null && dismissedFailure !== bannerText;
+
+  const writeCount = summary ? summary.copy + summary.update + summary.rename : 0;
+  const deleteCount = summary?.delete ?? 0;
+  // 引擎只在进度事件里刷新 elapsedMs；没有进度时如实标注未上报，不编造耗时。
+  const elapsedText = summary && summary.elapsedMs > 0 ? fmtDuration(summary.elapsedMs) : '引擎未上报';
+
+  const statusText = (() => {
+    if (busyStage === 'scanning') return '正在扫描…';
+    if (busyStage === 'planning') return '正在生成计划…';
+    if (busyStage === 'starting') return '正在启动备份…';
+    if (phase === 'failed') return `备份失败：${engineFailure ?? '引擎未上报失败原因'}`;
+    if (phase === 'cancelled') return `备份已取消：${engineFailure ?? '引擎未上报取消原因'}`;
+    if (running) return `${PHASE_LABEL[phase]}，已传输 ${fmtBytes(summary?.copiedBytes ?? 0)}`;
+    if (phase === 'completed') {
+      return `备份完成：写入 ${fmtInt(writeCount)} 个文件 · 删除 ${fmtInt(deleteCount)} 个 · 耗时 ${elapsedText}`;
+    }
+    if (summary && summary.totalFiles > 0) {
+      return `已就绪，将写入 ${fmtInt(writeCount)} 个文件，传输 ${fmtBytes(summary.bytes)}`;
+    }
+    return '请选择源目录与备份目标目录';
+  })();
+
+  const revealArchive = useCallback(() => {
+    if (!targetRoot) return;
+    void api.reveal(joinPath(targetRoot, ARCHIVE_DIR));
+  }, [api, targetRoot]);
+
+  const diagnosticsRoot = workspace === 'auto' ? autoTarget : targetRoot;
 
   return (
     <div className="app">
@@ -245,13 +328,29 @@ export default function App() {
           Backup Studio
         </div>
 
-        <nav className="steps">
-          <Step label="目录" state={step1} />
-          <span className="step-sep" aria-hidden="true" />
-          <Step label="计划" state={step2} />
-          <span className="step-sep" aria-hidden="true" />
-          <Step label="执行" state={step3} />
+        <nav className="workspace-nav" aria-label="工作区">
+          {WORKSPACES.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className="workspace-tab"
+              aria-current={workspace === item.id ? 'page' : undefined}
+              onClick={() => setWorkspace(item.id)}
+            >
+              {item.label}
+            </button>
+          ))}
         </nav>
+
+        {workspace === 'manual' ? (
+          <nav className="steps" aria-label="备份流程指示（仅表示进度，不可点击）">
+            <Step label="目录" state={step1} />
+            <span className="step-sep" aria-hidden="true" />
+            <Step label="计划" state={step2} />
+            <span className="step-sep" aria-hidden="true" />
+            <Step label="执行" state={step3} />
+          </nav>
+        ) : null}
 
         <div style={{ flex: '1 1 auto' }} />
 
@@ -268,137 +367,203 @@ export default function App() {
 
       <div className="workspace" ref={workspaceRef}>
         <section className="pane pane-left">
-          <div className="pane-body">
-            <div className="section">
-              <div className="section-title">备份目录</div>
-              <DirectoryPicker
-                sourceRoot={sourceRoot}
-                targetRoot={targetRoot}
-                scan={scan}
-                busy={busy}
-                onSourceChange={setSourceRoot}
-                onTargetChange={setTargetRoot}
-                onBrowseSource={handleBrowseSource}
-                onBrowseTarget={handleBrowseTarget}
-                onCommit={handleCommit}
+          <div className="pane-body pane-body-scroll">
+            {workspace === 'manual' ? (
+              <>
+                <div className="section">
+                  <div className="section-title">备份目录</div>
+                  <DirectoryPicker
+                    sourceRoot={sourceRoot}
+                    targetRoot={targetRoot}
+                    scan={scan}
+                    busy={busy}
+                    onSourceChange={setSourceRoot}
+                    onTargetChange={setTargetRoot}
+                    onBrowseSource={handleBrowseSource}
+                    onBrowseTarget={handleBrowseTarget}
+                    onCommit={handleCommit}
+                  />
+                </div>
+
+                <PlanPanel
+                  actions={state?.actions ?? []}
+                  copy={summary?.copy ?? 0}
+                  update={summary?.update ?? 0}
+                  rename={summary?.rename ?? 0}
+                  deleteCount={deleteCount}
+                  skip={summary?.skip ?? 0}
+                  totalFiles={summary?.totalFiles ?? 0}
+                  bytes={summary?.bytes ?? 0}
+                  syncMode={syncMode}
+                  onSyncModeChange={handleSyncModeChange}
+                  truncated={planMeta.truncated}
+                  totalActions={planMeta.totalActions}
+                  previewLimit={planMeta.previewLimit}
+                  onRevealArchive={revealArchive}
+                />
+
+                {phase === 'completed' ? (
+                  <div className="completion-summary">
+                    <span className="completion-summary-title">本次备份结果</span>
+                    <span>写入 {fmtInt(writeCount)} 个文件</span>
+                    <span>删除 {fmtInt(deleteCount)} 个文件</span>
+                    <span>耗时 {elapsedText}</span>
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <AutoSyncPanel
+                api={api.autoSync}
+                pickDirectory={(title) => api.pickDirectory(title)}
+                onActiveTargetChange={setAutoTarget}
               />
-            </div>
-
-            {api ? (
-              <div className="section">
-                <AutoSyncPanel api={api.autoSync} sourceRoot={sourceRoot} targetRoot={targetRoot} />
-              </div>
-            ) : null}
-
-            <PlanPanel
-              actions={state?.actions ?? []}
-              copy={summary?.copy ?? 0}
-              update={summary?.update ?? 0}
-              rename={summary?.rename ?? 0}
-              deleteCount={summary?.delete ?? 0}
-              skip={summary?.skip ?? 0}
-              totalFiles={summary?.totalFiles ?? 0}
-              bytes={summary?.bytes ?? 0}
-              syncMode={syncMode}
-              onSyncModeChange={handleSyncModeChange}
-            />
-
-            {confirming && state?.confirmReason ? (
-              <div className="banner" data-tone="danger">
-                <IconAlert size={13} className="icon-inline" />
-                <span>{state.confirmReason}</span>
-                <span style={{ flex: '1 1 auto' }} />
-                <button className="btn btn-sm" type="button" onClick={() => setConfirming(false)}>
-                  取消
-                </button>
-                <button
-                  className="btn btn-sm btn-primary"
-                  type="button"
-                  onClick={() => {
-                    setAllowMassDelete(true);
-                    setConfirming(false);
-                    void handleStart(true);
-                  }}
-                >
-                  确认并执行
-                </button>
-              </div>
-            ) : null}
-
-            <div className="action-bar">
-              <div className="status-line">
-                <span className="status-line-text">
-                  {running
-                    ? `${PHASE_LABEL[phase]}，已传输 ${fmtBytes(summary?.copiedBytes ?? 0)}`
-                    : summary
-                      ? `已就绪，将写入 ${fmtInt(summary.copy + summary.update + summary.rename)} 个文件，传输 ${fmtBytes(summary.bytes)}`
-                      : '请选择源目录与目标目录'}
-                </span>
-              </div>
-              <div className="action-bar-group">
-                <button
-                  className="btn btn-icon"
-                  type="button"
-                  title="重新扫描"
-                  aria-label="重新扫描"
-                  disabled={busy || !sourceRoot || !targetRoot}
-                  onClick={handleCommit}
-                >
-                  <IconRefresh size={15} />
-                </button>
-                <button
-                  className="btn btn-primary"
-                  type="button"
-                  disabled={!canStart || busy}
-                  onClick={() => void handleStart()}
-                >
-                  {showCheck ? (
-                    <span
-                      className="btn-check"
-                      style={{ transform: `scale(${0.5 + checkValue * 0.5})`, opacity: checkValue }}
-                    >
-                      <IconCheck size={14} />
-                    </span>
-                  ) : busy ? (
-                    <span className="spinner" />
-                  ) : null}
-                  {phase === 'completed' ? '备份完成' : '开始备份'}
-                </button>
-              </div>
-            </div>
+            )}
           </div>
+
+          {workspace === 'manual' ? (
+            <div className="pane-footer">
+              {state?.recoverableJob ? (
+                <RecoverCard
+                  job={state.recoverableJob}
+                  busy={busy}
+                  onRecover={() => void handleRecover()}
+                />
+              ) : null}
+
+              {showBanner ? (
+                <div className="banner banner-dismissible" data-tone="danger" role="alert">
+                  <IconAlert size={13} className="icon-inline" />
+                  <span className="banner-text">{bannerText}</span>
+                  <span style={{ flex: '1 1 auto' }} />
+                  <button
+                    className="btn btn-sm"
+                    type="button"
+                    disabled={!sourceRoot || !targetRoot || busy}
+                    onClick={handleCommit}
+                  >
+                    重新扫描
+                  </button>
+                  <button
+                    className="btn btn-sm btn-icon"
+                    type="button"
+                    aria-label="关闭错误提示"
+                    onClick={() => {
+                      setStartError(null);
+                      setDismissedFailure(bannerText ?? null);
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ) : null}
+
+              {confirming && state?.confirmReason ? (
+                <div className="banner" data-tone="danger">
+                  <IconAlert size={13} className="icon-inline" />
+                  <span>{state.confirmReason}</span>
+                  <span style={{ flex: '1 1 auto' }} />
+                  <button className="btn btn-sm" type="button" onClick={() => setConfirming(false)}>
+                    取消
+                  </button>
+                  <button
+                    className="btn btn-sm btn-primary"
+                    type="button"
+                    onClick={() => {
+                      setAllowMassDelete(true);
+                      setConfirming(false);
+                      void handleStart(true);
+                    }}
+                  >
+                    确认并执行
+                  </button>
+                </div>
+              ) : null}
+
+              <div className="action-bar">
+                <div className="status-line">
+                  <span className="status-line-text">{statusText}</span>
+                </div>
+                <div className="action-bar-group">
+                  <button
+                    className="btn btn-icon"
+                    type="button"
+                    title="重新扫描"
+                    aria-label="重新扫描"
+                    disabled={busy || !sourceRoot || !targetRoot}
+                    onClick={handleCommit}
+                  >
+                    <IconRefresh size={15} />
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    type="button"
+                    disabled={phase === 'completed' ? !sourceRoot || !targetRoot || busy : !canStart || busy}
+                    onClick={() => {
+                      if (phase === 'completed') {
+                        // 再次备份 = 重新扫描并重新生成计划，而不是直接复用旧计划。
+                        handleCommit();
+                        return;
+                      }
+                      void handleStart();
+                    }}
+                  >
+                    {showCheck ? (
+                      <span
+                        className="btn-check"
+                        style={{ transform: `scale(${0.5 + checkValue * 0.5})`, opacity: checkValue }}
+                      >
+                        <IconCheck size={14} />
+                      </span>
+                    ) : busy ? (
+                      <span className="spinner" />
+                    ) : null}
+                    {phase === 'completed' ? '再次备份' : '开始备份'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </section>
 
         <Splitter containerRef={workspaceRef} collapsed={collapsed} onCollapsedChange={setCollapsed} />
 
         <section className="pane pane-right">
           <div className="pane-body">
-            <div className="section">
-              <div className="section-title">执行进度</div>
-              <ProgressPanel
-                phase={phase}
-                media={media}
-                totalFiles={summary?.totalFiles ?? 0}
-                copy={summary?.copy ?? 0}
-                update={summary?.update ?? 0}
-                rename={summary?.rename ?? 0}
-                deleteCount={summary?.delete ?? 0}
-                bytes={summary?.bytes ?? 0}
-                copiedBytes={summary?.copiedBytes ?? 0}
-                elapsedMs={summary?.elapsedMs ?? 0}
-                throughput={summary?.throughput ?? 0}
-                etaMs={summary?.etaMs ?? 0}
-                activeFile={summary?.activeFile}
-                assessment={state?.assessment ?? null}
-                quarantine={state?.quarantine ?? null}
-                onPause={() => void api.pause()}
-                onResume={() => void api.resume()}
-                onCancel={() => void api.cancel()}
-                onRecover={() => void handleRecover()}
-                onReleaseQuarantine={() => void api.releaseQuarantine()}
-              />
-              <MediaDiagnostics key={targetRoot} api={api} root={targetRoot} disabled={phase === 'running' || phase === 'paused'} />
-            </div>
+            {workspace === 'manual' ? (
+              <div className="section">
+                <div className="section-title">执行进度</div>
+                <ProgressPanel
+                  phase={phase}
+                  media={media}
+                  started={Boolean(summary && summary.totalFiles > 0) || phase !== 'idle'}
+                  totalFiles={summary?.totalFiles ?? 0}
+                  copy={summary?.copy ?? 0}
+                  update={summary?.update ?? 0}
+                  rename={summary?.rename ?? 0}
+                  deleteCount={deleteCount}
+                  bytes={summary?.bytes ?? 0}
+                  copiedBytes={summary?.copiedBytes ?? 0}
+                  elapsedMs={summary?.elapsedMs ?? 0}
+                  throughput={summary?.throughput ?? 0}
+                  etaMs={summary?.etaMs ?? 0}
+                  activeFile={summary?.activeFile}
+                  assessment={state?.assessment ?? null}
+                  quarantine={state?.quarantine ?? null}
+                  onPause={() => void api.pause()}
+                  onResume={() => void api.resume()}
+                  onCancel={() => void api.cancel()}
+                  onRecover={() => void handleRecover()}
+                  onReleaseQuarantine={() => void api.releaseQuarantine()}
+                />
+              </div>
+            ) : null}
+
+            <MediaDiagnostics
+              key={diagnosticsRoot}
+              api={api}
+              root={diagnosticsRoot}
+              disabled={phase === 'running' || phase === 'paused'}
+            />
 
             <div className="section" style={{ flex: '1 1 auto', minHeight: 0 }}>
               <div className="section-title">执行事件</div>

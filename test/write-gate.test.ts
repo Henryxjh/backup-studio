@@ -37,6 +37,8 @@ const pair = (targetRoot: string): AutoPair => ({
   pollMs: 30000,
   stableMs: 750,
   allowSnapshotFiles: false,
+  historyMaxBytes: 1024,
+  historyMaxVersionsPerPath: 20,
 });
 
 /** 假服务：只实现桥接需要的两个方法，用于验证 epoch 与清理授权的语义 */

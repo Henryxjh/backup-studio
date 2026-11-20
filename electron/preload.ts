@@ -9,7 +9,7 @@ import type {
   ScanResult,
   SyncMode,
 } from '../shared/types';
-import type { AutoPairInput, AutoStatus } from '../shared/aut-types';
+import type { AutoHistory, AutoPairInput, AutoStatus } from '../shared/aut-types';
 
 export interface StartOptions {
   sourceRoot: string;
@@ -77,10 +77,18 @@ const api = {
 
   autoSync: {
     status: (): Promise<AutoStatus> => ipcRenderer.invoke('aut:status'),
-    configure: (pair: AutoPairInput): Promise<AutoStatus> => ipcRenderer.invoke('aut:configure', pair),
-    setEnabled: (enabled: boolean): Promise<AutoStatus> => ipcRenderer.invoke('aut:set-enabled', enabled),
-    resume: (): Promise<AutoStatus> => ipcRenderer.invoke('aut:resume'),
-    restore: (id: string): Promise<AutoStatus> => ipcRenderer.invoke('aut:restore', id),
+    addPair: (input: AutoPairInput): Promise<AutoStatus> => ipcRenderer.invoke('aut:add-pair', input),
+    updatePair: (pairId: string, input: Partial<AutoPairInput>): Promise<AutoStatus> =>
+      ipcRenderer.invoke('aut:update-pair', pairId, input),
+    removePair: (pairId: string): Promise<AutoStatus> => ipcRenderer.invoke('aut:remove-pair', pairId),
+    setEnabled: (pairId: string, enabled: boolean): Promise<AutoStatus> =>
+      ipcRenderer.invoke('aut:set-enabled', pairId, enabled),
+    resume: (pairId: string): Promise<AutoStatus> => ipcRenderer.invoke('aut:resume', pairId),
+    restore: (pairId: string, recycleId: string): Promise<AutoStatus> =>
+      ipcRenderer.invoke('aut:restore', pairId, recycleId),
+    restoreVersion: (pairId: string, versionId: string): Promise<AutoStatus> =>
+      ipcRenderer.invoke('aut:restore-version', pairId, versionId),
+    history: (pairId: string): Promise<AutoHistory> => ipcRenderer.invoke('aut:history', pairId),
   },
 
   reveal: (targetPath: string): Promise<void> => ipcRenderer.invoke('app:reveal', targetPath),

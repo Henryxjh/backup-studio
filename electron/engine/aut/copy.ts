@@ -8,6 +8,30 @@ import { statMaybe } from './config';
 export type Gate = () => Promise<void>;
 export function fault(code: string, message: string) { return Object.assign(new Error(message), { code }); }
 export const stamp = (s: { size: number; mtimeMs: number; ctimeMs: number; ino: number; dev: number }) => `${s.size}:${s.mtimeMs}:${s.ctimeMs}:${s.ino}:${s.dev}`;
+
+/** 硬链接在 exFAT/FAT32 等常见移动介质上不可用，这类错误码意味着要改走复制路径。 */
+const NO_HARDLINK = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV', 'ENOSYS', 'EINVAL']);
+
+/**
+ * 「不覆盖已有文件」的提交方式。
+ *
+ * 首选硬链接：原子、不额外占用空间、且天然保证目标不存在。
+ * 但 exFAT/FAT32 不支持硬链接（移动硬盘的常见格式），此时退回复制：
+ * 用 `COPYFILE_EXCL` 保持同样的「目标已存在就失败」语义，再删掉临时件。
+ */
+async function commitWithoutReplace(temporary: string, dest: string): Promise<void> {
+  try {
+    await fs.link(temporary, dest);
+    await fs.unlink(temporary);
+    return;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (!code || !NO_HARDLINK.has(code)) throw err;
+    // 目标已被占用时同样不得覆盖，保持与硬链接路径一致的不覆盖语义。
+    await fs.copyFile(temporary, dest, fs.constants.COPYFILE_EXCL);
+    await fs.unlink(temporary).catch(() => undefined);
+  }
+}
 export async function copyAtomic(src: string, dest: string, temporary: string, stableMs: number, gate: Gate, beforeCommit: (verifiedHash: string) => Promise<void>, noReplace = false) {
   const initial = await fs.lstat(src);
   if (!initial.isFile() || initial.isSymbolicLink()) throw fault('CONFLICT', '源文件类型已变更');
@@ -53,8 +77,7 @@ export async function copyAtomic(src: string, dest: string, temporary: string, s
     await beforeCommit(result);
     if (stamp(await input.stat()) !== stamp(initial) || stamp(await fs.lstat(src)) !== stamp(initial)) throw fault('UNSTABLE', '复制期间源文件已变更');
     if (noReplace) {
-      await gate(); await fs.link(temporary, dest);
-      await gate(); await fs.unlink(temporary);
+      await gate(); await commitWithoutReplace(temporary, dest);
     } else { await gate(); await fs.rename(temporary, dest); }
     // Windows does not expose directory fsync through Node. The file itself is synced before rename.
     if (process.platform !== 'win32') {

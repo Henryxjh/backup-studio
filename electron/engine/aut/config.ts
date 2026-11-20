@@ -24,6 +24,29 @@ function bounded(value: number | undefined, fallback: number, min: number, max: 
   if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error('配置数值超出范围');
   return value;
 }
+export function historyLimits(input: Partial<AutoPairInput>) {
+  return {
+    historyMaxBytes: bounded(input.historyMaxBytes, 10 * 1024 ** 3, 1, Number.MAX_SAFE_INTEGER),
+    historyMaxVersionsPerPath: bounded(input.historyMaxVersionsPerPath, 20, 1, 10_000),
+  };
+}
+export function validatePairInput(input: unknown, partial = false): asserts input is AutoPairInput {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('配对设置无效');
+  const entries = Object.entries(input);
+  for (const [key, value] of entries) {
+    let valid: boolean;
+    switch (key) {
+      case 'sourceRoot': case 'targetRoot': valid = typeof value === 'string' && path.isAbsolute(value) && !value.includes('\0'); break;
+      case 'excludes': valid = Array.isArray(value); break;
+      case 'syncDeletes': case 'pollOnly': case 'allowSnapshotFiles': valid = typeof value === 'boolean'; break;
+      case 'retentionDays': case 'recycleMaxBytes': case 'pollMs': case 'stableMs': case 'historyMaxBytes': case 'historyMaxVersionsPerPath': valid = Number.isSafeInteger(value); break;
+      case 'externalChanges': valid = value === 'pause' || value === 'overwrite'; break;
+      default: valid = false;
+    }
+    if (!valid) throw new Error(`配对设置字段无效：${key}`);
+  }
+  if (!partial && !['sourceRoot', 'targetRoot'].every(key => Object.hasOwn(input, key))) throw new Error('请选择绝对目录');
+}
 export async function makePair(input: AutoPairInput, localDirectory: string, previous?: AutoPair | null): Promise<AutoPair> {
   if (![input.sourceRoot, input.targetRoot].every(p => typeof p === 'string' && path.isAbsolute(p))) throw new Error('请选择绝对目录');
   const sourceRoot = await checkRoot(path.resolve(input.sourceRoot));
@@ -41,6 +64,7 @@ export async function makePair(input: AutoPairInput, localDirectory: string, pre
     pollOnly: input.pollOnly === true || [sourceRoot, targetRoot].some(x => /^(?:\\\\|\/\/)/.test(x)),
     pollMs: bounded(input.pollMs, 30_000, 5000, 300_000), stableMs: bounded(input.stableMs, 750, 500, 30_000),
     allowSnapshotFiles: input.allowSnapshotFiles === true,
+    ...historyLimits(input),
   };
 }
 const hard = /(?:^|\/)(?:\.backup-studio|\.aut-part-[^/]+)(?:\/|$)/i;
