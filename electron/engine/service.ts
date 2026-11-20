@@ -268,6 +268,15 @@ export class BackupService extends EventEmitter {
     targetRoot: string,
     syncMode: SyncMode,
   ): Promise<PlanResult> {
+    return this.planBackup(sourceRoot, targetRoot, syncMode);
+  }
+
+  private async planBackup(
+    sourceRoot: string,
+    targetRoot: string,
+    syncMode: SyncMode,
+    verifyTarget = false,
+  ): Promise<PlanResult> {
     if (this.running || this.state.phase === 'planning' || this.state.phase === 'scanning') {
       throw new Error('已有备份操作正在执行');
     }
@@ -302,7 +311,7 @@ export class BackupService extends EventEmitter {
         targetRoot,
         source,
         target,
-        manifest,
+        manifest: verifyTarget ? null : manifest,
         syncMode,
         onProgress: (stage, done, total) => {
           this.emit('progress', {
@@ -578,7 +587,7 @@ export class BackupService extends EventEmitter {
     this.currentPlan = null;
     this.plannedMedia = null;
     this.state.phase = 'idle';
-    await this.plan(job.sourceRoot, job.targetRoot, job.syncMode);
+    await this.planBackup(job.sourceRoot, job.targetRoot, job.syncMode, Boolean(job.transaction));
     if (job.mediaIdentity && !sameMedia(job.mediaIdentity, this.plannedMedia)) {
       throw new Error('恢复扫描期间目标介质身份已变化');
     }
@@ -1432,6 +1441,13 @@ export class BackupService extends EventEmitter {
     const targetRoot = this.state.targetRoot;
     if (!targetRoot) return;
     await this.diagnostic(async () => {
+      const active = await this.journal.getActive();
+      if (active && (active.transaction || active.interruption)) {
+        const activeRoot = await fs.realpath(active.targetRoot).catch(() => path.resolve(active.targetRoot));
+        if (!path.relative(activeRoot, await fs.realpath(targetRoot))) {
+          throw new Error('目标有未恢复的备份事务，禁止清理元数据');
+        }
+      }
       await this.guardTargetWrites(targetRoot);
       await fs.rm(path.join(targetRoot, META_DIR), { recursive: true, force: true });
     });
