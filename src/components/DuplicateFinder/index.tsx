@@ -21,6 +21,7 @@ import { VirtualList } from '../VirtualList';
 import { FileName } from '../FileName';
 import { IconAlert, IconFolder, IconTrash, IconX } from '../Icons';
 import { SuppressPanel } from './SuppressPanel';
+import { isScanActive } from './scanState';
 import { fmtBytes, fmtDuration, fmtInt, fmtThroughput } from '../../lib/format';
 import './duplicate-finder.css';
 
@@ -80,14 +81,8 @@ const INTENT_LABEL: Record<ItemIntent, string> = {
   suppress: '下次不提醒',
 };
 
-const SCANNING_PHASES: DupPhase[] = [
-  'scanning',
-  'bucketing',
-  'partial-hashing',
-  'hashing',
-  'summarizing',
-  'acting',
-];
+const CONFLICT_SUPPRESS_REASON =
+  '同名不同内容组没有共同内容哈希，整组抑制不成立；请对单份文件使用「下次不提醒」';
 
 type ActItem = DupActRequest['items'][number];
 
@@ -203,10 +198,11 @@ function DupPath({ absPath, relPath }: { absPath: string; relPath: string }) {
   const sep = cut >= 0 ? absPath[cut] : '';
   const dir = cut >= 0 ? absPath.slice(0, cut) : '';
   const name = cut >= 0 ? absPath.slice(cut + 1) : absPath;
-  const shortDir = dir.length > 36 ? `…${dir.slice(-35)}` : dir;
   return (
     <span className="dup-path" title={`${relPath}\n${absPath}`}>
-      {shortDir ? <span className="dup-path-dir">{shortDir}{sep}</span> : null}
+      {dir ? (
+        <span className="dup-path-dir"><bdi dir="ltr">{dir}{sep}</bdi></span>
+      ) : null}
       <FileName value={name} />
     </span>
   );
@@ -236,7 +232,7 @@ function FingerprintTag({ value }: { value: string }) {
     if (!ok) return;
     setCopied(true);
     if (timerRef.current !== null) window.clearTimeout(timerRef.current);
-    timerRef.current = window.setTimeout(() => setCopied(false), 1600);
+    timerRef.current = window.setTimeout(() => setCopied(false), 2500);
   }, [value]);
 
   return (
@@ -280,6 +276,8 @@ export function DuplicateFinderPage({
 }: DuplicateFinderPageProps) {
   const [status, setStatus] = useState<DupStatus | null>(null);
   const [root, setRoot] = useState('');
+  const [scanPending, setScanPending] = useState(false);
+  const pollVersion = useRef(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -350,17 +348,31 @@ export function DuplicateFinderPage({
     };
   }, [api, loadQuarantine]);
 
+  const phase = status?.phase ?? 'idle';
+  const scanning = isScanActive(scanPending, phase);
+
   // 扫描过程没有事件推送，靠轮询把五阶段进度搬到界面上
   useEffect(() => {
-    if (!status || !SCANNING_PHASES.includes(status.phase)) return undefined;
+    if (!scanning) return undefined;
+    let stopped = false;
+    let inFlight = false;
     const timer = window.setInterval(() => {
+      if (inFlight) return;
+      inFlight = true;
+      const version = pollVersion.current;
       void api
         .status()
-        .then((next) => setStatus(next))
-        .catch(() => undefined);
+        .then((next) => {
+          if (!stopped && version === pollVersion.current) setStatus(next);
+        })
+        .catch(() => undefined)
+        .finally(() => { inFlight = false; });
     }, 350);
-    return () => window.clearInterval(timer);
-  }, [api, status]);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [api, scanning]);
 
   // 引擎是保留/删除的持久事实来源：状态回来后同步到本地意图，保证重新挂载后显示一致
   useEffect(() => {
@@ -387,12 +399,10 @@ export function DuplicateFinderPage({
     });
   }, [status]);
 
-  const phase = status?.phase ?? 'idle';
   const result = status?.result ?? null;
   const progress = status?.progress;
   const suppressions = status?.suppressions ?? [];
   const recent = status?.recent ?? [];
-  const scanning = SCANNING_PHASES.includes(phase);
 
   const actBlockedReason = (() => {
     if (scanning) return '检测进行中，暂不能删除';
@@ -475,12 +485,27 @@ export function DuplicateFinderPage({
     setSelected(new Set());
     setKeeperChoice({});
     setIntents({});
-    void perform(() => api.scan(base));
+    pollVersion.current += 1;
+    setScanPending(true);
+    void perform(async () => {
+      try {
+        return await api.scan(base);
+      } finally {
+        pollVersion.current += 1;
+        setScanPending(false);
+      }
+    });
   }, [api, perform, requireRoot]);
 
-  const handleCancel = useCallback(() => {
-    void perform(() => api.cancel());
-  }, [api, perform]);
+  const handleCancel = useCallback(async () => {
+    try {
+      const next = await api.cancel();
+      pollVersion.current += 1;
+      setStatus(next);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '取消失败');
+    }
+  }, [api]);
 
   /** 逐条明确选择：直接改写意图，并同步给引擎 */
   const handleMark = useCallback(
@@ -622,10 +647,10 @@ export function DuplicateFinderPage({
       }
       setBusy(false);
       if (lastError) {
-        setError(`抑制未全部成功（${done}/${targets.length} 组已加入抑制清单）：${lastError}`);
+        setError(`抑制未全部成功（${done}/${targets.length} 条抑制记录已保存）：${lastError}`);
       } else {
         setNotice(
-          `已加入抑制清单：${done} 组内容哈希，作用域${scopeMode === 'global' ? '全局' : '当前根'}。`,
+          `已保存 ${done} 条抑制记录，作用域${scopeMode === 'global' ? '全局' : '当前根'}。`,
         );
       }
     },
@@ -891,7 +916,7 @@ export function DuplicateFinderPage({
             >
               {scanning ? '检测中' : '开始检测'}
             </button>
-            <button className="btn btn-sm" type="button" disabled={!scanning || busy} onClick={handleCancel}>
+            <button className="btn btn-sm" type="button" disabled={!scanning} onClick={handleCancel}>
               取消
             </button>
           </div>
@@ -1023,8 +1048,8 @@ export function DuplicateFinderPage({
 
         {summary ? (
           <p className="dup-hint">
-            跳过：空文件 {fmtInt(summary.skippedEmpty)} · 过小 {fmtInt(summary.skippedTooSmall)} ·
-            符号链接 {fmtInt(summary.skippedSymlink)} · 命中抑制 {fmtInt(summary.skippedSuppressed)}
+            跳过：空文件 {fmtInt(summary.skippedEmpty)} | 过小 {fmtInt(summary.skippedTooSmall)} |
+            符号链接 {fmtInt(summary.skippedSymlink)} | 命中抑制 {fmtInt(summary.skippedSuppressed)}
           </p>
         ) : null}
 
@@ -1480,6 +1505,7 @@ export function ResultZone({
           <div>
             <strong>{warning.title}</strong>
             <p>{warning.body}</p>
+            {zoneId === 'conflict' ? <p>{CONFLICT_SUPPRESS_REASON}</p> : null}
           </div>
         </div>
       ) : null}
@@ -1602,7 +1628,7 @@ export function ResultZone({
                     <div className="dup-group-info">
                       <span className="dup-group-title">
                         {isConflict ? (
-                          group.fileName
+                          <FileName value={group.fileName ?? group.entries[0]?.fileName ?? '未命名文件'} />
                         ) : (
                           <span className="dup-fingerprint-label">
                             指纹
@@ -1648,7 +1674,8 @@ export function ResultZone({
                       <button
                         className="btn btn-sm"
                         type="button"
-                        disabled={busy || !group.entries.length}
+                        disabled={busy || isConflict || !group.entries.length}
+                        title={isConflict ? CONFLICT_SUPPRESS_REASON : undefined}
                         onClick={() =>
                           onSuppress([
                             {

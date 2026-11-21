@@ -46,6 +46,29 @@ import type {
   WriteGate,
 } from '../../shared/types';
 
+/**
+ * 自动写入要求确认卷健康（需求 §3.2）；用户显式指定目录的查重清理落系统回收站，可恢复，
+ * 因此仅放宽「卷健康未知」。两种模式仍拦截不可达、隔离、L2、只读和需修复的介质。
+ */
+export function decideWriteGate(facts: {
+  reachable: boolean;
+  isolated: boolean;
+  level: WriteGate['level'];
+  readOnly: boolean;
+  repairNeeded: boolean;
+  volumeHealth: WriteGate['volumeHealth'];
+}, mode: 'automatic' | 'user-directed'): { allowed: boolean; reason?: string } {
+  const { reachable, isolated, level, readOnly, repairNeeded, volumeHealth } = facts;
+  let reason: string | undefined;
+  if (!reachable) reason = '目标介质不可达';
+  else if (isolated) reason = '介质处于隔离观察，禁止写入';
+  else if (level === 'L2') reason = '容灾判定为 L2，禁止写入';
+  else if (readOnly) reason = '系统报告磁盘为只读';
+  else if (repairNeeded || volumeHealth === 'repair-required') reason = '卷需要人工检查，禁止写入；处理完成并重新对账后再继续';
+  else if (mode === 'automatic' && volumeHealth === 'unknown') reason = '未能确认卷健康（权限不足或当前平台不支持卷级检查），按默认只读处理；自动写入已禁止';
+  return { allowed: reason === undefined, reason };
+}
+
 /** 判定为「介质不可用」的错误码：拔盘、拔出 USB、总线错误 */
 const MEDIA_PROBE_INTERVAL = 700;
 const JOURNAL_FLUSH_INTERVAL = 400;
@@ -721,13 +744,8 @@ export class BackupService extends EventEmitter {
     }
   }
 
-  /**
-   * 写入闸门：供自动备份等外部写入方裁决是否允许写入。
-   *
-   * 判定条件与 `guardTargetWrites` 完全一致（L2、磁盘只读、卷需修复、隔离中一律拒绝），
-   * 避免手动备份与自动备份出现两套互相漂移的写入规则。
-   */
-  async writeGate(targetRoot: string): Promise<WriteGate> {
+  /** 默认按自动写入策略裁决；可恢复的用户清理须显式选择模式。 */
+  async writeGate(targetRoot: string, options?: { mode?: 'automatic' | 'user-directed' }): Promise<WriteGate> {
     const report = await this.inspectTarget(targetRoot, true);
     const riskKey = await this.targetRiskKey(targetRoot);
     const mark = this.state.quarantine;
@@ -739,18 +757,11 @@ export class BackupService extends EventEmitter {
     // 只有确实取到卷级事实且未发现问题时才敢称「健康」；否则标注能力缺失，不伪造健康结论。
     const volumeChecked = reachable && report.volume !== null && !readOnly && !repairNeeded;
     const volumeHealth: WriteGate['volumeHealth'] = repairNeeded ? 'repair-required' : volumeChecked ? 'healthy' : 'unknown';
-    // 自动写入必须建立在「确定无卷级风险」之上：卷健康无法判定时按默认只读处理（需求 §3.2）。
-    const allowed = reachable && !isolated && level !== 'L2' && !readOnly && !repairNeeded && volumeHealth === 'healthy';
-
-    let reason: string | undefined;
-    if (!reachable) reason = '目标介质不可达';
-    else if (isolated) reason = '介质处于隔离观察，禁止写入';
-    else if (level === 'L2') reason = '容灾判定为 L2，禁止写入';
-    else if (readOnly) reason = '系统报告磁盘为只读';
-    else if (repairNeeded) reason = '卷需要人工检查，禁止写入；处理完成并重新对账后再继续';
-    else if (volumeHealth === 'unknown') reason = '未能确认卷健康（权限不足或当前平台不支持卷级检查），按默认只读处理；自动写入已禁止';
+    const mode = options?.mode ?? 'automatic';
+    const { allowed, reason } = decideWriteGate({ reachable, isolated, level, readOnly, repairNeeded, volumeHealth }, mode);
 
     const evidence = report.assessment.evidence.map((item) => `${item.kind}：${item.detail}`);
+    if (mode === 'user-directed' && volumeHealth === 'unknown') evidence.push('卷健康未知：未能确认卷级健康状况');
     if (report.assessment.suggestion) evidence.push(`建议：${report.assessment.suggestion}`);
     return { allowed, reachable, isolated, level, volumeHealth, reason, evidence };
   }

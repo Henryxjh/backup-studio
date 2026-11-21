@@ -82,6 +82,11 @@ export interface PathVerdict {
   reason?: string;
 }
 
+/** 复合键用于定位删除动作的分组条目；路径级查询必须走独立的绝对路径索引。 */
+export function isRegisteredPath(entriesByPath: ReadonlyMap<string, ActRegistryEntry[]>, absPath: string): boolean {
+  return entriesByPath.has(path.resolve(absPath));
+}
+
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -125,8 +130,10 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
   private suppressionItems: SuppressionRecord[] = [];
   /** 隔离区条目快照：渲染层据此展示还原入口（FR-08） */
   private quarantineSnapshot: DupQuarantineEntry[] = [];
-  /** 扫描结果登记表：绝对路径 → 条目（FR-20 路径边界校验的唯一依据） */
+  /** 扫描结果登记表：绝对路径 + 组 id → 删除动作使用的条目（FR-11） */
   private registry = new Map<string, ActRegistryEntry>();
+  /** 路径级查询索引（FR-20）；同一路径可属于多个组。 */
+  private entriesByPath = new Map<string, ActRegistryEntry[]>();
   /** 组 → 组内全部条目 id（FR-11 至少留一份） */
   private groupMembers = new Map<string, string[]>();
   private currentRoot = '';
@@ -180,6 +187,10 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
 
   /** 更新阶段进度：已处理/总数、已读字节、吞吐与预计剩余 */
   private setProgress(phase: DupProgress['phase'], label: string, done: number, total: number, bytesRead: number): void {
+    // 取消是终态：迟到��进度回调不得把相位改回「局部哈希」，
+    // 否则用户点了取消，界面却又显示扫描在跑（FR-15）。
+    // 只压制「被取消的那一次操作」的迟到回调：新操作会推进 operationToken，不受影响。
+    if (this.phase === 'cancelled' && this.cancelToken === this.operationToken) return;
     const now = Date.now();
     const elapsedMs = Math.max(1, now - this.progressStartedAt);
     const throughputBps = bytesRead > 0 ? Math.round((bytesRead / elapsedMs) * 1000) : 0;
@@ -216,8 +227,17 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
     };
   }
 
-  /** 当前状态 */
-  status = (): Promise<DupStatus> => this.run(async () => this.view());
+  /**
+   * 当前状态：**只读快照，不进操作队列**。
+   *
+   * 进队列的话，扫描进行中查询状态会被正在跑的扫描本身挡住——
+   * 界面轮询拿到的永远是「扫描结束那一刻」的状态，
+   * 五阶段进度就永远看不到（FR-15）。
+   */
+  status = async (): Promise<DupStatus> => {
+    await this.loaded;
+    return this.view();
+  };
 
   /**
    * 扫描一个目录（FR-02）。
@@ -243,6 +263,7 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
       this.result = null;
       this.fullResult = null;
       this.registry = new Map();
+      this.entriesByPath = new Map();
       this.groupMembers = new Map();
       this.currentRoot = resolved;
       this.progressStartedAt = Date.now();
@@ -256,10 +277,12 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
       });
 
       if (scanned.cancelled || this.cancelToken === token) {
-        this.phase = 'cancelled';
         this.reason = '扫描已取消';
         this.event('扫描已取消');
         await this.audit({ at: Date.now(), action: '扫描取消', outcome: 'skipped', reason: '用户取消' });
+        // 终态在所有 await 之后再落：审计写入期间仍有哈希工作项在回调，
+        // 提前落终态会被迟到回调改回「局部哈希」（FR-15）。
+        this.phase = 'cancelled';
         return this.view();
       }
 
@@ -286,10 +309,12 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
       }
 
       if (detected.cancelled || this.cancelToken === token) {
-        this.phase = 'cancelled';
         this.reason = '扫描已取消（保留已完成的判定结果）';
         this.event('扫描已取消');
         await this.audit({ at: Date.now(), action: '扫描取消', outcome: 'skipped', reason: '用户取消' });
+        // 终态在所有 await 之后再落：审计写入期间仍有哈希工作项在回调，
+        // 提前落终态会被迟到回调改回「局部哈希」（FR-15）。
+        this.phase = 'cancelled';
         return this.view();
       }
 
@@ -371,13 +396,14 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
   /** 建立扫描结果登记表与分组成员表（FR-11、FR-20） */
   private buildRegistry(groups: DupGroup[]): void {
     this.registry = new Map();
+    this.entriesByPath = new Map();
     this.groupMembers = new Map();
     for (const group of groups) {
       const ids: string[] = [];
       for (const entry of group.entries) {
         // 键里带组 id：同一个文件可能同时出现在内容重复组与同名告警组，
         // 只用绝对路径做键会让后写入的组覆盖前一个，硬约束就会用错组。
-        this.registry.set(registryKey(entry.absPath, group.id), {
+        const registered: ActRegistryEntry = {
           id: entry.id,
           absPath: entry.absPath,
           relPath: entry.relPath,
@@ -388,7 +414,12 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
           suspected: entry.suspected,
           groupId: group.id,
           category: group.category,
-        });
+        };
+        this.registry.set(registryKey(entry.absPath, group.id), registered);
+        const resolved = path.resolve(entry.absPath);
+        const entries = this.entriesByPath.get(resolved);
+        if (entries) entries.push(registered);
+        else this.entriesByPath.set(resolved, [registered]);
         ids.push(entry.id);
       }
       this.groupMembers.set(group.id, ids);
@@ -406,7 +437,7 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
   /** 当前扫描结果中登记的绝对路径集合（主进程校验用） */
   knownEntries(root: string): ReadonlySet<string> {
     if (normalizeRoot(root) !== normalizeRoot(this.currentRoot)) return new Set<string>();
-    return new Set(this.registry.keys());
+    return new Set(this.entriesByPath.keys());
   }
 
   /**
@@ -419,10 +450,12 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
     if (normalizeRoot(root) !== normalizeRoot(this.currentRoot)) return { allowed: false, reason: '当前没有匹配的扫描结果，请重新扫描' };
     const resolved = path.resolve(absPath);
     const relative = path.relative(this.currentRoot, resolved);
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    // 越界判定只看「上一级」本身：`..foo.txt` 这类合法条目名不能被误判为越界。
+    const outsideRoot = relative === '..' || relative.startsWith(`..${path.sep}`);
+    if (!relative || outsideRoot || path.isAbsolute(relative)) {
       return { allowed: false, reason: '路径不在本次扫描根目录之内' };
     }
-    if (!this.registry.has(resolved)) {
+    if (!isRegisteredPath(this.entriesByPath, resolved)) {
       return { allowed: false, reason: '路径不在本次扫描结果内，已拒绝' };
     }
     try {
@@ -639,12 +672,12 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
       return this.view();
     });
 
-  /** 抑制清单（FR-13） */
-  listSuppressions = (root: string): Promise<DupSuppression[]> =>
-    this.run(async () => {
-      void root;
-      return this.suppressionItems.map(toSuppression);
-    });
+  /** 抑制清单（FR-13）：只读快照，不进操作队列 */
+  listSuppressions = async (root: string): Promise<DupSuppression[]> => {
+    await this.loaded;
+    void root;
+    return this.suppressionItems.map(toSuppression);
+  };
 
   /**
    * 撤销抑制项（FR-13）。
@@ -736,11 +769,11 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
    * 隔离区里的文件是**已经从原处移走**的：没有这条列表，
    * 用户重启之后就再也找不到它们，也无从还原。
    */
-  listQuarantine = (): Promise<DupQuarantineEntry[]> =>
-    this.run(async () => {
-      await this.refreshQuarantine();
-      return this.quarantineSnapshot;
-    });
+  listQuarantine = async (): Promise<DupQuarantineEntry[]> => {
+    await this.loaded;
+    await this.refreshQuarantine();
+    return this.quarantineSnapshot;
+  };
 
   /** 从隔离区索引刷新快照 */
   private async refreshQuarantine(): Promise<void> {
@@ -785,7 +818,7 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
 
   // ---- 内部辅助 ----
 
-  /** 写入一条抑制项并通知备份侧 */
+  /** 写入一条抑制项；只落本机清单，不通知也不影响备份引擎（§4.2 非目标） */
   private async addSuppression(root: string, group: DupGroup, entry: DupFileEntry): Promise<void> {
     const sha256 = group.sha256 ?? entry.sha256;
     await this.writeSuppression(root, sha256, 'root', group, group.entries.map((item) => item.absPath));

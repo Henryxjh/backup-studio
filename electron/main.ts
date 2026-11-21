@@ -292,9 +292,10 @@ void app.whenReady().then(() => {
     trash: async (absPath) => {
       await shell.trashItem(absPath);
     },
-    // 写入闸门：与备份引擎同一套裁决，介质异常一律拒绝删除（FR-10）
+    // 查重删除是用户显式指定目录上的可恢复清理，不套用自动写入的「卷健康未知即默认只读」。
+    // 不可达、隔离、L2、只读及需修复仍然阻断（FR-10）。
     writeGate: async (root) => {
-      const verdict = await service!.writeGate(root);
+      const verdict = await service!.writeGate(root, { mode: 'user-directed' });
       return { allowed: verdict.allowed, reason: verdict.reason };
     },
     // 备份任务或自动同步正在运行时，删除动作整体禁用（FR-10）

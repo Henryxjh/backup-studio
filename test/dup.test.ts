@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import path from 'node:path';
-import { DuplicateFinder } from '../electron/engine/dup';
+import { DuplicateFinder, MAX_PREVIEW_GROUPS } from '../electron/engine/dup';
 import { createDuplicateFinder } from '../electron/engine/dup/wiring';
 import { groupNameConflicts } from '../electron/engine/dup/detect';
 import { FULL_HASH_LIMIT_BYTES } from '../electron/engine/dup/hash';
-import { BackupService } from '../electron/engine/service';
+import { BackupService, decideWriteGate } from '../electron/engine/service';
 import type {
   DupActRequest,
   DupActResult,
@@ -117,6 +117,8 @@ interface Fixture {
   finder: DuplicateFinder;
   /** 假回收站收到的路径 */
   trashCalls: string[];
+  /** 注入的定位实现收到的路径 */
+  revealCalls: string[];
   /** 抑制清单变更回调 */
   changes: string[];
   /** 假备份忙闲开关 */
@@ -131,6 +133,7 @@ async function fixture(options: FixtureOptions, fn: (fx: Fixture) => Promise<voi
   await fs.mkdir(local, { recursive: true });
 
   const trashCalls: string[] = [];
+  const revealCalls: string[] = [];
   const changes: string[] = [];
   const busy = { value: false };
 
@@ -150,12 +153,12 @@ async function fixture(options: FixtureOptions, fn: (fx: Fixture) => Promise<voi
     writeGate: options.gate ?? (async () => ({ allowed: true })),
     isBackupBusy: options.isBusy ?? (() => busy.value),
     isAutoSyncRunning: () => false,
-    revealFile: () => undefined,
+    revealFile: (absPath) => { revealCalls.push(absPath); },
     onSuppressionsChanged: (changedRoot, reason) => changes.push(`${changedRoot}|${reason}`),
   });
 
   try {
-    await fn({ base, root, local, finder, trashCalls, changes, busy });
+    await fn({ base, root, local, finder, trashCalls, revealCalls, changes, busy });
   } finally {
     await fs.rm(base, { recursive: true, force: true });
   }
@@ -403,6 +406,33 @@ async function quarantineCandidates(local: string): Promise<string[]> {
 }
 
 async function main(): Promise<void> {
+  await test('§11-1a 扫描请求待返回或正在扫描时保持激活，完成后退出', async () => {
+    const { isScanActive } = await import('../src/components/DuplicateFinder/scanState');
+    assert.equal(isScanActive(true, 'idle'), true);
+    assert.equal(isScanActive(false, 'scanning'), true);
+    assert.equal(isScanActive(false, 'done'), false);
+    assert.equal(isScanActive(false, 'cancelled'), false);
+  });
+
+  await test('§11-10a 未知卷健康只放行用户主动操作，硬阻断对两种模式均有效', async () => {
+    const healthy = {
+      reachable: true, isolated: false, level: 'L0', readOnly: false,
+      repairNeeded: false, volumeHealth: 'healthy',
+    } as const;
+    const unknown = { ...healthy, volumeHealth: 'unknown' } as const;
+    assert.equal(decideWriteGate(unknown, 'automatic').allowed, false);
+    assert.equal(decideWriteGate(unknown, 'user-directed').allowed, true);
+
+    for (const mode of ['automatic', 'user-directed'] as const) {
+      assert.equal(decideWriteGate(healthy, mode).allowed, true, `${mode}: healthy`);
+      assert.equal(decideWriteGate({ ...healthy, reachable: false }, mode).allowed, false, `${mode}: unreachable`);
+      assert.equal(decideWriteGate({ ...healthy, isolated: true }, mode).allowed, false, `${mode}: isolated`);
+      assert.equal(decideWriteGate({ ...healthy, level: 'L2' }, mode).allowed, false, `${mode}: L2`);
+      assert.equal(decideWriteGate({ ...healthy, readOnly: true }, mode).allowed, false, `${mode}: readOnly`);
+      assert.equal(decideWriteGate({ ...healthy, repairNeeded: true }, mode).allowed, false, `${mode}: repairNeeded`);
+      assert.equal(decideWriteGate({ ...healthy, volumeHealth: 'repair-required' }, mode).allowed, false, `${mode}: repair-required`);
+    }
+  });
   // ------------------------------------------------ §11-1 进度五阶段与取消
 
   await test('§11-1 扫描完成并按「扫描目录→大小分桶→局部哈希→全量哈希→汇总」推进', () =>
@@ -427,6 +457,53 @@ async function main(): Promise<void> {
       assert.equal(status.phase, 'cancelled');
       assert.notEqual(status.phase, 'done');
       assert.equal((await finder.status()).phase, 'cancelled');
+    }));
+
+  await test('§11-1b 状态查询不被正在执行的操作阻塞（进度必须实时可见）', () => {
+    // 闸门挂起：删除操作停在闸门上并占住操作队列。
+    // 此时状态查询若也排队，就只能等到删除结束才返回 —— 界面永远看不到扫描进度。
+    let release: () => void = () => undefined;
+    const gateOpen = new Promise<void>((resolve) => { release = resolve; });
+    return fixture(
+      { gate: async () => { await gateOpen; return { allowed: true }; } },
+      async ({ root, finder }) => {
+        await put(root, 'a/one.txt', blob('blocked-status'));
+        await put(root, 'b/two.txt', blob('blocked-status'));
+        const { status } = await scanWatch(finder, root);
+        const group = resultOf(status).identicalGroups[0];
+        const acting = finder.act(root, actRequest(root, group, [group.entries[0]]));
+        try {
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+          const live = await Promise.race([
+            finder.status(),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+          ]);
+          assert.ok(live, '状态查询不得被正在执行的操作阻塞');
+          assert.notEqual(live!.phase, 'done');
+        } finally {
+          release();
+          await acting;
+        }
+      },
+    );
+  });
+
+  await test('§11-1c 取消后终态是「已取消」，不得被在途进度回调改写', () =>
+    fixture({}, async ({ root, finder }) => {
+      // 大样本：取消之后仍有哈希工作项在途，它们的进度回调会持续到达。
+      for (let i = 0; i < 600; i += 1) await put(root, `bulk/f${i}.bin`, blob(`bulk-${i}`, 64 * 1024));
+      const promise = finder.scan(root);
+      await new Promise<void>((resolve) => setTimeout(resolve, 60));
+      const cancelled = await finder.cancel();
+      if (cancelled.phase !== 'cancelled') {
+        await promise;
+        return; // 扫描已跑完，本例无从检验
+      }
+      // 扫描仍在跑：迟到��进度回调会把阶段改回「局部哈希」，终态必须守得住
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
+      assert.equal((await finder.status()).phase, 'cancelled', '取消后不得被在途进度回调改写');
+      const final = await promise;
+      assert.equal(final.phase, 'cancelled', '取消后扫描终态必须是已取消');
     }));
 
   // ------------------------------------------------ §11-2 内容重复分组
@@ -653,8 +730,8 @@ async function main(): Promise<void> {
 
   // ------------------------------------------------ §11-8 回收站落地
 
-  await test('§11-8 删除后文件落入系统回收站（注入的假回收站被调用）', () =>
-    fixture({}, async ({ root, finder, trashCalls }) => {
+  await test('§11-8 删除移入回收站且原内容可恢复', () =>
+    fixture({}, async ({ base, root, finder, trashCalls }) => {
       await put(root, 'a/one.txt', blob('trash-me'));
       await put(root, 'b/two.txt', blob('trash-me'));
       const { status } = await scanWatch(finder, root);
@@ -672,6 +749,8 @@ async function main(): Promise<void> {
       assert.equal(acted.items[0].landedTo, 'system-trash');
       assert.equal(acted.degradedToQuarantine, false);
       assert.deepEqual(trashCalls, [victim.absPath]);
+      await assert.rejects(fs.stat(victim.absPath), { code: 'ENOENT' });
+      assert.deepEqual(await fs.readFile(path.join(base, 'trash-sim', path.basename(victim.absPath))), blob('trash-me'));
       // 保留的那一份必须还在
       await fs.stat(keeper.absPath);
     }));
@@ -907,29 +986,57 @@ async function main(): Promise<void> {
       assert.equal((await finder.listSuppressions(root)).length, 0);
     }));
 
-  await test('§11-14 抑制项不会出现在待删队列', () =>
-    fixture({}, async ({ root, finder }) => {
-      await put(root, 'a/one.txt', blob('alpha-content'));
-      await put(root, 'a/two.txt', blob('alpha-content'));
-      await put(root, 'b/three.txt', blob('beta-content'));
-      await put(root, 'b/four.txt', blob('beta-content'));
+  await test('§11-14a 已排队删除的条目在执行前被抑制时必须阻断', () =>
+    fixture({}, async ({ root, finder, trashCalls }) => {
+      const content = blob('suppress-after-queue');
+      const absPath = await put(root, 'a/one.txt', content);
+      await put(root, 'b/two.txt', content);
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      const victim = entryOf(group, absPath);
+      assert.ok(group.sha256);
+
+      const queued = await finder.markAction(root, [victim.id], 'delete');
+      assert.equal(entryState(queued, victim.id), 'queued');
+      const request = actRequest(root, group, [victim]);
+      await finder.suppress(root, group.sha256, 'root', [absPath]);
+      const acted = await finder.act(root, request);
+
+      assert.deepEqual(await fs.readFile(absPath).catch(() => undefined), content, '原文件内容应保留');
+      assert.equal(acted.deleted, 0);
+      assert.equal(acted.items.length, 1);
+      assert.equal(acted.items[0].outcome, 'blocked');
+      assert.match(acted.items[0].reason ?? '', /抑制/);
+      assert.deepEqual(trashCalls, []);
+    }));
+
+  // ------------------------------------------------ §11-reveal 定位边界
+
+  for (const scenario of [
+    { name: '§11-reveal-1 可定位本次扫描结果', target: 'registered' },
+    { name: '§11-reveal-2 拒绝定位扫描根外的文件', target: 'outside' },
+    { name: '§11-reveal-3 拒绝定位扫描根内未登记的文件', target: 'unregistered' },
+  ] as const) {
+    await test(scenario.name, () => fixture({}, async ({ root, base, finder, revealCalls }) => {
+      const absPath = await put(root, 'one.txt', blob('reveal-pair'));
+      await put(root, 'two.txt', blob('reveal-pair'));
+      const outside = await put(base, 'outside.txt', blob('outside'));
+      const unregistered = await put(root, 'unique.txt', blob('unique'));
       const { status } = await scanWatch(finder, root);
       const result = resultOf(status);
-      const groupA = groupsContaining(result, path.join(root, 'a/one.txt'))[0];
-      const groupB = groupsContaining(result, path.join(root, 'b/three.txt'))[0];
+      const entry = entryOf(result.identicalGroups[0], absPath);
+      assert.ok(!result.groups.some((group) => group.entries.some((file) => file.absPath === unregistered)));
 
-      await finder.suppress(root, groupA.sha256!, 'root', [groupA.entries[0].absPath]);
-      await finder.markAction(root, [groupB.entries[0].id], 'delete');
-
-      const after = await finder.markAction(root, [groupB.entries[0].id], 'delete');
-      assert.equal(resultOf(after).stats.pendingDeleteCount, 1);
-      const queued = resultOf(after).groups.flatMap((g) => g.entries).filter((e) => e.state === 'queued');
-      assert.equal(queued.length, 1);
-      assert.ok(
-        !queued.some((e) => groupA.entries.some((a) => a.absPath === e.absPath)),
-        '被抑制的哈希不得进入待删队列',
-      );
+      if (scenario.target === 'registered') {
+        await assert.doesNotReject(() => finder.reveal(root, entry.absPath));
+        assert.deepEqual(revealCalls, [entry.absPath]);
+      } else {
+        const target = scenario.target === 'outside' ? outside : unregistered;
+        await assert.rejects(() => finder.reveal(root, target));
+        assert.deepEqual(revealCalls, []);
+      }
     }));
+  }
 
   // ------------------------------------------------ §11-15 路径边界
 
@@ -1318,6 +1425,37 @@ async function main(): Promise<void> {
       const outcome = await finder.act(root, actRequest(root, group, [group.entries[0]]));
       assert.equal(outcome.deleted, 1);
       assert.equal(outcome.auditFailed, true, '审计写失败必须回报给调用方');
+    }));
+
+  await test('§11-export-1 界面结果预览截断，JSON 和 CSV 仍导出全量', () =>
+    fixture({}, async ({ root, finder }) => {
+      const expectedGroups = MAX_PREVIEW_GROUPS + 1;
+      // 有限并发，避免 Windows 上数千个文件同时打开。
+      for (let start = 0; start < expectedGroups; start += 32) {
+        await Promise.all(Array.from({ length: Math.min(32, expectedGroups - start) }, async (_, offset) => {
+          const i = start + offset;
+          const content = blob(`export-pair-${i}`);
+          await put(root, `a/${i}.txt`, content);
+          await put(root, `b/${i}.txt`, content);
+        }));
+      }
+      const { status } = await scanWatch(finder, root);
+      const preview = resultOf(status);
+      assert.equal(preview.groups.length, MAX_PREVIEW_GROUPS);
+      assert.equal(preview.identicalGroups.length, MAX_PREVIEW_GROUPS);
+      const json = await finder.exportReport('json');
+      const full = JSON.parse(await fs.readFile(json.path, 'utf8')) as DupScanResult;
+      assert.equal(full.groups.length, expectedGroups);
+      const previewIds = new Set(preview.groups.map((group) => group.id));
+      const omitted = full.groups.filter((group) => !previewIds.has(group.id));
+      assert.equal(omitted.length, 1);
+      const csv = await finder.exportReport('csv');
+      const rows = (await fs.readFile(csv.path, 'utf8')).trimEnd().split(/\r?\n/).slice(1).map(splitCsvLine);
+      assert.equal(rows.length, expectedGroups * 2);
+      assert.deepEqual(
+        rows.filter((row) => row[0] === omitted[0].id).map((row) => row[5]).sort(),
+        omitted[0].entries.map((entry) => entry.absPath).sort(),
+      );
     }));
 
   await test('CSV 导出必须转义文件名里的分隔符（列结构不得被冲掉）', () =>

@@ -300,6 +300,9 @@
 /* ============ 结果区 ============ */
 
 .dup-zone {
+  /* 同心圆角：外 16px = 列表内圆角 8px + 四边内距 8px。 */
+  --dup-zone-inset: var(--sp-2);
+  --dup-zone-radius: calc(var(--radius-inner) + var(--dup-zone-inset));
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
@@ -307,8 +310,8 @@
   flex: 0 0 auto;
   min-height: 0;
   background: var(--bg-panel);
-  border-radius: var(--radius-outer);
-  padding: var(--sp-3) var(--sp-4) var(--sp-4);
+  border-radius: var(--dup-zone-radius);
+  padding: var(--dup-zone-inset);
 }
 
 /*
@@ -321,9 +324,9 @@
   display: flex;
   align-items: flex-start;
   gap: var(--sp-2);
-  margin: calc(var(--sp-3) * -1) calc(var(--sp-4) * -1) var(--sp-3);
-  padding: var(--sp-3) var(--sp-4);
-  border-radius: var(--radius-outer) var(--radius-outer) 0 0;
+  margin: calc(-1 * var(--dup-zone-inset)) calc(-1 * var(--dup-zone-inset)) var(--sp-3);
+  padding: var(--sp-3) var(--dup-zone-inset);
+  border-radius: var(--dup-zone-radius) var(--dup-zone-radius) 0 0;
   background: var(--danger-soft);
   color: var(--danger);
   font-size: var(--fs-meta);
@@ -388,9 +391,12 @@
   overflow: hidden;
 }
 
-.dup-list:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+.dup-page .dup-scope select:focus-visible,
+.dup-page .dup-keeper-select:focus-visible,
+.dup-page .dup-list:focus-visible,
+.dup-page .dup-fingerprint:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 1px var(--accent), 0 0 0 4px var(--accent-ghost);
 }
 
 .dup-row {
@@ -504,11 +510,6 @@
   color: var(--text-primary);
 }
 
-.dup-page .dup-fingerprint:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px var(--bg-inset), 0 0 0 4px var(--accent-ghost);
-}
-
 .dup-page .dup-fingerprint[data-copied='true'] {
   background: var(--accent-soft);
   color: var(--accent);
@@ -590,6 +591,10 @@
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
+  /* 窄行也从目录头部省略；内部 bdi 保持路径字符的顺序。 */
+  max-width: min(36ch, 50%);
+  direction: rtl;
+  text-align: left;
   text-overflow: ellipsis;
   color: var(--text-tertiary);
 }
@@ -653,7 +658,8 @@
   inset: 0;
   display: grid;
   place-items: center;
-  background: rgba(0, 0, 0, 0.32);
+  --dup-modal-scrim: color-mix(in srgb, light-dark(var(--text-primary), var(--bg-app)) 32%, transparent);
+  background: var(--dup-modal-scrim);
   z-index: 40;
   padding: var(--sp-5);
 }

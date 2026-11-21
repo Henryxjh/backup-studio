@@ -82,6 +82,17 @@ export default function App() {
   const [dismissedFailure, setDismissedFailure] = useState<string | null>(null);
   const [planMeta, setPlanMeta] = useState<{ truncated?: boolean; totalActions?: number; previewLimit?: number }>({});
   const [autoTarget, setAutoTarget] = useState('');
+  const [autoSyncRunning, setAutoSyncRunning] = useState(false);
+
+  useEffect(() => {
+    // 自动同步工作区由面板回传；App 挂载及进入查重时面板不在，主动读取状态。
+    if (workspace === 'auto') return undefined;
+    let stopped = false;
+    void api.autoSync.status().then((status) => {
+      if (!stopped) setAutoSyncRunning(status.state === 'scanning' || status.state === 'syncing');
+    }).catch(() => undefined);
+    return () => { stopped = true; };
+  }, [api, workspace]);
   // 备份完成后回收站会多出新删除项，用它触发回收站重新读取。
   const [recycleToken, setRecycleToken] = useState(0);
 
@@ -385,7 +396,7 @@ export default function App() {
           api={api.duplicateFinder}
           pickDirectory={(title) => api.pickDirectory(title)}
           onBack={() => setWorkspace('manual')}
-          backupRunning={running}
+          backupRunning={running || autoSyncRunning}
         />
       ) : (
       <div className="workspace" ref={workspaceRef}>
@@ -452,6 +463,7 @@ export default function App() {
                 api={api.autoSync}
                 pickDirectory={(title) => api.pickDirectory(title)}
                 onActiveTargetChange={setAutoTarget}
+                onRunningChange={setAutoSyncRunning}
               />
             )}
           </div>

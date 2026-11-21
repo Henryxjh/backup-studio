@@ -17,6 +17,7 @@ export interface AutoSyncPanelProps {
   pickDirectory?: (title: string) => Promise<string | null>;
   /** 聚焦配对的备份目标目录变化时回调，供右栏诊断使用。 */
   onActiveTargetChange?: (targetRoot: string) => void;
+  onRunningChange?: (running: boolean) => void;
 }
 
 const STATE_LABEL: Record<AutoRunState, string> = {
@@ -56,7 +57,7 @@ type ConfirmState =
  * 回收站与版本历史都属于「这个配对会删什么、留什么、能不能撤回」，
  * 因此直接嵌在配对详情里，不做成互相割裂的独立区块。
  */
-export function AutoSyncPanel({ api, pickDirectory, onActiveTargetChange }: AutoSyncPanelProps) {
+export function AutoSyncPanel({ api, pickDirectory, onActiveTargetChange, onRunningChange }: AutoSyncPanelProps) {
   const [status, setStatus] = useState<AutoStatus>();
   const [focusId, setFocusId] = useState('');
   const [tab, setTab] = useState<Tab>('recycle');
@@ -86,6 +87,10 @@ export function AutoSyncPanel({ api, pickDirectory, onActiveTargetChange }: Auto
       clearTimeout(timer);
     };
   }, [api, busy]);
+
+  useEffect(() => {
+    if (status) onRunningChange?.(status.state === 'scanning' || status.state === 'syncing');
+  }, [status, onRunningChange]);
 
   const pairs = status?.pairs ?? [];
   // 优先用用户在本界面选中的配对；没选过时沿用引擎给出的 activePairId。
