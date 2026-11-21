@@ -15,7 +15,8 @@ import { IconAlert, IconCheck, IconLayers, IconMoon, IconRefresh, IconSun } from
 import { useSpringValue } from './hooks/useSpringValue';
 import { POP_SPRING } from './lib/spring';
 import { fmtBytes, fmtDuration, fmtInt } from './lib/format';
-import type { AppState, BackupPhase, SyncMode } from '../shared/types';
+import type { BackupPhase, RecycleEntry, SyncMode } from '../shared/types';
+import type { BackupRevealResult, BackupRevealState } from '../shared/reveal-types';
 
 type StepState = 'idle' | 'active' | 'done';
 
@@ -55,14 +56,6 @@ const PHASE_LABEL: Record<BackupPhase, string> = {
   interrupted: '已中断',
 };
 
-/** 目标端的归档目录（与 electron/engine/manifest.ts 的 historyDir 对齐）。 */
-const ARCHIVE_DIR = '.backup-studio/history';
-
-function joinPath(root: string, rel: string): string {
-  const sep = root.includes('\\') ? '\\' : '/';
-  return `${root.replace(/[\\/]+$/, '')}${sep}${rel.replace(/\//g, sep)}`;
-}
-
 export default function App() {
   const api = useMemo<BackupAPI>(() => getApi() ?? createMockApi(), []);
   const workspaceRef = useRef<HTMLDivElement>(null);
@@ -73,7 +66,7 @@ export default function App() {
   const [scan, setScan] = useState<ScanOutcome | null>(null);
   // 默认非破坏性：备份不该顺手删掉目标端多出来的文件。
   const [syncMode, setSyncMode] = useState<SyncMode>('copy');
-  const [state, setState] = useState<AppState | null>(null);
+  const [state, setState] = useState<BackupRevealState | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [busyStage, setBusyStage] = useState<'scanning' | 'planning' | 'starting' | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -83,6 +76,15 @@ export default function App() {
   const [planMeta, setPlanMeta] = useState<{ truncated?: boolean; totalActions?: number; previewLimit?: number }>({});
   const [autoTarget, setAutoTarget] = useState('');
   const [autoSyncRunning, setAutoSyncRunning] = useState(false);
+  // 定位失败只作为提示呈现，**不**改写备份状态。
+  const [revealError, setRevealError] = useState<string | null>(null);
+  // 当前授权作用域：作用域一旦切换，旧作用域的在途响应必须被忽略。
+  const scopeIdRef = useRef<string | undefined>(state?.revealScopeId);
+
+  useEffect(() => {
+    scopeIdRef.current = state?.revealScopeId;
+    setRevealError(null);
+  }, [state?.revealScopeId]);
 
   useEffect(() => {
     // 自动同步工作区由面板回传；App 挂载及进入查重时面板不在，主动读取状态。
@@ -95,6 +97,13 @@ export default function App() {
   }, [api, workspace]);
   // 备份完成后回收站会多出新删除项，用它触发回收站重新读取。
   const [recycleToken, setRecycleToken] = useState(0);
+
+  // 「待收尾」回收项的收尾：用户已处理过，但最终索引提交失败。
+  // 这时只能把这次操作收尾，不能重新还原或重新删除。
+  const handleRetryRecycleCleanup = useCallback(
+    (entry: RecycleEntry) => api.retryRecycleCleanup(targetRoot, entry.id),
+    [api, targetRoot],
+  );
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('backup-studio-theme');
@@ -199,6 +208,10 @@ export default function App() {
           totalActions: planned.totalActions ?? planned.actions?.length,
           previewLimit: planned.previewLimit,
         });
+        // 计划换了，定位授权作用域也跟着换：旧作用域在主进程已作废。
+        setState((prev) =>
+          prev ? { ...prev, revealScopeId: planned.revealScopeId } : prev,
+        );
         setAllowMassDelete(false);
         setConfirming(false);
       } catch (err) {
@@ -337,10 +350,33 @@ export default function App() {
     return '请选择源目录与备份目标目录';
   })();
 
-  const revealArchive = useCallback(() => {
-    if (!targetRoot) return;
-    void api.reveal(joinPath(targetRoot, ARCHIVE_DIR));
-  }, [api, targetRoot]);
+  /**
+   * 打开归档目录。
+   *
+   * 路径由主进程授权表裁决：渲染层只提交「作用域 + 归档」，
+   * 失败也只是这次定位没成功，**不**改写备份状态。
+   */
+  const revealArchive = useCallback(async () => {
+    const scopeId = state?.revealScopeId;
+    if (!scopeId) {
+      setRevealError('尚未生成备份计划，无法定位归档目录。');
+      return;
+    }
+    setRevealError(null);
+    let result: BackupRevealResult;
+    try {
+      result = await api.reveal({ kind: 'archive', scopeId });
+    } catch (err) {
+      // 通道本身出错也不该变成未处理的拒绝，更不该写成备份失败。
+      if (scopeId === scopeIdRef.current) {
+        setRevealError(err instanceof Error ? err.message : '定位归档目录失败。');
+      }
+      return;
+    }
+    // 作用域已经切换（重新扫描/重新规划）时，这次响应属于旧作用域，直接丢弃。
+    if (scopeId !== scopeIdRef.current) return;
+    if (!result.ok) setRevealError(result.message);
+  }, [api, state?.revealScopeId]);
 
   const diagnosticsRoot = workspace === 'auto' ? autoTarget : targetRoot;
 
@@ -435,7 +471,8 @@ export default function App() {
                   truncated={planMeta.truncated}
                   totalActions={planMeta.totalActions}
                   previewLimit={planMeta.previewLimit}
-                  onRevealArchive={revealArchive}
+                  onRevealArchive={() => void revealArchive()}
+                  revealArchiveError={revealError ?? undefined}
                 />
 
                 <RecycleBin
@@ -443,6 +480,7 @@ export default function App() {
                   targetRoot={targetRoot}
                   disabled={running}
                   refreshToken={recycleToken}
+                  onRetryCleanup={handleRetryRecycleCleanup}
                 />
 
                 {phase === 'completed' ? (

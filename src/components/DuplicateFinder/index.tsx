@@ -118,6 +118,30 @@ function baseName(absPath: string): string {
 }
 
 /**
+ * 引擎抛出的错误外面可能裹着 Electron 的转发前缀
+ * （形如 `Error invoking remote method 'dup:listQuarantine': Error: …`）。
+ * 界面上只呈现真正的原因，不把内部通道名怼给用户。
+ */
+function engineMessage(err: unknown, fallback: string): string {
+  const raw = err instanceof Error ? err.message : String(err ?? '');
+  const remote = /Error invoking remote method '[^']*':\s*(?:Error:\s*)?([\s\S]*)$/.exec(raw);
+  const text = (remote?.[1] ?? raw).trim();
+  return text || fallback;
+}
+
+/**
+ * 隔离区不可读的原因。
+ *
+ * 引擎已经说过一次「隔离区不可读取」，界面横幅会再声明一次，
+ * 这里把重复的前缀去掉，只留真正的失败原因。
+ */
+function quarantineReason(err: unknown): string {
+  const text = engineMessage(err, '隔离区索引不可读取');
+  const stripped = text.replace(/^隔离区(?:索引)?不可读取[:：]\s*/, '').trim();
+  return stripped || text;
+}
+
+/**
  * 指纹截断：首尾各留 4 位，中间省略。
  *
  * 标题行放不下完整哈希，但用户随时可能要核对完整值，
@@ -285,6 +309,16 @@ export function DuplicateFinderPage({
   /** 本机隔离区条目：降级落地时删除的文件在这里，可逐条还原（FR-08） */
   const [quarantine, setQuarantine] = useState<DupQuarantineEntry[]>([]);
   const [quarantineOpen, setQuarantineOpen] = useState(false);
+  /** 隔离区索引不可读的原因：非空即表示清单可能不完整（FR-08） */
+  const [quarantineError, setQuarantineError] = useState('');
+  /**
+   * 还原完成但有隐患时的警告。
+   *
+   * 后端在「文件已还原、但隔离区索引更新失败」时会带回 reason：
+   * 那时文件确实回到了原处，条目却可能仍留在清单里（实体已经不在），
+   * 只显示一句「已还原」会把这件事盖过去——那正是「失败伪装成功」。
+   */
+  const [restoreWarning, setRestoreWarning] = useState('');
   const [reportNote, setReportNote] = useState('');
   /** 条目意图：保留 / 删除 / 下次不提醒 的唯一来源，三态互斥（FR-06） */
   const [intents, setIntents] = useState<Record<string, ItemIntent>>({});
@@ -314,19 +348,20 @@ export function DuplicateFinderPage({
    * 隔离区条目必须来自引擎的持久列表。
    *
    * 只靠本次 act() 的返回值，重启或切页后还原入口就消失了，文件再也回不来（FR-08）。
+   *
+   * 索引读不出来时**不回退**到状态里带回来的旧清单：那份清单同样来自这份坏索引，
+   * 回退只会让界面继续显示一份假清单（看上去像「隔离区是空的」）。
+   * 这里保留上一次成功读到的快照，同时把失败原因明确显示出来。
    */
-  const loadQuarantine = useCallback(
-    async (fallback?: DupQuarantineEntry[]) => {
-      try {
-        const list = await api.listQuarantine();
-        setQuarantine(Array.isArray(list) ? list : []);
-      } catch {
-        // 引擎尚未提供隔离区列表时，退回状态里带回的条目，不能因此丢掉还原入口
-        if (fallback) setQuarantine(fallback);
-      }
-    },
-    [api],
-  );
+  const loadQuarantine = useCallback(async () => {
+    try {
+      const list = await api.listQuarantine();
+      setQuarantine(Array.isArray(list) ? list : []);
+      setQuarantineError('');
+    } catch (err) {
+      setQuarantineError(quarantineReason(err));
+    }
+  }, [api]);
 
   useEffect(() => {
     let stopped = false;
@@ -338,7 +373,7 @@ export function DuplicateFinderPage({
         // 本页会被工作区切换卸载：目录只能从状态回填，否则回来后所有动作都因缺根而静默失效
         const backfilled = value.currentRoot ?? value.result?.root ?? '';
         if (backfilled) setRoot((prev) => prev || backfilled);
-        await loadQuarantine(value.quarantine);
+        await loadQuarantine();
       } catch {
         if (!stopped) setError('无法读取重复文件检测状态');
       }
@@ -481,6 +516,7 @@ export function DuplicateFinderPage({
     if (!base) return;
     setError('');
     setNotice('');
+    setRestoreWarning('');
     setActSummary('');
     setSelected(new Set());
     setKeeperChoice({});
@@ -516,6 +552,7 @@ export function DuplicateFinderPage({
       if (!base) return;
       setError('');
       setNotice('');
+      setRestoreWarning('');
       const before = intents;
       writeIntents(ids, action);
       try {
@@ -545,6 +582,7 @@ export function DuplicateFinderPage({
       }
       setError('');
       setNotice('');
+      setRestoreWarning('');
       const before = intents;
       writeIntents(targets, action);
       try {
@@ -571,6 +609,7 @@ export function DuplicateFinderPage({
       if (!base) return;
       setError('');
       setNotice('');
+      setRestoreWarning('');
       const before = intents;
       writeIntents(ids, 'keep');
       try {
@@ -595,6 +634,7 @@ export function DuplicateFinderPage({
       }
       setError('');
       setNotice('');
+      setRestoreWarning('');
       const before = intents;
       writeIntents([keeperId], 'keep');
       writeIntents(
@@ -624,6 +664,7 @@ export function DuplicateFinderPage({
       if (!base) return;
       setError('');
       setNotice('');
+      setRestoreWarning('');
       setBusy(true);
       let done = 0;
       let lastError = '';
@@ -663,6 +704,7 @@ export function DuplicateFinderPage({
       if (!base) return;
       setError('');
       setNotice('');
+      setRestoreWarning('');
       try {
         // 走受校验的定位通道：路径必须落在本次扫描根内且是真实扫描结果（FR-14、FR-20）
         await api.reveal(base, entry.absPath);
@@ -770,6 +812,8 @@ export function DuplicateFinderPage({
     }
     setBusy(true);
     setError('');
+    setNotice('');
+    setRestoreWarning('');
     try {
       const outcome = await api.act(base, {
         root: base,
@@ -810,18 +854,26 @@ export function DuplicateFinderPage({
     async (id: string) => {
       setError('');
       setNotice('');
+      setRestoreWarning('');
       try {
         const outcome = await api.restoreQuarantine(id);
         if (!outcome.restored) {
           setError(outcome.reason ?? '还原失败');
+          await loadQuarantine();
           return;
         }
         setNotice(`已还原到原路径：${outcome.path ?? ''}`);
+        // 还原成功但后端带回 reason（如「索引更新失败，该条目可能仍显示在清单中」）：
+        // 这条警告必须单独呈现，不能被上面的成功提示盖掉。
+        if (outcome.reason) setRestoreWarning(outcome.reason);
         // 还原后刷新隔离区与检测结果，避免界面停留在已删除的状态
         await loadQuarantine();
         setStatus(await api.status());
       } catch (err) {
-        setError(err instanceof Error ? err.message : '还原失败');
+        // 引擎给出的原因必须原样呈现：索引不可读、目标被占用、闸门阻断各不相同
+        setError(engineMessage(err, '还原失败'));
+        // 还原失败可能正是索引出了问题：重新读一次，隔离区的可读状态也要如实反映
+        await loadQuarantine();
       }
     },
     [api, loadQuarantine],
@@ -845,6 +897,40 @@ export function DuplicateFinderPage({
   const stats = result?.stats;
   const summary = result?.summary;
   const truncated = result?.truncated ?? false;
+
+  /** 隔离区条目清单：错误态与正常态共用一份，错误态只是多一条横幅 */
+  const quarantineList = (
+    <ul className="dup-suppress-list">
+      {quarantine.map((entry) => (
+        <li key={entry.id} className="dup-suppress-row">
+          <span className="dup-suppress-main">
+            <span className="dup-suppress-fingerprint" title={entry.originalPath}>
+              {baseName(entry.originalPath)}
+            </span>
+            <span className="dup-suppress-name" title={entry.originalPath}>
+              {entry.originalPath}
+            </span>
+            <span className="dup-suppress-meta">
+              大小 {fmtBytes(entry.size)} | 进入隔离区 {timeText(entry.deletedAt)}
+              {entry.restored ? ' | 已还原' : ''}
+              {entry.missing ? ' | 实体文件缺失，无法还原' : ''}
+              {!entry.missing && entry.unavailableReason ? ` | ${entry.unavailableReason}` : ''}
+            </span>
+          </span>
+          <button
+            className="btn btn-sm"
+            type="button"
+            // 已还原 / 实体缺失的条目点了也只会失败：按钮必须如实禁用
+            disabled={busy || entry.restored || entry.missing}
+            onClick={() => void handleRestore(entry.id)}
+            aria-label={`还原 ${entry.originalPath}`}
+          >
+            还原
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
 
   return (
     <div className="dup-page">
@@ -883,9 +969,9 @@ export function DuplicateFinderPage({
               setQuarantineOpen(true);
               void loadQuarantine();
             }}
-            aria-label={`本机隔离区，当前 ${quarantine.length} 项`}
+            aria-label={quarantineError ? '本机隔离区，索引不可读取' : `本机隔离区，当前 ${quarantine.length} 项`}
           >
-            隔离区 ({quarantine.length})
+            {quarantineError ? '隔离区（不可读）' : `隔离区 (${quarantine.length})`}
           </button>
         </div>
       </header>
@@ -934,6 +1020,23 @@ export function DuplicateFinderPage({
           <div className="dup-banner" data-tone="warn" role="status">
             <IconAlert size={13} className="icon-inline" />
             <span>{notice}</span>
+          </div>
+        ) : null}
+
+        {restoreWarning ? (
+          // 警告单独一条：还原完成不等于一切正常，索引没更新就得说出来
+          <div className="dup-banner" data-tone="warn" role="alert">
+            <IconAlert size={13} className="icon-inline" />
+            <span>{restoreWarning}</span>
+          </div>
+        ) : null}
+
+        {quarantineError ? (
+          <div className="dup-banner" data-tone="danger" role="alert">
+            <IconAlert size={13} className="icon-inline" />
+            <span>
+              隔离区索引不可读取：{quarantineError}。清单可能不完整，磁盘上的文件仍在隔离区目录中。
+            </span>
           </div>
         ) : null}
 
@@ -1224,12 +1327,24 @@ export function DuplicateFinderPage({
           <div className="dup-drawer-card">
             <header className="dup-drawer-head">
               <div>
-                <h2>本机隔离区 ({fmtInt(quarantine.length)})</h2>
+                <h2>
+                  本机隔离区{quarantineError ? '（不可读）' : ` (${fmtInt(quarantine.length)})`}
+                </h2>
                 <p className="dup-hint">
                   系统回收站不可用时删除的文件会移到这里，可逐条还原回原路径。清单来自本机持久记录，重启后仍在。
                 </p>
               </div>
               <div className="dup-drawer-actions">
+                {quarantineError ? (
+                  <button
+                    className="btn btn-sm"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void loadQuarantine()}
+                  >
+                    重试
+                  </button>
+                ) : null}
                 <button
                   className="btn btn-sm"
                   type="button"
@@ -1249,36 +1364,20 @@ export function DuplicateFinderPage({
               </div>
             </header>
 
-            {quarantine.length === 0 ? (
+            {quarantineError ? (
+              <>
+                <div className="dup-banner" data-tone="danger" role="alert">
+                  <IconAlert size={13} className="icon-inline" />
+                  <span>
+                    隔离区索引不可读取：{quarantineError}。清单可能不完整，磁盘上的文件仍在隔离区目录中。
+                  </span>
+                </div>
+                {quarantine.length > 0 ? quarantineList : null}
+              </>
+            ) : quarantine.length === 0 ? (
               <p className="dup-hint">隔离区为空：没有需要还原的文件。</p>
             ) : (
-              <ul className="dup-suppress-list">
-                {quarantine.map((entry) => (
-                  <li key={entry.id} className="dup-suppress-row">
-                    <span className="dup-suppress-main">
-                      <span className="dup-suppress-fingerprint" title={entry.originalPath}>
-                        {baseName(entry.originalPath)}
-                      </span>
-                      <span className="dup-suppress-name" title={entry.originalPath}>
-                        {entry.originalPath}
-                      </span>
-                      <span className="dup-suppress-meta">
-                        大小 {fmtBytes(entry.size)} | 进入隔离区 {timeText(entry.deletedAt)}
-                        {entry.restored ? ' | 已还原' : ''}
-                      </span>
-                    </span>
-                    <button
-                      className="btn btn-sm"
-                      type="button"
-                      disabled={busy || entry.restored}
-                      onClick={() => void handleRestore(entry.id)}
-                      aria-label={`还原 ${entry.originalPath}`}
-                    >
-                      还原
-                    </button>
-                  </li>
-                ))}
-              </ul>
+              quarantineList
             )}
           </div>
         </div>
@@ -1291,6 +1390,7 @@ export function DuplicateFinderPage({
           onClose={() => setSuppressOpen(false)}
           onRevoke={(sha256) => {
             setNotice('');
+            setRestoreWarning('');
             void perform(() => api.revokeSuppression(sha256));
           }}
         />

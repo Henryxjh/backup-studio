@@ -3,12 +3,13 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { FileName } from './FileName';
 import { fmtBytes, fmtInt } from '../lib/format';
 import type { BackupAPI } from '../lib/api';
-import type { RecycleEntry } from '../../shared/types';
+import type { RecycleBin, RecycleEntry } from '../../shared/types';
 
 interface Props {
   api: Pick<BackupAPI, 'listRecycle' | 'restoreRecycle' | 'removeRecycle'>;
   targetRoot: string;
   disabled?: boolean;
+  onRetryCleanup?: (entry: RecycleEntry) => Promise<RecycleBin>;
   /**
    * 外部状态变化时递增，触发重新读取。
    * 备份完成后回收站会多出新条目，不刷新的话用户会以为删除没进回收站。
@@ -19,16 +20,29 @@ interface Props {
 /** 待确认的动作：还原冲突时的覆盖确认，以及不可逆的彻底删除确认。 */
 type Pending = { kind: 'overwrite' | 'remove'; entry: RecycleEntry } | null;
 
+function verifyLabel(entry: RecycleEntry): string {
+  const state = entry.contentState ?? (entry.contentVerified ? 'verified'
+    : entry.hashBaseline ?? Boolean(entry.archiveSha256) ? 'unverified' : 'unknown');
+  switch (state) {
+    case 'verified': return '内容已校验';
+    case 'unverified': return '有内容校验基线，还原时会严格校验';
+    case 'failed': return '内容校验未通过，需人工核对';
+    case 'unknown': return '无内容校验基线：还原的是磁盘当前内容';
+  }
+}
+
 /**
  * 手动备份回收站。
  *
  * 删除的文件只有在进入回收站后才谈得上「可恢复」，所以这里必须能看清三件事：
  * 删掉了什么、占了多少空间、以及还能不能还原。彻底删除是不可逆动作，
  * 一律先过确认层，把后果写在确认按钮之前。
+ *
+ * 回收站自身也可能有状态问题（索引缺失、条目待核对、实体丢失），
+ * 这些必须显式呈现：把「读不出来」显示成「回收站是空的」等于骗用户。
  */
-export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
-  const [entries, setEntries] = useState<RecycleEntry[]>([]);
-  const [totalBytes, setTotalBytes] = useState(0);
+export function RecycleBin({ api, targetRoot, disabled, refreshToken, onRetryCleanup }: Props) {
+  const [snapshot, setSnapshot] = useState<RecycleBin | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -39,8 +53,7 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
   const load = useCallback(async () => {
     const seq = (requestSeq.current += 1);
     if (!targetRoot) {
-      setEntries([]);
-      setTotalBytes(0);
+      setSnapshot(null);
       setError(null);
       setLoading(false);
       return;
@@ -48,14 +61,12 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const snapshot = await api.listRecycle(targetRoot);
+      const result = await api.listRecycle(targetRoot);
       if (seq !== requestSeq.current) return;
-      setEntries(snapshot.entries);
-      setTotalBytes(snapshot.totalBytes);
+      setSnapshot(result);
     } catch (err) {
       if (seq !== requestSeq.current) return;
-      setEntries([]);
-      setTotalBytes(0);
+      setSnapshot(null);
       setError(err instanceof Error ? err.message : '读取回收站失败');
     } finally {
       if (seq === requestSeq.current) setLoading(false);
@@ -71,9 +82,8 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
       setBusyId(entry.id);
       setError(null);
       try {
-        const snapshot = await api.restoreRecycle(targetRoot, entry.id, overwrite);
-        setEntries(snapshot.entries);
-        setTotalBytes(snapshot.totalBytes);
+        const result = await api.restoreRecycle(targetRoot, entry.id, overwrite);
+        setSnapshot(result);
       } catch (err) {
         const message = err instanceof Error ? err.message : '还原失败';
         // 目标位置已被占用不是失败，而是需要用户决定是否覆盖原文件。
@@ -94,9 +104,8 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
       setBusyId(entry.id);
       setError(null);
       try {
-        const snapshot = await api.removeRecycle(targetRoot, entry.id);
-        setEntries(snapshot.entries);
-        setTotalBytes(snapshot.totalBytes);
+        const result = await api.removeRecycle(targetRoot, entry.id);
+        setSnapshot(result);
       } catch (err) {
         setError(err instanceof Error ? err.message : '彻底删除失败');
       } finally {
@@ -106,8 +115,33 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
     [api, targetRoot],
   );
 
+  const retryCleanup = useCallback(async (entry: RecycleEntry) => {
+    if (!onRetryCleanup) return;
+    setBusyId(entry.id);
+    setError(null);
+    try {
+      setSnapshot(await onRetryCleanup(entry));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '重试收尾失败');
+    } finally {
+      setBusyId(null);
+    }
+  }, [onRetryCleanup]);
+
   const locked = Boolean(disabled) || loading;
   const pendingEntry = pending?.entry;
+  const entries = snapshot?.entries ?? [];
+  const totalBytes = snapshot?.totalBytes ?? 0;
+  const usedBytes = snapshot?.usedBytes ?? totalBytes;
+  const limitBytes = snapshot?.limitBytes;
+  const pendingBytes = snapshot?.pendingBytes ?? 0;
+  const orphanBytes = snapshot?.orphanBytes ?? 0;
+  const uncertainCount = snapshot?.uncertainCount ?? entries.filter((e) => e.state === 'uncertain').length;
+  const indexState = snapshot?.indexState ?? 'ok';
+  const overLimit = snapshot?.overLimit ?? false;
+  const blockedReason = snapshot?.blockedReason;
+  // 索引缺失/损坏/不一致时，回收站不是「空的」，而是「读不准的」。
+  const inconsistent = indexState !== 'ok';
 
   return (
     <div className="section">
@@ -119,11 +153,11 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
           disabled={locked || !targetRoot}
           onClick={() => void load()}
         >
-          刷新
+          {error && !snapshot ? '重试' : '刷新'}
         </button>
       </div>
 
-      <div className="stat-row">
+      {snapshot ? <div className="stat-row">
         <div className="stat">
           <span className="stat-value">{fmtInt(entries.length)}</span>
           <span className="stat-label">回收条目</span>
@@ -132,7 +166,29 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
           <span className="stat-value">{fmtBytes(totalBytes)}</span>
           <span className="stat-label">占用空间</span>
         </div>
-      </div>
+        {limitBytes !== undefined ? (
+          <div className="stat">
+            <span className="stat-value">{fmtBytes(limitBytes)}</span>
+            <span className="stat-label">容量上限</span>
+          </div>
+        ) : null}
+        {uncertainCount > 0 ? (
+          <div className="stat">
+            <span className="stat-value">{fmtInt(uncertainCount)}</span>
+            <span className="stat-label">待人工核对</span>
+          </div>
+        ) : null}
+      </div> : null}
+
+      {snapshot && limitBytes !== undefined ? (
+        <p className="recycle-meta">
+          已索引实体 {fmtBytes(usedBytes)}
+          {pendingBytes > 0 ? ` · 未决事务 ${fmtBytes(pendingBytes)}` : ''}
+          {orphanBytes > 0 ? ` · 无索引实体 ${fmtBytes(orphanBytes)}` : ''}
+          {` · 上限 ${fmtBytes(limitBytes)}`}
+          {overLimit ? '（已超限）' : ''}
+        </p>
+      ) : null}
 
       {error ? (
         <p className="recycle-error" role="alert">
@@ -140,10 +196,22 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
         </p>
       ) : null}
 
+      {blockedReason ? (
+        <p className="recycle-error" role="alert">
+          {blockedReason}
+        </p>
+      ) : null}
+
       {!targetRoot ? (
         <p className="empty-hint">选择备份目标目录后可查看回收站</p>
-      ) : loading && entries.length === 0 ? (
+      ) : loading && !snapshot ? (
         <p className="empty-hint">正在读取回收站…</p>
+      ) : !snapshot ? (
+        error ? <p className="empty-hint">读取失败，请重试。</p> : null
+      ) : entries.length === 0 && inconsistent ? (
+        <p className="empty-hint">
+          回收站状态异常（{indexState}），条目未能可靠读出，请先人工核对后再操作。
+        </p>
       ) : entries.length === 0 ? (
         <p className="empty-hint">回收站是空的。被删除的备份文件会出现在这里，随时可以还原。</p>
       ) : (
@@ -155,8 +223,26 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
               <span className="recycle-meta">
                 {new Date(entry.deletedAt).toLocaleString('zh-CN')}
               </span>
+              {entry.state === 'uncertain' ? (
+                <span className="recycle-meta">需人工核对</span>
+              ) : null}
+              {entry.entityState === 'missing' ? (
+                <span className="recycle-meta">副本缺失</span>
+              ) : null}
+              {entry.cleanupPending ? (
+                <span className="recycle-meta">待收尾</span>
+              ) : entry.entityState === 'pending' ? (
+                <span className="recycle-meta">事务未完成</span>
+              ) : null}
+              <span className="recycle-meta">{verifyLabel(entry)}</span>
+              {entry.error ? <span className="recycle-meta">{entry.error}</span> : null}
               <div className="recycle-actions">
-                <button
+                {entry.cleanupPending ? (
+                  <button type="button" className="btn btn-sm" disabled={locked || busyId === entry.id || !onRetryCleanup}
+                    onClick={() => void retryCleanup(entry)} title={!onRetryCleanup ? '收尾接口尚未接入' : undefined}>
+                    重试收尾
+                  </button>
+                ) : <><button
                   type="button"
                   className="btn btn-sm"
                   disabled={locked || busyId === entry.id}
@@ -172,7 +258,7 @@ export function RecycleBin({ api, targetRoot, disabled, refreshToken }: Props) {
                   onClick={() => setPending({ kind: 'remove', entry })}
                 >
                   彻底删除
-                </button>
+                </button></>}
               </div>
             </div>
           ))}

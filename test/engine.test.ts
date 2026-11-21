@@ -135,6 +135,39 @@ async function makeHashFixture() {
   return { source, target, src, dst, memo: manifest.files['a.txt'] };
 }
 
+/**
+ * 哈希判定回归夹具（R1~R4）。
+ *
+ * 源端与目标端各一个 4 字节文件（内容可独立改写），且目标端 mtime 被钉到整秒并同步进清单，
+ * 这样「把 mtime 还原成清单记录的值」在不同文件系统上都能逐位精确复现，
+ * 避免 mtime 精度差异把用例前提变成随机事件。
+ */
+async function makeHashDecisionFixture() {
+  const source = await makeTemp('bs-hashdec-src-');
+  const target = await makeTemp('bs-hashdec-dst-');
+  const src = path.join(source, 'a.txt');
+  await fs.writeFile(src, 'AAAA');
+  await runService(source, target);
+
+  const dst = path.join(target, 'a.txt');
+  await fs.utimes(dst, baselineMtime, baselineMtime);
+  const manifest = await readManifest(target);
+  assert.ok(manifest);
+  assert.ok(manifest.files['a.txt']);
+  manifest.files['a.txt'].mtimeMs = (await fs.stat(dst)).mtimeMs;
+  await writeManifest(target, manifest);
+  return { source, target, src, dst, memo: manifest.files['a.txt'] };
+}
+
+/** 清理用例创建的临时目录；Windows 上偶发占用时重试，最终失败也不影响用例结论。 */
+async function cleanupTemp(...dirs: string[]): Promise<void> {
+  for (const dir of dirs) {
+    await fs
+      .rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
+      .catch(() => undefined);
+  }
+}
+
 async function main(): Promise<void> {
   console.log('\nBackup Studio 引擎验证\n');
 
@@ -259,6 +292,164 @@ async function main(): Promise<void> {
     const report = await inspectHealth(target, { platform: 'linux', store: new JournalStore(local) });
     assert.equal(report.files.mismatch, 1);
     assert.equal(report.files.complete, 0);
+  });
+
+  await test('R1 哈希判定：源端同尺寸改写且 mtime 还原为改写前值，必须判定为更新', async () => {
+    // 核心回归：planner.ts:154-164 对所有同尺寸文件逐个实算源端 SHA-256，
+    // 不允许用清单里的历史哈希冒充源端内容，否则「同尺寸原地改动」会被漏备份。
+    const { source, target, src } = await makeHashDecisionFixture();
+    try {
+      const before = await fs.stat(src);
+      // 同样 4 字节、内容不同，并把 mtime 还原成改写前的值
+      await fs.writeFile(src, 'BBBB');
+      await fs.utimes(src, before.atime, before.mtime);
+      const after = await fs.stat(src);
+      assert.equal(after.size, before.size, '用例前提：改写后尺寸不变');
+      assert.ok(Math.abs(after.mtimeMs - before.mtimeMs) < 2, '用例前提：mtime 已还原');
+
+      const plan = await planFor(source, target);
+      assert.equal(plan.summary.update, 1, '源端实算哈希必须识别出改写');
+      assert.equal(plan.summary.skip, 0, '内容已变不得判为跳过');
+      assert.ok(
+        plan.actions.some((a) => a.type === 'update' && a.relPath === 'a.txt'),
+        '应存在作用于 a.txt 的 update 动作',
+      );
+    } finally {
+      await cleanupTemp(source, target);
+    }
+  });
+
+  await test('R2 哈希判定：源端同尺寸、mtime 变化但内容不变，判定为跳过', async () => {
+    const { source, target, src } = await makeHashDecisionFixture();
+    try {
+      const st = await fs.stat(src);
+      await fs.utimes(src, st.atime, new Date(st.mtimeMs + 5000));
+      const after = await fs.stat(src);
+      assert.notEqual(
+        Math.round(after.mtimeMs),
+        Math.round(st.mtimeMs),
+        '用例前提：源端 mtime 已变化',
+      );
+      assert.equal(await fs.readFile(src, 'utf8'), 'AAAA', '用例前提：内容未变');
+
+      const plan = await planFor(source, target);
+      assert.equal(plan.summary.skip, 1, '内容一致时即使 mtime 变化也必须跳过');
+      assert.equal(plan.summary.update, 0, '内容未变不得误判为更新');
+      assert.ok(
+        plan.actions.some((a) => a.type === 'skip' && a.relPath === 'a.txt'),
+        '应存在作用于 a.txt 的 skip 动作',
+      );
+    } finally {
+      await cleanupTemp(source, target);
+    }
+  });
+
+  await test('R3 已知缺口：目标端同尺寸外部改写且 mtime 被还原时，默认规划发现不了', async () => {
+    // 记录**当前实现的真实行为**，这是一个已知缺口，不是期望行为：
+    // planner.ts:166-180 只在「目标 size 与 mtimeMs 同时与清单记录吻合」时才复用清单里的目标哈希。
+    // 外部改写若刻意保留 size 与 mtime，清单就会继续被当成目标端的可信基线，
+    // 于是这次外部改写对默认规划完全不可见——目标端被改坏的内容会被一直跳过、永远不被修复。
+    // 严格校验路径 service.planBackup(..., verifyTarget = true)（强制 manifest: null 全量重算）
+    // 确实存在，但只在**事务恢复**路径上有调用方（service.ts:722 传 Boolean(job.transaction)）。
+    // 用户主动发起的规划链路（service.plan() → IPC backup:plan → preload.plan → api.plan → App.tsx）
+    // 一律只传 3 个参数，verifyTarget 恒为 false，因此这条严格校验路径对日常规划不可达。
+    // 本用例把缺口钉在测试里：将来接通严格校验时本用例会失败，需要同步更新断言。
+    const { source, target, dst, memo } = await makeHashDecisionFixture();
+    const journal = await makeTemp('bs-r3-journal-');
+    try {
+      // 目标端被外部改写成同样大小但不同内容，并把 mtime 还原成清单记录的值
+      await fs.writeFile(dst, 'BBBB');
+      await fs.utimes(dst, new Date(memo.mtimeMs), new Date(memo.mtimeMs));
+      const stat = await fs.stat(dst);
+      assert.equal(stat.size, memo.size, '用例前提：目标尺寸未变');
+      assert.equal(stat.mtimeMs, memo.mtimeMs, '用例前提：目标 mtime 已还原为清单记录值');
+
+      const plan = await planFor(source, target);
+      assert.equal(plan.summary.update, 0, '当前实现不会发现目标端被外部改写（已知缺口）');
+      assert.equal(plan.summary.skip, 1, '当前实现把这次外部改写误判为「内容一致」');
+      assert.equal(
+        plan.actions.filter((a) => a.type === 'update').length,
+        0,
+        '当前实现不会为被外部改写的目标生成 update 动作',
+      );
+
+      // 公开入口 plan() 同样看不到：verifyTarget 无调用方，严格校验路径不可达
+      const service = new BackupService(journal);
+      const svcPlan = await service.plan(source, target, 'mirror');
+      assert.equal(svcPlan.summary.update, 0, '公开 plan() 走不到严格校验路径');
+      assert.equal(svcPlan.summary.skip, 1, '公开 plan() 同样把外部改写误判为一致');
+    } finally {
+      await cleanupTemp(source, target, journal);
+    }
+  });
+
+  await test('R4 哈希判定：清单损坏时不得把「读不到」当成「没变化」', async () => {
+    const { source, target, src } = await makeHashDecisionFixture();
+    try {
+      // 源端内容确实变了（同尺寸）
+      const before = await fs.stat(src);
+      await fs.writeFile(src, 'BBBB');
+      await fs.utimes(src, before.atime, before.mtime);
+
+      // 把目标端清单写成损坏的 JSON
+      const manifestFile = path.join(target, '.backup-studio', 'manifest.json');
+      await fs.writeFile(manifestFile, '{ this is not valid json', 'utf8');
+      assert.equal(await readManifest(target), null, '用例前提：损坏的清单读不出来');
+
+      // 规划不得抛异常
+      const plan = await planFor(source, target);
+      assert.equal(plan.summary.update, 1, '清单不可用时仍须按实际内容判定为更新');
+      assert.equal(plan.summary.skip, 0, '清单不可用不得被当成「内容一致」');
+      assert.ok(
+        plan.actions.some((a) => a.type === 'update' && a.relPath === 'a.txt'),
+        '应存在作用于 a.txt 的 update 动作',
+      );
+      assert.deepEqual(plan.hashErrors, [], '清单损坏本身不应产生哈希读取错误');
+    } finally {
+      await cleanupTemp(source, target);
+    }
+  });
+
+  await test('R5 哈希判定：规划期源端哈希读取失败时不得被静默判为「相同」', async () => {
+    // 用「把源端文件换成目录」制造读取失败：Windows 上读目录稳定返回 EISDIR。
+    // 这是读取失败的**替身**——权限/占用类手段在 Windows 上不稳定，复现性差。
+    const source = await makeTemp('bs-r5-src-');
+    const target = await makeTemp('bs-r5-dst-');
+    try {
+      await fs.writeFile(path.join(source, 'a.txt'), 'AAAA');
+      await fs.writeFile(path.join(target, 'a.txt'), 'BBBB'); // 同尺寸、不同内容
+      const srcScan = await scanTree(source);
+      const dstScan = await scanTree(target);
+
+      // 扫描完成后源端文件变成目录：哈希阶段读取必然失败
+      const srcFile = path.join(source, 'a.txt');
+      await fs.rm(srcFile, { force: true });
+      await fs.mkdir(srcFile);
+
+      const plan = await buildPlan({
+        sourceRoot: source,
+        targetRoot: target,
+        source: srcScan,
+        target: dstScan,
+        manifest: null,
+        syncMode: 'mirror',
+      });
+      assert.ok(plan.hashErrors.length > 0, '哈希读取失败必须被记录');
+      assert.ok(
+        plan.hashErrors.some((e) => e.includes('a.txt')),
+        '错误记录应指明出错的文件',
+      );
+      assert.equal(
+        plan.actions.some((a) => a.type === 'skip' && a.relPath === 'a.txt'),
+        false,
+        '读不到哈希绝不能判为「内容一致」',
+      );
+      assert.equal(plan.summary.skip, 0, '读取失败的文件不得计入跳过');
+      // 当前实现选择「宁可重传也不静默跳过」：拿不到源哈希即判为待更新
+      assert.equal(plan.summary.update, 1, '源哈希读取失败的同尺寸文件应判为待更新而不是跳过');
+    } finally {
+      await cleanupTemp(source, target);
+    }
   });
 
   await test('改名配对：重新计算 mtime 已变化的孤儿文件摘要', async () => {

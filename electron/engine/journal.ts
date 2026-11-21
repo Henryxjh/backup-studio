@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { syncDirectory, writeJsonAtomic } from './manifest';
+import { samePathIdentity } from './path-identity';
 import type { MediaIdentity, QuarantineMark, SyncMode } from '../../shared/types';
 
 /**
@@ -34,7 +35,55 @@ export interface JournalInterruption {
   committedTasks: number;
 }
 
+export type DeleteTxState =
+  | 'planned' | 'archived' | 'intent-persisted' | 'original-deleted'
+  | 'indexed' | 'committed' | 'uncertain';
+
+/**
+ * 目标端路径是否指向同一个地方。
+ *
+ * 判定依据是**磁盘真实身份**而不是字符串：字符串折叠大小写会把大小写敏感卷上
+ * 两个真实不同的目录（`Foo` 与 `foo`）当成同一个，从而把一个目标的账本
+ * 串到另一个目标上；完全不折叠又会在大小写不敏感的卷上漏配自己的账本。
+ * 详见 `path-identity.ts`。
+ */
+export function sameTargetPath(a: string, b: string): boolean {
+  return samePathIdentity(a, b);
+}
+
+export interface DeleteTx {
+  txId: string;
+  jobId: string;
+  relPath: string;
+  size: number;
+  archiveRelPath: string;
+  archiveSize?: number;
+  archiveSha256?: string;
+  state: DeleteTxState;
+  lastError?: string;
+  /**
+   * 删除已作废：恢复时发现原文件仍在，删除被取消。
+   * 归档实体保留待人工处理，但**不**登记进回收索引（不是一条可还原的回收项）。
+   */
+  voided?: boolean;
+  /**
+   * 该回收项已经结案：`restored` = 已还原到原位置，`removed` = 已彻底删除。
+   * 结案的条目不得在索引重建时复活——用户已经处理过它了。
+   */
+  settled?: 'restored' | 'removed';
+  /**
+   * 待删文件的临时名（与原文件同目录）。
+   *
+   * 崩溃可能发生在「原子移走」与「真正删除」之间，这时原文件已经不在原位，
+   * 只有这个临时名指向它。名字必须**先落盘到账本**再执行移走，否则崩溃后
+   * 恢复流程无从知道该去哪里找回这份待删内容。
+   */
+  trashPath?: string;
+  updatedAt: number;
+}
+
 export interface Journal {
+  deletes?: Record<string, DeleteTx>;
   version: 1;
   jobId: string;
   sourceRoot: string;
@@ -96,14 +145,114 @@ export class JournalStore {
   }
 
   async read(jobId: string): Promise<Journal | null> {
+    let raw: string;
     try {
-      const raw = await fs.readFile(this.jobPath(jobId), 'utf8');
-      const parsed = JSON.parse(raw) as Journal;
-      if (!parsed || parsed.version !== 1) return null;
-      return parsed;
-    } catch {
-      return null;
+      raw = await fs.readFile(this.jobPath(jobId), 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw err;
     }
+    try {
+      const parsed = JSON.parse(raw) as Journal;
+      if (!parsed || parsed.version !== 1) throw new Error('版本不受支持');
+      return parsed;
+    } catch (err) {
+      throw Object.assign(new Error(`任务账本损坏或版本不受支持：${jobId}`, { cause: err }), { code: 'JOURNAL_INVALID' });
+    }
+  }
+
+  listDeleteTx(journal: Journal): DeleteTx[] {
+    return Object.values(journal.deletes ?? {});
+  }
+
+  /**
+   * 账本目录下所有任务 id（不含 active 指针）。
+   *
+   * `clearActive` 只删掉活动指针，`jobs/<jobId>.json` 本身会保留，
+   * 所以任务结束后删除事务依然有据可查。
+   *
+   * **读不出来必须报错**：把 `readdir` 的失败吞成空数组，会让调用方以为
+   * 「这个目标端没有任何删除事务」，进而把「索引缺失 + 账本读不出来」
+   * 当成空回收站重建索引——已删除文件的唯一副本就此从界面上消失。
+   * 只有目录确实不存在（ENOENT）才返回空。
+   */
+  async listJobIds(): Promise<string[]> {
+    let names: string[];
+    try {
+      names = await fs.readdir(this.jobsDir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw err;
+    }
+    return names
+      .filter((name) => name.endsWith('.json') && name !== 'active.json')
+      .map((name) => name.slice(0, -'.json'.length))
+      .filter((id) => /^[\w-]+$/.test(id));
+  }
+
+  /**
+   * 某个目标端上所有任务留下的删除事务（含已提交的）。
+   *
+   * 回收索引是可浏览的入口，但**不是唯一证据**：归档实体会长期留在目标端，
+   * 索引一旦丢失，已删除文件的唯一副本就再也看不见、也还原不了。
+   * 账本是本机权威，必须能跨任务把删除事务重新找回来。
+   *
+   * **损坏的账本不得被静默跳过**：跳过会让那份账本里的删除事务连同它们的归档
+   * 一起从「可找回的证据」变成「看不见的孤儿」。这里把读失败的任务报出来，
+   * 由调用方决定阻断还是降级，绝不假装它们不存在。
+   */
+  async listDeleteTxByTarget(targetRoot: string): Promise<DeleteTx[]> {
+    const { txs, failures } = await this.listDeleteTxByTargetDetailed(targetRoot);
+    if (failures.length) {
+      const detail = failures.map((f) => `${f.jobId}（${f.message}）`).join('；');
+      throw Object.assign(
+        new Error(`部分任务账本读取失败，删除事务清单不完整：${detail}`),
+        { code: 'JOURNAL_INVALID' },
+      );
+    }
+    return txs;
+  }
+
+  /** 与 `listDeleteTxByTarget` 相同，但把读失败的任务单独报出来，不抛错。 */
+  async listDeleteTxByTargetDetailed(targetRoot: string): Promise<{
+    txs: DeleteTx[];
+    failures: { jobId: string; message: string }[];
+  }> {
+    const out: DeleteTx[] = [];
+    const failures: { jobId: string; message: string }[] = [];
+    const seen = new Set<string>();
+    for (const jobId of await this.listJobIds()) {
+      let job: Journal | null;
+      try {
+        job = await this.read(jobId);
+      } catch (err) {
+        failures.push({ jobId, message: err instanceof Error ? err.message : String(err) });
+        continue;
+      }
+      if (!job || !sameTargetPath(job.targetRoot, targetRoot)) continue;
+      for (const tx of this.listDeleteTx(job)) {
+        if (seen.has(tx.txId)) continue;
+        seen.add(tx.txId);
+        out.push(tx);
+      }
+    }
+    return { txs: out, failures };
+  }
+
+  async recordDeleteTx(journal: Journal, tx: DeleteTx): Promise<void> {
+    const deletes = { ...journal.deletes, [tx.txId]: tx };
+    const next = { ...journal, deletes };
+    await this.write(next);
+    journal.deletes = deletes;
+    journal.updatedAt = next.updatedAt;
+  }
+
+  async updateDeleteTx(journal: Journal, txId: string, patch: Partial<DeleteTx>): Promise<DeleteTx> {
+    const previous = journal.deletes?.[txId];
+    if (!previous) throw new Error(`删除事务不存在：${txId}`);
+    const tx = { ...previous, ...patch, txId, updatedAt: Date.now() };
+    await this.recordDeleteTx(journal, tx);
+    return tx;
   }
 
   async write(journal: Journal): Promise<void> {

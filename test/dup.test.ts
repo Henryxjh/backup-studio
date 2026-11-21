@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import type { Dirent } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DuplicateFinder, MAX_PREVIEW_GROUPS } from '../electron/engine/dup';
 import { createDuplicateFinder } from '../electron/engine/dup/wiring';
 import { groupNameConflicts } from '../electron/engine/dup/detect';
 import { FULL_HASH_LIMIT_BYTES } from '../electron/engine/dup/hash';
+import { QuarantineStore, executeAct, registryKey } from '../electron/engine/dup/act';
+import type { ActRegistryEntry, QuarantineEntry, QuarantineErrorCode } from '../electron/engine/dup/act';
 import { BackupService, decideWriteGate } from '../electron/engine/service';
 import type {
   DupActRequest,
@@ -403,6 +407,66 @@ async function quarantineCandidates(local: string): Promise<string[]> {
     }
   }
   return [...new Set(candidates)];
+}
+
+// ------------------------------------------------ 隔离区索引可靠性工具
+
+/** 隔离区索引文件路径（固定为 `<隔离区目录>/index.json`） */
+function quarantineIndexPath(dir: string): string {
+  return path.join(dir, 'index.json');
+}
+
+/** 写一份隔离区索引；content 为字符串时原样写入（用于构造损坏索引） */
+async function writeQuarantineIndex(dir: string, content: unknown): Promise<string> {
+  const file = quarantineIndexPath(dir);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(file, typeof content === 'string' ? content : JSON.stringify(content, null, 2), 'utf8');
+  return file;
+}
+
+/** 临时目录：落在系统临时目录，用完即清理 */
+async function withTempDir(prefix: string, fn: (dir: string) => Promise<void>): Promise<void> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  try {
+    await fn(dir);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** 断言某个 Promise 以指定的隔离区错误码失败（可顺带校验消息） */
+async function expectQuarantineError(
+  promise: Promise<unknown>,
+  code: QuarantineErrorCode,
+  message?: RegExp,
+): Promise<Error> {
+  let caught: unknown;
+  let thrown = false;
+  try {
+    await promise;
+  } catch (err) {
+    thrown = true;
+    caught = err;
+  }
+  assert.ok(thrown, `预期抛出 ${code} 错误，实际没有抛错`);
+  const err = caught as Error & { code?: string };
+  assert.equal(err.code, code, `错误码应为 ${code}，实际 ${err.code}（${err.message}）`);
+  if (message) assert.match(err.message, message);
+  return err;
+}
+
+/** 构造一条结构合法的隔离区索引条目（可逐字段覆写） */
+function fakeQuarantineEntry(dir: string, originalPath: string, overrides?: Partial<QuarantineEntry>): QuarantineEntry {
+  const id = overrides?.id ?? 'q-entry-1';
+  return {
+    id,
+    originalPath,
+    storedPath: path.join(dir, 'files', id, path.basename(originalPath)),
+    size: 11,
+    sha256: 'a'.repeat(64),
+    createdAt: 1_700_000_000_000,
+    ...overrides,
+  };
 }
 
 async function main(): Promise<void> {
@@ -1472,6 +1536,672 @@ async function main(): Promise<void> {
       for (const line of lines) {
         assert.equal(splitCsvLine(line).length, 11, `每行必须保持 11 列：${line}`);
       }
+    }));
+
+  // ------------------------------------------------ 隔离区索引可靠性回归（T1~T16）
+
+  await test('T1 隔离区索引不存在时 list() 返回空数组（不得抛错）', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const store = new QuarantineStore(dir);
+      const items = await store.list();
+      assert.deepEqual(items, [], '索引不存在应等价于「隔离区是空的」');
+    }));
+
+  await test('T2 正常索引：六个字段逐一相等', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(outside, { recursive: true });
+      const entry = fakeQuarantineEntry(dir, path.join(outside, 'keep.txt'), {
+        id: 'q-keep',
+        size: 42,
+        sha256: 'b'.repeat(64),
+        createdAt: 1_700_000_000_000,
+      });
+      await writeQuarantineIndex(dir, { version: 1, updatedAt: 1_700_000_000_001, items: [entry] });
+      const items = await new QuarantineStore(dir).list();
+      assert.equal(items.length, 1);
+      const got = items[0];
+      assert.equal(got.id, entry.id);
+      assert.equal(got.originalPath, entry.originalPath);
+      assert.equal(got.storedPath, entry.storedPath);
+      assert.equal(got.size, entry.size);
+      assert.equal(got.sha256, entry.sha256);
+      assert.equal(got.createdAt, entry.createdAt);
+    }));
+
+  await test('T3 索引 JSON 损坏：list() 以 parse-failed 失败并说明索引已损坏', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      await writeQuarantineIndex(dir, '{not json');
+      await expectQuarantineError(
+        new QuarantineStore(dir).list(),
+        'parse-failed',
+        /索引[\s\S]*损坏/,
+      );
+    }));
+
+  await test('T4 索引版本号不对：以 version-mismatch 失败', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      await writeQuarantineIndex(dir, { version: 99, updatedAt: 1, items: [] });
+      await expectQuarantineError(new QuarantineStore(dir).list(), 'version-mismatch');
+    }));
+
+  await test('T5 索引条目缺字段：以 entry-invalid 失败并点名缺失字段', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(outside, { recursive: true });
+      const broken = {
+        id: 'q-broken',
+        originalPath: path.join(outside, 'keep.txt'),
+        // storedPath 缺失
+        size: 11,
+        sha256: 'a'.repeat(64),
+        createdAt: 1_700_000_000_000,
+      };
+      await writeQuarantineIndex(dir, { version: 1, updatedAt: 1, items: [broken] });
+      await expectQuarantineError(
+        new QuarantineStore(dir).list(),
+        'entry-invalid',
+        /storedPath/,
+      );
+    }));
+
+  await test('T6 索引条目字段类型不对（size 为字符串）：以 entry-invalid 失败并点名字段', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(outside, { recursive: true });
+      const entry = fakeQuarantineEntry(dir, path.join(outside, 'keep.txt'), { id: 'q-badsize' });
+      const broken = { ...entry, size: 'big' };
+      await writeQuarantineIndex(dir, { version: 1, updatedAt: 1, items: [broken] });
+      await expectQuarantineError(
+        new QuarantineStore(dir).list(),
+        'entry-invalid',
+        /size/,
+      );
+    }));
+
+  await test('T7 索引顶层结构不对（items 不是数组）：以 schema-invalid 失败', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      await writeQuarantineIndex(dir, { version: 1, updatedAt: 1, items: {} });
+      await expectQuarantineError(new QuarantineStore(dir).list(), 'schema-invalid');
+    }));
+
+  await test('T8 伪造越界 storedPath：拒绝还原，隔离区外的文件毫发无损', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const outsideDir = path.join(dir, 'outside');
+      await fs.mkdir(outsideDir, { recursive: true });
+      const precious = path.join(outsideDir, 'precious.txt');
+      await fs.writeFile(precious, 'precious-content', 'utf8');
+      const before = await fs.readdir(outsideDir);
+
+      // 伪造一条 storedPath 指向隔离区外真实文件的登记
+      const entry = fakeQuarantineEntry(dir, path.join(outsideDir, 'restore-target.txt'), {
+        id: 'q-forged',
+        storedPath: precious,
+      });
+      await writeQuarantineIndex(dir, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(dir);
+      const outcome = await store.restore('q-forged');
+      assert.equal(outcome.restored, false, '越界路径不得被还原');
+      assert.match(outcome.reason ?? '', /越出|非法/, '必须说明路径越界');
+      // 外部文件仍在原处、内容未变
+      assert.equal(await fs.readFile(precious, 'utf8'), 'precious-content');
+      // 隔离区外不得新增任何文件或目录
+      assert.deepEqual(await fs.readdir(outsideDir), before, '隔离区外不得被创建任何新东西');
+      // 索引记录仍保留（还原失败不销账）
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-forged');
+    }));
+
+  await test('T9 originalPath 含 .. 逃逸：拒绝还原且不得在越界位置创建任何东西', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const outsideDir = path.join(dir, 'outside');
+      await fs.mkdir(outsideDir, { recursive: true });
+      const escapeDir = path.join(dir, 'escaped-target');
+      // 字面量保留 `..`（path.join 会把它规范化掉，这里必须手工拼接）
+      const originalPath = `${outsideDir}${path.sep}..${path.sep}escaped-target${path.sep}file.txt`;
+      const entry = fakeQuarantineEntry(dir, originalPath, { id: 'q-escape' });
+      await writeQuarantineIndex(dir, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(dir);
+      const outcome = await store.restore('q-escape');
+      assert.equal(outcome.restored, false, '含 .. 的原路径不得被还原');
+      assert.match(outcome.reason ?? '', /越出|非法/);
+      // 逃逸目标目录不得被创建
+      await assert.rejects(fs.stat(escapeDir), { code: 'ENOENT' }, '逃逸目标目录不得被创建');
+      await assert.rejects(fs.stat(path.join(escapeDir, 'file.txt')), { code: 'ENOENT' });
+    }));
+
+  await test('T10 索引读取失败（用「索引文件是目录」模拟权限拒绝）：报 read-failed，不得当成空清单', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const file = quarantineIndexPath(dir);
+      await fs.mkdir(file, { recursive: true }); // 目录占位 → 读索引必然失败
+      // 平台差异探测：读目录必须报错，否则本用例无法模拟 I/O 失败
+      let code: string | undefined;
+      try {
+        await fs.readFile(file, 'utf8');
+      } catch (err) {
+        code = (err as { code?: string }).code;
+      }
+      if (!code || code === 'ENOENT') {
+        console.log('     SKIP T10：本平台读目录不报错，无法模拟索引读取失败');
+        return;
+      }
+      const store = new QuarantineStore(dir);
+      await expectQuarantineError(store.list(), 'read-failed', /读取失败/);
+    }));
+
+  await test('T11 索引异常时原始隔离文件不被删除：第二次降级报失败且既有记录不丢', () =>
+    withTempDir('dup-q-act-', async (dir) => {
+      const root = path.join(dir, 'scan');
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      await fs.mkdir(root, { recursive: true });
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+
+      const content = blob('quarantine-index-broken');
+      const sha256 = createHash('sha256').update(content).digest('hex');
+      const first = await put(root, 'a/one.txt', content);
+      const second = await put(root, 'b/two.txt', content);
+      const third = await put(root, 'c/three.txt', content);
+
+      const groupId = 'group-t11';
+      const registry = new Map<string, ActRegistryEntry>();
+      const members: string[] = [];
+      // 三份同内容同组：只删其中两份，「每组至少留一份」的硬约束才不会先一步拦下本用例
+      const targets = [first, second, third];
+      for (const [index, absPath] of targets.entries()) {
+        const stat = await fs.stat(absPath);
+        const id = `t11-item-${index}`;
+        registry.set(registryKey(absPath, groupId), {
+          id,
+          absPath,
+          relPath: path.basename(absPath),
+          sha256,
+          size: stat.size,
+          dev: String(stat.dev),
+          ino: String(stat.ino),
+          groupId,
+          category: 'identical',
+        });
+        members.push(id);
+      }
+      const groupMembers = new Map<string, string[]>([[groupId, members]]);
+      const requestOf = (absPath: string): DupActRequest['items'][number] => {
+        const entry = registry.get(registryKey(absPath, groupId))!;
+        return {
+          id: entry.id,
+          absPath: entry.absPath,
+          groupId: entry.groupId,
+          sha256: entry.sha256,
+          size: entry.size,
+          dev: entry.dev,
+          ino: entry.ino,
+        };
+      };
+      const actOne = async (absPath: string): Promise<DupActResult> =>
+        executeAct({
+          root,
+          items: [requestOf(absPath)],
+          category: 'identical',
+          registry,
+          groupMembers,
+          // 回收站不可用 → 走降级隔离
+          trash: async () => {
+            throw new Error('系统回收站不可用');
+          },
+          quarantineDirectory,
+          audit: () => true,
+        });
+
+      // 第一次：正常降级隔离
+      const firstOutcome = await actOne(first);
+      assert.equal(firstOutcome.deleted, 1);
+      assert.equal(firstOutcome.items[0].landedTo, 'quarantine');
+      const firstId = firstOutcome.items[0].quarantineId;
+      assert.ok(firstId, '降级后必须给出隔离区条目 id');
+      const storedFile = path.join(quarantineDirectory, 'files', firstId, path.basename(first));
+
+      // 把索引写坏：追加一条字段缺失的条目 → 整份索引不可读，
+      // 但第一条记录仍留在文件里，便于断言「既有记录没被冲掉」
+      const indexFile = quarantineIndexPath(quarantineDirectory);
+      const originalText = await fs.readFile(indexFile, 'utf8');
+      const parsed = JSON.parse(originalText) as { version: number; updatedAt: number; items: unknown[] };
+      parsed.items.push({ id: 'broken-entry' });
+      const brokenText = JSON.stringify(parsed, null, 2);
+      await fs.writeFile(indexFile, brokenText, 'utf8');
+
+      // 第二次：索引不可读 → 必须中止移入并如实报失败
+      const secondOutcome = await actOne(second);
+      assert.equal(secondOutcome.blocked, 0, '失败不得来自「至少留一份」等前置校验');
+      assert.equal(secondOutcome.failed, 1, '索引不可读时降级必须报失败');
+      assert.equal(secondOutcome.deleted, 0);
+      assert.equal(secondOutcome.items[0].outcome, 'failed');
+      // 源文件必须留在原处（不得被移走）
+      await fs.stat(second);
+      // 第一次隔离的实体文件仍在
+      await fs.stat(storedFile);
+      // 索引不得被这次失败覆盖，既有记录不得丢失
+      assert.equal(await fs.readFile(indexFile, 'utf8'), brokenText, '索引不得被失败的写入覆盖');
+      assert.ok(
+        (await fs.readFile(indexFile, 'utf8')).includes(firstId),
+        '第一次的索引记录不得被覆盖丢失',
+      );
+      // 组内第三份仍在（前置校验未被破坏）
+      await fs.stat(third);
+    }));
+
+  await test('T12 正常还原不受影响：清单 1 条 → 还原成功 → 原路径逐字节相等且清单变空', () =>
+    fixture(
+      { trash: async () => { throw new Error('系统回收站不可用'); } },
+      async ({ root, finder }) => {
+        const content = blob('restore-roundtrip');
+        await put(root, 'a/one.txt', content);
+        await put(root, 'b/two.txt', content);
+        const { status } = await scanWatch(finder, root);
+        const group = resultOf(status).identicalGroups[0];
+        const victim = group.entries[0];
+
+        const outcome = await finder.act(root, actRequest(root, group, [victim]));
+        assert.equal(outcome.deleted, 1);
+        assert.equal(outcome.items[0].landedTo, 'quarantine');
+        const quarantineId = outcome.items[0].quarantineId;
+        assert.ok(quarantineId);
+
+        const listed = await finder.listQuarantine();
+        assert.equal(listed.length, 1);
+        assert.equal(listed[0].id, quarantineId);
+
+        const restored = await finder.restoreQuarantine(quarantineId);
+        assert.equal(restored.restored, true, `还原应当成功：${restored.reason ?? ''}`);
+        assert.deepEqual(await fs.readFile(victim.absPath), content, '还原后的内容必须逐字节相等');
+        assert.equal((await finder.listQuarantine()).length, 0, '还原后清单必须变空');
+      },
+    ));
+
+  await test('T13 还原成功后索引写失败：如实返回「已还原但索引更新失败」，不抛异常', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+
+      const content = 'restore-then-index-fail';
+      const originalPath = path.join(outside, 'restore-me.txt');
+      const entry = fakeQuarantineEntry(quarantineDirectory, originalPath, {
+        id: 'q-restore',
+        size: Buffer.byteLength(content),
+        // 登记的哈希必须是实体内容的真实哈希：
+        // 还原前要做内容校验（H-01），登记值与实体对不上时还原本就该被拒。
+        sha256: createHash('sha256').update(content).digest('hex'),
+      });
+      // 实体文件先就位
+      await fs.mkdir(path.dirname(entry.storedPath), { recursive: true });
+      await fs.writeFile(entry.storedPath, content, 'utf8');
+      const indexFile = await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      // 索引文件置为只读：读得到、覆盖写不进去（Windows 上覆盖只读文件会 EPERM）
+      await fs.chmod(indexFile, 0o444);
+      const store = new QuarantineStore(quarantineDirectory);
+      let outcome: { restored: boolean; path?: string; reason?: string } | undefined;
+      try {
+        outcome = await store.restore('q-restore');
+      } finally {
+        await fs.chmod(indexFile, 0o666);
+      }
+      assert.equal(outcome?.restored, true, '索引写失败不得把已完成的还原报成失败');
+      assert.match(outcome?.reason ?? '', /索引更新失败/);
+      // 文件确实回到了原处
+      assert.equal(await fs.readFile(originalPath, 'utf8'), content);
+      // 索引记录仍在（写失败意味着旧索引原封不动）
+      const raw = await fs.readFile(indexFile, 'utf8');
+      const parsed = JSON.parse(raw) as { items: { id: string }[] };
+      assert.equal(parsed.items.length, 1);
+      assert.equal(parsed.items[0].id, 'q-restore');
+    }));
+
+  await test('T14 隔离区实体文件已丢失：还原如实报失败且索引记录保留', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+
+      const originalPath = path.join(outside, 'gone.txt');
+      const entry = fakeQuarantineEntry(quarantineDirectory, originalPath, { id: 'q-missing' });
+      // 实体文件先创建、再手动删除（模拟隔离区实体丢失）
+      await fs.mkdir(path.dirname(entry.storedPath), { recursive: true });
+      await fs.writeFile(entry.storedPath, 'x', 'utf8');
+      await fs.rm(entry.storedPath, { force: true });
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-missing');
+      assert.equal(outcome.restored, false, '实体缺失时不得报还原成功');
+      assert.ok((outcome.reason ?? '').length > 0, '必须给出失败原因');
+      // 索引记录保留
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-missing');
+    }));
+
+  await test('T15 索引异常不得把已完成的删除误报成失败', () =>
+    fixture({}, async ({ root, local, finder }) => {
+      await put(root, 'a/one.txt', blob('trash-still-works'));
+      await put(root, 'b/two.txt', blob('trash-still-works'));
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      const victim = group.entries[0];
+
+      // 隔离区索引写坏：删除后的隔离区刷新必然失败
+      const quarantineDirectory = path.join(local, 'quarantine');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.writeFile(path.join(quarantineDirectory, 'index.json'), '{not json', 'utf8');
+
+      const outcome = await finder.act(root, actRequest(root, group, [victim]));
+      assert.equal(outcome.items[0].outcome, 'deleted', '删除已完成就不得被报成失败');
+      assert.equal(outcome.deleted, 1);
+      assert.equal(outcome.failed, 0);
+    }));
+
+  await test('T16 索引损坏时 listQuarantine 必须抛错并带中文原因', () =>
+    fixture({}, async ({ local, finder }) => {
+      const quarantineDirectory = path.join(local, 'quarantine');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.writeFile(path.join(quarantineDirectory, 'index.json'), '{not json', 'utf8');
+
+      await assert.rejects(
+        () => finder.listQuarantine(),
+        (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          assert.match(message, /隔离区不可读取/);
+          assert.match(message, /损坏/, '必须带上中文原因');
+          return true;
+        },
+      );
+    }));
+
+  await test('T17 隔离区实体被换成同样大小的其它内容：还原被拒，实体与索引记录都保留', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+
+      const originalContent = Buffer.alloc(64, 0x41);
+      const replacedContent = Buffer.alloc(64, 0x42); // 同样大小、不同内容
+      const originalPath = path.join(outside, 'restore-me.txt');
+      const entry = fakeQuarantineEntry(quarantineDirectory, originalPath, {
+        id: 'q-swapped',
+        size: originalContent.length,
+        sha256: createHash('sha256').update(originalContent).digest('hex'),
+      });
+      await fs.mkdir(path.dirname(entry.storedPath), { recursive: true });
+      await fs.writeFile(entry.storedPath, originalContent);
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      // 实体被换成同样大小、不同内容：只看大小放行就会把错误内容写回用户原路径
+      await fs.writeFile(entry.storedPath, replacedContent);
+
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-swapped');
+      assert.equal(outcome.restored, false, '内容被替换时不得还原');
+      assert.match(outcome.reason ?? '', /校验不通过/, '必须明确说明内容校验不通过');
+      // 实体仍在隔离区（不得被移动）
+      assert.deepEqual(await fs.readFile(entry.storedPath), replacedContent, '实体文件必须留在隔离区');
+      // 索引记录仍在（还原失败不销账）
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-swapped');
+      // 原路径未被写入
+      await assert.rejects(fs.stat(originalPath), { code: 'ENOENT' }, '原路径不得被写入');
+    }));
+
+  await test('T18 隔离区实体大小与登记不符：还原被拒，实体与索引记录都保留', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+
+      const originalPath = path.join(outside, 'restore-me.txt');
+      const entry = fakeQuarantineEntry(quarantineDirectory, originalPath, {
+        id: 'q-resized',
+        size: 64,
+        sha256: createHash('sha256').update(Buffer.alloc(64, 0x41)).digest('hex'),
+      });
+      await fs.mkdir(path.dirname(entry.storedPath), { recursive: true });
+      // 内容相同但大小变了：大小这一关必须先挡住
+      await fs.writeFile(entry.storedPath, Buffer.alloc(32, 0x41));
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-resized');
+      assert.equal(outcome.restored, false, '大小不符时不得还原');
+      assert.match(outcome.reason ?? '', /大小/, '必须说明大小与登记不符');
+      // 实体仍在隔离区
+      assert.equal((await fs.stat(entry.storedPath)).size, 32);
+      // 索引记录仍在
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-resized');
+      // 原路径未被写入
+      await assert.rejects(fs.stat(originalPath), { code: 'ENOENT' });
+    }));
+
+  await test('T19 隔离区实体被换成指向外部目录的联接：还原被拒，外部文件毫发无损', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+      const precious = path.join(outside, 'precious.txt');
+      await fs.writeFile(precious, 'precious-content', 'utf8');
+      const before = await fs.readdir(outside);
+
+      const originalPath = path.join(outside, 'restore-me.txt');
+      const entry = fakeQuarantineEntry(quarantineDirectory, originalPath, { id: 'q-junction' });
+      await fs.mkdir(path.dirname(entry.storedPath), { recursive: true });
+      // 目录联接（junction 不需要管理员权限）
+      try {
+        await fs.symlink(outside, entry.storedPath, 'junction');
+      } catch (err) {
+        console.log(`     SKIP T19：本平台无法创建目录联接（${(err as Error).message}）`);
+        return;
+      }
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-junction');
+      assert.equal(outcome.restored, false, '联接指向隔离区外时不得还原');
+      assert.ok((outcome.reason ?? '').length > 0, '必须给出拒绝原因');
+      // 外部文件仍在原处、内容未变
+      assert.equal(await fs.readFile(precious, 'utf8'), 'precious-content');
+      // 隔离区外未被创建新东西
+      assert.deepEqual(await fs.readdir(outside), before, '隔离区外不得被创建任何新东西');
+      // 索引记录仍在
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-junction');
+    }));
+
+  await test('T20 存放路径大小写与登记值不一致：还原被拒（授权以登记值为准）', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+
+      const originalPath = path.join(outside, 'restore-me.txt');
+      // 登记值用大写写法：Windows 上它指向同一个文件，但授权必须以登记值为准
+      const entry = fakeQuarantineEntry(quarantineDirectory, originalPath, {
+        id: 'q-case',
+        storedPath: path.join(quarantineDirectory, 'files', 'q-case', 'RESTORE-ME.TXT'),
+      });
+      await fs.mkdir(path.dirname(entry.storedPath), { recursive: true });
+      await fs.writeFile(entry.storedPath, 'x', 'utf8');
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-case');
+      assert.equal(outcome.restored, false, '大小写变体不得被当成合法登记放行');
+      assert.ok((outcome.reason ?? '').length > 0, '必须给出拒绝原因');
+      // 索引记录仍在
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-case');
+      // 原路径未被写入
+      await assert.rejects(fs.stat(originalPath), { code: 'ENOENT' });
+    }));
+
+  await test('T21 隔离区实体位置是一个目录：还原被拒', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+
+      const originalPath = path.join(outside, 'restore-me.txt');
+      const entry = fakeQuarantineEntry(quarantineDirectory, originalPath, { id: 'q-dir' });
+      // 实体位置放一个目录
+      await fs.mkdir(entry.storedPath, { recursive: true });
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-dir');
+      assert.equal(outcome.restored, false, '实体是目录时不得还原');
+      assert.match(outcome.reason ?? '', /不是普通文件/, '必须说明实体不是普通文件');
+      // 目录仍在隔离区
+      assert.ok((await fs.stat(entry.storedPath)).isDirectory());
+      // 索引记录仍在
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-dir');
+    }));
+
+  await test('T22 自指条目（原路径与存放路径相同）：还原被拒，实体与索引记录都保留', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+
+      const storedPath = path.join(quarantineDirectory, 'files', 'q-self', 'self.txt');
+      const entry = fakeQuarantineEntry(quarantineDirectory, storedPath, { id: 'q-self' });
+      await fs.mkdir(path.dirname(storedPath), { recursive: true });
+      await fs.writeFile(storedPath, 'self', 'utf8');
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-self');
+      assert.equal(outcome.restored, false, '自指条目不得被还原');
+      assert.ok((outcome.reason ?? '').length > 0, '必须给出拒绝原因');
+      // 实体仍在隔离区（不得被移动，也不得被销账）
+      assert.equal(await fs.readFile(storedPath, 'utf8'), 'self');
+      // 索引记录仍在
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-self');
+    }));
+
+  await test('T23 原路径位于隔离区目录内部：还原被拒', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+
+      // 原路径落在隔离区目录内部（但与存放路径不同）
+      const originalPath = path.join(quarantineDirectory, 'other', 'inner.txt');
+      const entry = fakeQuarantineEntry(quarantineDirectory, originalPath, { id: 'q-inside' });
+      await fs.mkdir(path.dirname(entry.storedPath), { recursive: true });
+      await fs.writeFile(entry.storedPath, 'inner', 'utf8');
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-inside');
+      assert.equal(outcome.restored, false, '原路径在隔离区内部时不得还原');
+      assert.match(outcome.reason ?? '', /越出|非法/, '必须说明路径非法');
+      // 索引记录仍在
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-inside');
+    }));
+
+  await test('T24 越界存放路径 + 覆盖开关：仍然拒绝还原，隔离区外毫发无损', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+      const precious = path.join(outside, 'precious.txt');
+      await fs.writeFile(precious, 'precious-content', 'utf8');
+      const before = await fs.readdir(outside);
+
+      const entry = fakeQuarantineEntry(quarantineDirectory, path.join(outside, 'restore-target.txt'), {
+        id: 'q-overwrite',
+        storedPath: precious,
+      });
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(quarantineDirectory);
+      // overwrite = true：覆盖开关不得绕过路径边界
+      const outcome = await store.restore('q-overwrite', true);
+      assert.equal(outcome.restored, false, '覆盖开关不得绕过边界校验');
+      assert.match(outcome.reason ?? '', /越出|非法|不一致/, '必须说明路径非法');
+      // 外部文件仍在原处、内容未变
+      assert.equal(await fs.readFile(precious, 'utf8'), 'precious-content');
+      assert.deepEqual(await fs.readdir(outside), before, '隔离区外不得被创建任何新东西');
+      // 索引记录仍在
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-overwrite');
+    }));
+
+  await test('T25 隔离区索引不可读：status() 带上 quarantineError.code，恢复后被清空', () =>
+    fixture({}, async ({ local, finder }) => {
+      const quarantineDirectory = path.join(local, 'quarantine');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      const indexFile = path.join(quarantineDirectory, 'index.json');
+      await fs.writeFile(indexFile, '{not json', 'utf8');
+
+      await assert.rejects(
+        () => finder.listQuarantine(),
+        (err: unknown) => {
+          // 错误码必须保留（跨 IPC 后调用方靠 code 区分失败类别）
+          assert.equal((err as { code?: string }).code, 'parse-failed');
+          return true;
+        },
+      );
+
+      const broken = await finder.status();
+      assert.ok(broken.quarantineError, 'status() 必须带上 quarantineError');
+      assert.equal(broken.quarantineError?.code, 'parse-failed');
+      assert.match(broken.quarantineError?.message ?? '', /损坏/, '必须带上中文原因');
+
+      // 索引恢复正常 → 该字段必须被清空
+      await fs.writeFile(indexFile, JSON.stringify({ version: 1, updatedAt: 1, items: [] }), 'utf8');
+      await finder.listQuarantine();
+      const healed = await finder.status();
+      assert.equal(healed.quarantineError, undefined, '索引恢复正常后必须清空 quarantineError');
+    }));
+
+  await test('T26 存放路径是 UNC 网络路径：还原被拒', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+
+      const entry = fakeQuarantineEntry(quarantineDirectory, path.join(dir, 'outside', 'restore-me.txt'), {
+        id: 'q-unc',
+        // UNC 在 Windows 上是一条越界通道
+        storedPath: '\\\\server\\share\\payload.txt',
+      });
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-unc');
+      assert.equal(outcome.restored, false, 'UNC 路径不得被还原');
+      assert.ok((outcome.reason ?? '').length > 0, '必须给出拒绝原因');
+      // 索引记录仍在
+      const items = await store.list();
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, 'q-unc');
     }));
 
   // ------------------------------------------------ 阶段覆盖汇总

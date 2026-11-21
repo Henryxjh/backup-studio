@@ -35,6 +35,7 @@ import type {
   DupSuppression,
 } from '../../shared/dup-types';
 import type { BackupAPI, PlanPayload, ProgressPayload, StartOptions } from './api';
+import type { BackupRevealRequest, BackupRevealResult } from '../../shared/reveal-types';
 
 type Handler<T> = (payload: T) => void;
 
@@ -387,9 +388,22 @@ export function createMockApi(): BackupAPI {
   let dupCurrentRoot = '';
   /** 本机隔离区条目：模拟系统回收站不可用时的降级落地，可还原（FR-08） */
   let dupQuarantine: DupQuarantineEntry[] = [];
+  /**
+   * 浏览器演示：隔离区索引读不出来的状态。
+   *
+   * 真实引擎在索引损坏时会让 listQuarantine **reject**（界面显示「隔离区（不可读）」），
+   * 绝不返回空清单——空清单等于告诉用户「文件都没了」。这里用同样的语义演示。
+   *
+   * 损坏状态**不会**因为「重试」而消失：真实引擎里索引坏着就一直是坏的，
+   * 「重试」只是重新读一次。只有显式修复（重写隔离区索引）或重新初始化才恢复。
+   */
+  let dupQuarantineBroken = false;
   // 浏览器演示：系统回收站不可用时删除降级到本机隔离区（FR-08）。
   // 演示约定：路径中带「归档」的文件模拟回收站不可用，其余走系统回收站。
   const DUP_QUARANTINE_MARK = '归档';
+  // 演示约定：落到隔离区的那份文件若带「已删除」标记，视为它的隔离区索引写坏了，
+  // 于是清单读不出来（需要显式修复索引或重新初始化才恢复）。
+  const DUP_QUARANTINE_BROKEN_MARK = '已删除';
   let dupProgress: DupProgress = {
     phase: 'idle',
     label: '待选目录',
@@ -470,6 +484,10 @@ export function createMockApi(): BackupAPI {
     canAct: dupPhase === 'ready' || dupPhase === 'done',
     currentRoot: dupCurrentRoot || undefined,
     quarantine: dupQuarantine,
+    // 索引不可读时状态里也必须带上原因（与真实引擎的 DupStatus 契约一致）
+    quarantineError: dupQuarantineBroken
+      ? { code: 'parse-failed', message: '隔离区索引 JSON 损坏，无法解析' }
+      : undefined,
   });
 
   const aggregateState = (): AutoRunState => {
@@ -561,6 +579,10 @@ export function createMockApi(): BackupAPI {
       size: 2_411_520,
       deletedAt: Date.now() - 86_400_000,
       jobId: 'demo-job-1',
+      // 列表阶段不重新计算哈希，有基线但尚未校验当前内容。
+      hashBaseline: true,
+      contentVerified: false,
+      contentState: 'unverified',
     },
     {
       id: 'r-2',
@@ -568,6 +590,10 @@ export function createMockApi(): BackupAPI {
       size: 4_820_224,
       deletedAt: Date.now() - 259_200_000,
       jobId: 'demo-job-1',
+      // 演示「旧条目没有哈希基线」：界面必须如实标出内容未经校验。
+      hashBaseline: false,
+      contentVerified: false,
+      contentState: 'unknown',
     },
     {
       // 预置「目标位置已被占用」的条目：还原时先报错，再由用户确认是否覆盖。
@@ -576,15 +602,29 @@ export function createMockApi(): BackupAPI {
       size: 1_048_576,
       deletedAt: Date.now() - 43_200_000,
       jobId: 'demo-job-2',
+      hashBaseline: true,
+      contentVerified: false,
+      contentState: 'unverified',
     },
   ];
 
   /** 每次都返回新对象，调用方拿到的快照不会与内部状态共享数组引用。 */
-  const recycleSnapshot = (targetRoot: string): RecycleBin => ({
-    targetRoot,
-    entries: recycleEntries.map((entry) => ({ ...entry })),
-    totalBytes: recycleEntries.reduce((sum, entry) => sum + entry.size, 0),
-  });
+  const recycleSnapshot = (targetRoot: string): RecycleBin => {
+    const usedBytes = recycleEntries.reduce((sum, entry) => sum + entry.size, 0);
+    return {
+      targetRoot,
+      entries: recycleEntries.map((entry) => ({ ...entry })),
+      totalBytes: usedBytes,
+      // 与真实引擎同口径：容量统计按实体实际字节，孤儿单独列出，不从占用里隐瞒。
+      limitBytes: 10 * 1024 ** 3,
+      usedBytes,
+      pendingBytes: 0,
+      orphanBytes: 0,
+      overLimit: false,
+      indexState: 'ok',
+      uncertainCount: 0,
+    };
+  };
 
   return {
     async pickDirectory(title: string) {
@@ -754,9 +794,15 @@ export function createMockApi(): BackupAPI {
       return current;
     },
 
-    async reveal(targetPath: string) {
-      // 浏览器演示：没有真实文件系统，按演示约定模拟「扫描后该文件已不存在」
-      if (targetPath.includes('已删除')) throw new Error('文件已不存在或不可访问');
+    async reveal(request: BackupRevealRequest): Promise<BackupRevealResult> {
+      // 浏览器演示：没有真实文件系统。定位契约只提交「作用域 + 动作」，
+      // 绝对路径由主进程裁决；业务拒绝以 { ok:false, code, message } 返回，不抛异常。
+      // 演示约定：动作 id 里带「已删除」的条目模拟「文件已不存在」。
+      const actionId = request.kind === 'action' ? request.actionId : '';
+      if (actionId.includes('已删除')) {
+        return { ok: false, code: 'NOT_FOUND', message: '文件已不存在或不可访问' };
+      }
+      return { ok: true };
     },
 
     async listRecycle(targetRoot: string): Promise<RecycleBin> {
@@ -776,6 +822,14 @@ export function createMockApi(): BackupAPI {
 
     async removeRecycle(targetRoot: string, id: string): Promise<RecycleBin> {
       if (!recycleEntries.some((entry) => entry.id === id)) throw new Error('回收项不存在');
+      recycleEntries = recycleEntries.filter((entry) => entry.id !== id);
+      return recycleSnapshot(targetRoot);
+    },
+
+    async retryRecycleCleanup(targetRoot: string, id: string): Promise<RecycleBin> {
+      const target = recycleEntries.find((entry) => entry.id === id);
+      if (!target) throw new Error('回收项不存在或已被处理');
+      if (!target.cleanupPending) throw new Error('该条目不是待收尾状态，不能收尾');
       recycleEntries = recycleEntries.filter((entry) => entry.id !== id);
       return recycleSnapshot(targetRoot);
     },
@@ -985,6 +1039,13 @@ export function createMockApi(): BackupAPI {
                 deletedAt: Date.now(),
               },
             ];
+            // 演示约定：写隔离区索引 = 重写索引文件，等价于用户显式修复了损坏的索引。
+            // 只有这种显式动作（或重新初始化）才能让清单重新可读，「重试」不行。
+            dupQuarantineBroken = false;
+            if (entry.absPath.includes(DUP_QUARANTINE_BROKEN_MARK)) {
+              // 演示约定：这份文件的隔离区索引写坏了
+              dupQuarantineBroken = true;
+            }
             items.push({
               id: item.id,
               absPath: item.absPath,
@@ -1060,6 +1121,13 @@ export function createMockApi(): BackupAPI {
         return { restored: true, path: entry.originalPath };
       },
       async listQuarantine() {
+        // 与真实引擎同语义：索引读不出来时必须 reject，界面据此显示「隔离区（不可读）」，
+        // 而不是回退成空清单（空清单会让用户以为文件已经没了）。
+        // 损坏状态**保持不变**：真实引擎里索引坏着就一直是坏的，
+        // 「重试」只是重新读一次，不会自动修好——演示里也不许把重试伪装成「用户修复成功」。
+        if (dupQuarantineBroken) {
+          throw new Error('隔离区不可读取：隔离区索引 JSON 损坏，无法解析');
+        }
         return dupQuarantine;
       },
       async reveal(root: string, absPath: string) {

@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import type { CopyResult } from '../electron/engine/pool';
+// 事务清理是纯逻辑，不依赖编译产物：直接引入源码，避免与并发改动互相阻塞。
+import { BackupTransaction } from '../electron/engine/transaction';
+import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
 import type { AppState, SyncMode } from '../shared/types';
 
 // The service launches copyWorker.js alongside itself. Use the existing Electron build.
@@ -435,4 +438,169 @@ test('首次删除实际成功后进程退出，恢复不重删且保留重新�
   assert.deepEqual(await fs.readFile(f.targetFile), oldPayload);
   assert.deepEqual(await fs.readFile(manifestPath(f.target)), committedIndex);
   assert.equal(await f.store.getActive(), null);
+});
+
+/** 同一个名字换一种大小写写法（只改字母大小写，不改结构）。 */
+function swapCase(name: string): string {
+  return name.replace(/[a-zA-Z]/g, (letter) => (letter === letter.toUpperCase() ? letter.toLowerCase() : letter.toUpperCase()));
+}
+
+async function readIfExists(file: string): Promise<string | null> {
+  return fs.readFile(file, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+}
+
+/** 事务历史清理夹具：把源文件归档进事务历史目录，模拟真实归档布局。 */
+interface ArchiveFixture {
+  transaction: BackupTransaction;
+  /** 归档一个文件，返回它在事务历史里的路径。 */
+  archive: (relative: string, content: string) => Promise<string>;
+}
+
+async function archiveFixture(t: TestContext): Promise<ArchiveFixture> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-archive-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const transaction = new BackupTransaction(root, randomUUID(), async () => {});
+  const source = path.join(root, 'source');
+  await fs.mkdir(source, { recursive: true });
+  return {
+    transaction,
+    archive: async (relative: string, content: string) => {
+      const file = path.join(source, relative);
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, content);
+      const archived = await transaction.preserveTarget(file);
+      assert.ok(archived, '归档必须成功');
+      return archived.archivePath;
+    },
+  };
+}
+
+test('220 字符文件名归档成功且临时名独立于原 basename', async (t) => {
+  const f = await archiveFixture(t);
+  const basename = 'a'.repeat(220);
+  const bytes = Buffer.from('long filename archive payload');
+  const file = path.join(f.transaction.root, 'source', basename);
+  await fs.writeFile(file, bytes);
+  const copyFile = fs.copyFile;
+  const temporaryNames: string[] = [];
+  t.mock.method(fs, 'copyFile', async (...args: Parameters<typeof copyFile>) => {
+    if (String(args[0]) === file) temporaryNames.push(String(args[1]));
+    return copyFile(...args);
+  });
+  const archived = await f.transaction.preserveTarget(file, bytes.length);
+  assert.ok(archived);
+  assert.equal(path.relative(historyDir(f.transaction.root), archived.archivePath).split(path.sep).slice(1).join(path.sep),
+    path.join('source', basename), '返回的 archivePath 必须是最终归档路径');
+  assert.equal(archived.sha256, sha256(bytes));
+  assert.deepEqual(await fs.readFile(archived.archivePath), bytes);
+  assert.equal(temporaryNames.length, 1);
+  assert.equal(path.dirname(temporaryNames[0]), path.dirname(archived.archivePath));
+  assert.match(path.basename(temporaryNames[0]), /^\.backup-studio-archive-[0-9a-f]{32}$/);
+  assert.ok(!path.basename(temporaryNames[0]).includes(basename));
+  assert.deepEqual(await fs.readdir(path.dirname(archived.archivePath)), [basename], '归档目录不得残留临时文件');
+});
+
+test('归档临时名撞占用文件时重新选择且不覆盖原内容', async (t) => {
+  const f = await archiveFixture(t);
+  const file = path.join(f.transaction.root, 'source', 'collision.bin');
+  await fs.writeFile(file, 'archive payload');
+  const lstat = fs.lstat;
+  let occupied: string | undefined;
+  t.mock.method(fs, 'lstat', async (...args: Parameters<typeof lstat>) => {
+    const candidate = String(args[0]);
+    if (!occupied && /^\.backup-studio-archive-[0-9a-f]{32}$/.test(path.basename(candidate))) {
+      occupied = candidate;
+      await fs.writeFile(candidate, 'existing sentinel');
+    }
+    return lstat(...args);
+  });
+  const archived = await f.transaction.preserveTarget(file);
+  assert.ok(archived);
+  assert.ok(occupied);
+  assert.equal(path.dirname(occupied), path.dirname(archived.archivePath));
+  assert.equal(await fs.readFile(occupied, 'utf8'), 'existing sentinel');
+  assert.equal(await fs.readFile(archived.archivePath, 'utf8'), 'archive payload');
+  assert.deepEqual((await fs.readdir(path.dirname(archived.archivePath))).sort(),
+    [path.basename(occupied), path.basename(archived.archivePath)].sort());
+});
+
+test('清理事务历史：受保护目录与文件跨大小写都必须保留，未受保护的照常清理', async (t) => {
+  await t.test('受保护目录用磁盘实际大小写传入，子文件保留', async (t) => {
+    const f = await archiveFixture(t);
+    const keep = await f.archive('Protected/keep.bin', 'keep');
+    const deep = await f.archive('Protected/Nested/deep.bin', 'deep');
+    const stale = await f.archive('Stale/old.bin', 'old');
+    await f.transaction.cleanup(new Set([path.dirname(keep)]));
+    assert.equal(await readIfExists(keep), 'keep', '受保护目录里的文件必须保留');
+    assert.equal(await readIfExists(deep), 'deep', '受保护目录的整棵子树必须保留');
+    assert.equal(await readIfExists(stale), null, '未被引用的旧归档必须清理');
+  });
+
+  await t.test('受保护目录用另一种大小写传入，子文件同样保留', async (t) => {
+    const f = await archiveFixture(t);
+    const keep = await f.archive('Protected/keep.bin', 'keep');
+    const deep = await f.archive('Protected/Nested/deep.bin', 'deep');
+    // 同一个目录换一种大小写写法传入：调用方记下的写法与磁盘上的写法可能不同。
+    const protectedDir = path.join(path.dirname(path.dirname(keep)), swapCase('Protected'));
+    await f.transaction.cleanup(new Set([protectedDir]));
+    assert.equal(await readIfExists(keep), 'keep', '受保护目录换一种大小写写法也必须整棵子树保留');
+    assert.equal(await readIfExists(deep), 'deep', '受保护目录换一种大小写写法也必须整棵子树保留');
+  });
+
+  await t.test('受保护文件用另一种大小写传入，该文件保留', async (t) => {
+    const f = await archiveFixture(t);
+    const keep = await f.archive('Protected/keep.bin', 'keep');
+    const stale = await f.archive('Stale/old.bin', 'old');
+    const protectedFile = path.join(path.dirname(keep), swapCase('keep.bin'));
+    await f.transaction.cleanup(new Set([protectedFile]));
+    const kept = await readIfExists(keep);
+    if (CASE_INSENSITIVE_PATHS) {
+      assert.equal(kept, 'keep', '大小写不敏感的文件系统上，受保护文件必须跨大小写保留');
+    } else {
+      assert.equal(kept, null, '大小写敏感的文件系统上，另一种大小写指向另一个实体，文件级保护按平台规则精确匹配');
+    }
+    assert.equal(await readIfExists(stale), null, '未受保护的旧归档必须清理');
+  });
+
+  await t.test('未受保护的文件和崩溃残留临时名仍然会被清理', async (t) => {
+    const f = await archiveFixture(t);
+    const keep = await f.archive('Protected/keep.bin', 'keep');
+    const stale = await f.archive('Stale/old.bin', 'old');
+    const loose = await f.archive('loose.bin', 'loose');
+    const protectedResidue = path.join(path.dirname(keep), `.backup-studio-archive-${'a'.repeat(32)}`);
+    const staleResidue = path.join(path.dirname(stale), `.backup-studio-archive-${'b'.repeat(32)}`);
+    await fs.writeFile(protectedResidue, 'protected residue');
+    await fs.writeFile(staleResidue, 'stale residue');
+    await f.transaction.cleanup(new Set([path.dirname(keep)]));
+    assert.equal(await readIfExists(keep), 'keep', '受保护目录里的文件必须保留');
+    assert.equal(await readIfExists(protectedResidue), 'protected residue', '受保护目录里的临时残留也不得误删');
+    assert.equal(await readIfExists(stale), null, '未被引用的旧归档必须清理');
+    assert.equal(await readIfExists(staleResidue), null, '未受保护的临时残留必须清理');
+    assert.equal(await readIfExists(loose), null, '未被引用的旧归档必须清理');
+    await assert.rejects(fs.stat(path.dirname(stale)), { code: 'ENOENT' }, '空目录必须一并清理');
+  });
+
+  await t.test('大小写敏感卷上只差大小写的兄弟目录按保守处理', async (t) => {
+    const f = await archiveFixture(t);
+    const keep = await f.archive('Protected/keep.bin', 'keep');
+    const parent = path.dirname(path.dirname(keep));
+    const first = path.join(parent, 'Sibling');
+    const second = path.join(parent, swapCase('Sibling'));
+    try {
+      await fs.mkdir(first);
+      await fs.mkdir(second);
+    } catch {
+      t.skip('当前文件系统大小写不敏感，无法构造只差大小写的兄弟目录');
+      return;
+    }
+    await fs.writeFile(path.join(first, 'keep.bin'), 'keep');
+    await fs.writeFile(path.join(second, 'other.bin'), 'other');
+    await f.transaction.cleanup(new Set([first]));
+    assert.equal(await readIfExists(path.join(first, 'keep.bin')), 'keep');
+    assert.equal(await readIfExists(path.join(second, 'other.bin')), 'other',
+      '只差大小写的兄弟目录按「拿不准就不删」保守保留');
+  });
 });

@@ -28,6 +28,8 @@ interface Props {
   previewLimit?: number;
   /** 打开归档目录的入口（仅「镜像并保留历史」可用）。 */
   onRevealArchive?: () => void;
+  /** 归档目录定位失败的原因（如作用域已过期）；只提示，不改写备份状态。 */
+  revealArchiveError?: string;
 }
 
 const ROW_HEIGHT = 30;
@@ -104,6 +106,7 @@ export function PlanPanel({
   totalActions,
   previewLimit,
   onRevealArchive,
+  revealArchiveError,
 }: Props) {
   const groups = useMemo(() => {
     const buckets = new Map<ActionType, PlanAction[]>();
@@ -193,9 +196,17 @@ export function PlanPanel({
           ))}
         </div>
         {syncMode === 'mirror-archive' && onRevealArchive ? (
-          <button type="button" className="btn btn-sm" onClick={onRevealArchive}>
-            查看归档目录
-          </button>
+          <>
+            <button type="button" className="btn btn-sm" onClick={onRevealArchive}>
+              查看归档目录
+            </button>
+            {revealArchiveError ? (
+              <div className="plan-warning" data-tone="danger" role="alert">
+                <IconAlert size={13} className="icon-inline" />
+                <span className="plan-warning-text">{revealArchiveError}</span>
+              </div>
+            ) : null}
+          </>
         ) : null}
       </div>
 

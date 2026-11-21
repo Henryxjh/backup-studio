@@ -303,6 +303,8 @@ export interface DupActRequest {
  * 系统回收站不可用时，删除的文件被移动到本机隔离区而不是被丢弃，
  * 必须可列出、可还原——否则用户重启后就再也找不回这些文件。
  */
+export type DupQuarantineErrorCode = 'read-failed' | 'parse-failed' | 'version-mismatch' | 'schema-invalid' | 'entry-invalid';
+
 export interface DupQuarantineEntry {
   /** 隔离区条目 id */
   id: string;
@@ -314,6 +316,10 @@ export interface DupQuarantineEntry {
   deletedAt: number;
   /** 已还原过（保留记录以便追溯，不再重复还原） */
   restored?: boolean;
+  /** 索引仍在，但隔离区实体文件已缺失 */
+  missing?: boolean;
+  /** 实体不可还原的已知原因 */
+  unavailableReason?: string;
 }
 
 /** 事件流条目（审计脱敏后写入，FR-19） */
@@ -354,6 +360,21 @@ export interface DupStatus {
   currentRoot?: string;
   /** 本机隔离区条目（FR-08 降级路径，可还原） */
   quarantine?: DupQuarantineEntry[];
+  /**
+   * 隔离区索引不可读。
+   *
+   * 非空表示隔离区索引读不出来（损坏 / 版本不符 / 条目非法）。
+   * 此时 `quarantine` 只是**上一次成功读到的快照**，不是完整清单——
+   * 磁盘上的文件仍在隔离区目录里，界面必须如实显示「不可读」。
+   *
+   * 带 `code` 是为了让调用方能区分失败类别，而不必去解析中文消息。
+   */
+  quarantineError?: {
+    /** 错误码 */
+    code: DupQuarantineErrorCode;
+    /** 可读原因 */
+    message: string;
+  };
 }
 
 /** 渲染层可调用的接口（主进程是唯一写入点，FR-20） */

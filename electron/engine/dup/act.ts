@@ -1,7 +1,7 @@
 import { promises as fs, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { DupActRequest, DupActResult, DupCategory } from '../../../shared/dup-types';
+import type { DupActRequest, DupActResult, DupCategory, DupQuarantineErrorCode } from '../../../shared/dup-types';
 import { hashPartialFile } from './hash';
 import { hashFile } from '../hash';
 import { writeJsonAtomic } from '../manifest';
@@ -101,6 +101,73 @@ function errorCode(err: unknown): string | undefined {
   return typeof code === 'string' ? code : undefined;
 }
 
+export type QuarantineErrorCode = DupQuarantineErrorCode;
+
+const ILLEGAL_RESTORE_PATH = '隔离区条目路径非法（越出隔离区目录），已拒绝还原';
+/** 存放路径与登记值不一致（大小写变体、被换成别的目录等） */
+const ILLEGAL_RESTORE_LAYOUT = '隔离区条目存放路径非法（与登记值不一致：大小写或所在目录不符），已拒绝还原';
+/** UNC / 网络盘：Windows 上它本身就是一条越界通道 */
+const ILLEGAL_RESTORE_NETWORK = '隔离区实体路径不得是网络盘 / UNC 路径，已拒绝还原';
+/** 自指条目：原路径与存放路径相同，还原等于把文件"还原"到它自己 */
+const ILLEGAL_RESTORE_SELF = '隔离区条目的原路径与存放路径相同（自指条目），已拒绝还原';
+/** 实体内容与登记哈希不一致：实体已被替换 */
+const CONTENT_MISMATCH = '隔离区副本内容校验不通过，可能已被替换，已拒绝还原';
+/** 旧索引没有登记哈希：跳过内容校验（必须如实说明，不得当成校验通过） */
+const CONTENT_NOT_CHECKED = '未登记哈希，未做内容校验';
+
+export class QuarantineIndexError extends Error {
+  readonly code: QuarantineErrorCode;
+  constructor(code: QuarantineErrorCode, message: string, cause?: unknown) {
+    super(message);
+    this.name = 'QuarantineIndexError';
+    this.code = code;
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
+class QuarantinePathError extends QuarantineIndexError {}
+
+function isOutside(relative: string): boolean {
+  return relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+}
+
+function isAbsolutePath(value: unknown): value is string {
+  return typeof value === 'string' && path.isAbsolute(value);
+}
+
+function hasParentSegment(value: string): boolean {
+  return value.split(/[\\/]+/).includes('..');
+}
+
+export function validateEntry(value: unknown, index: number): QuarantineEntry {
+  if (!value || typeof value !== 'object') throw new QuarantineIndexError('entry-invalid', `隔离区索引条目 ${index} 无效`);
+  const entry = value as Record<string, unknown>;
+  const requiredString = (field: string, predicate: (v: string) => boolean = () => true): string => {
+    const v = entry[field];
+    if (typeof v !== 'string' || !v || !predicate(v)) throw new QuarantineIndexError('entry-invalid', `隔离区索引条目 ${index} 字段 ${field} 缺失或类型无效`);
+    return v;
+  };
+  const id = requiredString('id');
+  const originalPath = requiredString('originalPath');
+  const storedPath = requiredString('storedPath');
+  for (const [field, value] of Object.entries({ originalPath, storedPath })) {
+    if (!isAbsolutePath(value) || hasParentSegment(value) || value.includes('\0')) {
+      throw new QuarantinePathError('entry-invalid', `隔离区索引条目 ${index} 字段 ${field} 路径非法`);
+    }
+  }
+  const size = entry.size;
+  if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) throw new QuarantineIndexError('entry-invalid', `隔离区索引条目 ${index} 字段 size 缺失或类型无效`);
+  // sha256 允许缺失/为空：旧索引里没有登记哈希时，还原必须**降级为「不做内容校验」**，
+  // 而不是让整条记录直接变成 entry-invalid——那会让旧索引里的文件再也还原不了。
+  if (entry.sha256 !== undefined && typeof entry.sha256 !== 'string') {
+    throw new QuarantineIndexError('entry-invalid', `隔离区索引条目 ${index} 字段 sha256 类型无效`);
+  }
+  const sha256 = typeof entry.sha256 === 'string' ? entry.sha256.trim() : '';
+  const createdAt = entry.createdAt;
+  if (typeof createdAt !== 'number' || !Number.isFinite(createdAt)) throw new QuarantineIndexError('entry-invalid', `隔离区索引条目 ${index} 字段 createdAt 缺失或类型无效`);
+  return { id, originalPath, storedPath, size, sha256, createdAt };
+}
+
 /** 网络盘 / UNC 路径：回收站语义不可靠，默认拒绝删除（FR-21） */
 export function isNetworkPath(target: string): boolean {
   const normalized = target.replace(/\//g, '\\');
@@ -162,13 +229,101 @@ export class QuarantineStore {
   }
 
   async list(): Promise<QuarantineEntry[]> {
+    let raw: string;
     try {
-      const raw = await fs.readFile(this.file, 'utf8');
-      const parsed = JSON.parse(raw) as QuarantineFile;
-      if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.items)) return [];
-      return parsed.items;
-    } catch {
-      return [];
+      raw = await fs.readFile(this.file, 'utf8');
+    } catch (err) {
+      if (errorCode(err) === 'ENOENT') return [];
+      throw new QuarantineIndexError('read-failed', `隔离区索引读取失败：${errorText(err)}`, err);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new QuarantineIndexError('parse-failed', '隔离区索引 JSON 损坏，无法解析', err);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new QuarantineIndexError('schema-invalid', '隔离区索引顶层结构无效');
+    const record = parsed as Record<string, unknown>;
+    if (record.version !== 1) throw new QuarantineIndexError('version-mismatch', '隔离区索引版本不受支持');
+    if (!Array.isArray(record.items)) throw new QuarantineIndexError('schema-invalid', '隔离区索引 items 结构无效');
+    return record.items.map((item, index) => validateEntry(item, index));
+  }
+
+  /**
+   * 路径授权：还原前必须确认这条登记指向的确实是隔离区里那一份文件。
+   *
+   * 授权**以登记值为准**，而不是以文件系统的解析结果为准：
+   * Windows 不区分大小写，`FILES\Q1\A.TXT` 与 `files\q1\a.txt` 指向同一个文件；
+   * 若按解析结果授权，伪造的大小写变体就会被当成合法条目放行。
+   * 因此存放路径必须与「隔离区目录 + 条目 id + 原文件名」**逐字相同**。
+   */
+  private assertInsideQuarantine(entry: QuarantineEntry): void {
+    const quarantineRoot = path.resolve(this.directory);
+    const filesRoot = path.join(quarantineRoot, 'files');
+    const storedPath = entry.storedPath;
+    const originalPath = entry.originalPath;
+    // UNC / 网络盘：Windows 上它本身就是一条越界通道，直接拒绝
+    if (isNetworkPath(storedPath)) throw new QuarantinePathError('entry-invalid', ILLEGAL_RESTORE_NETWORK);
+    const expectedStored = path.join(this.directory, 'files', entry.id, path.basename(originalPath));
+    if (storedPath !== expectedStored) throw new QuarantinePathError('entry-invalid', ILLEGAL_RESTORE_LAYOUT);
+    // 自指条目：原路径与存放路径相同，还原等于把文件"还原"到它自己——
+    // 结果是文件留在隔离区而索引记录被销账，用户再也找不到它。
+    if (path.resolve(originalPath) === path.resolve(storedPath)) {
+      throw new QuarantinePathError('entry-invalid', ILLEGAL_RESTORE_SELF);
+    }
+    const storedRel = path.relative(filesRoot, path.resolve(storedPath));
+    if (!storedRel || isOutside(storedRel)) throw new QuarantinePathError('entry-invalid', ILLEGAL_RESTORE_PATH);
+    const originalRel = path.relative(quarantineRoot, path.resolve(originalPath));
+    if (!isAbsolutePath(originalPath) || hasParentSegment(originalPath) || !isOutside(originalRel)) {
+      throw new QuarantinePathError('entry-invalid', ILLEGAL_RESTORE_PATH);
+    }
+  }
+
+  /**
+   * 检查隔离区实体是否可以还原。
+   *
+   * `verifyContent` 为真时**额外**做一次 SHA-256 内容校验：
+   * 只看大小是不够的——隔离区实体被换成同样大小的其它内容后，
+   * 仅凭大小放行会把错误内容写回用户原路径，用户无从察觉。
+   *
+   * 内容校验**只在还原路径上**做：清单刷新不读实体内容，
+   * 否则每次列清单都要把整个隔离区重算一遍哈希。
+   */
+  async checkStored(
+    entry: QuarantineEntry,
+    options: { verifyContent?: boolean } = {},
+  ): Promise<{ missing: boolean; reason?: string; contentChecked?: boolean; contentSkipped?: boolean }> {
+    try {
+      this.assertInsideQuarantine(entry);
+      const stat = await fs.lstat(entry.storedPath);
+      const root = await fs.realpath(this.directory);
+      const realStored = await fs.realpath(entry.storedPath);
+      if (isOutside(path.relative(path.join(root, 'files'), realStored))) {
+        return { missing: false, reason: ILLEGAL_RESTORE_PATH };
+      }
+      if (!stat.isFile()) return { missing: false, reason: '隔离区实体不是普通文件' };
+      if (stat.size !== entry.size) return { missing: false, reason: '隔离区实体大小与索引记录不符，已拒绝还原' };
+      if (options.verifyContent) {
+        const expected = entry.sha256.trim().toLowerCase();
+        if (!expected) {
+          // 旧索引没有登记哈希：跳过内容校验，但**不得**当成校验通过
+          return { missing: false, contentSkipped: true };
+        }
+        let actual: string;
+        try {
+          // 流式计算：大文件不整体读进内存（与扫描侧 hashFile 同一口径）
+          actual = (await hashFile(entry.storedPath)).toLowerCase();
+        } catch (err) {
+          return { missing: false, reason: `无法校验隔离区副本内容：${errorText(err)}` };
+        }
+        if (actual !== expected) return { missing: false, reason: CONTENT_MISMATCH };
+        return { missing: false, contentChecked: true };
+      }
+      return { missing: false };
+    } catch (err) {
+      if (err instanceof QuarantinePathError) return { missing: false, reason: err.message };
+      if (errorCode(err) === 'ENOENT') return { missing: true, reason: '隔离区实体文件缺失' };
+      return { missing: false, reason: `无法检查隔离区实体：${errorText(err)}` };
     }
   }
 
@@ -210,26 +365,56 @@ export class QuarantineStore {
    *
    * 还原失败时保留登记项：文件还在隔离区，用户可以再次尝试。
    * 目标位置已被占用时**默认拒绝**——静默覆盖会毁掉用户在那里的新文件。
+   *
+   * 还原前必须过三道关：路径授权 → 实体存在/大小 → **内容哈希**（H-01）。
+   * 内容校验在移动**之前**完成：实体被换成同样大小的其它内容时，
+   * 只看大小会把错误内容写回用户原路径。
    */
-  async restore(id: string, overwrite = false): Promise<{ restored: boolean; path?: string; reason?: string }> {
-    const items = await this.list();
+  async restore(id: string, overwrite = false, gate?: ActOptions['gate']): Promise<{ restored: boolean; path?: string; reason?: string }> {
+    let items: QuarantineEntry[];
+    try {
+      items = await this.list();
+    } catch (err) {
+      // 直接调用还原时，路径格式错误也是一次明确的拒绝；引擎仍须获知索引不可信。
+      if (err instanceof QuarantinePathError && !gate) return { restored: false, reason: ILLEGAL_RESTORE_PATH };
+      throw err;
+    }
     const entry = items.find((item) => item.id === id);
     if (!entry) return { restored: false, reason: '隔离区中没有这条记录，可能已被还原' };
-    if (!overwrite) {
-      try {
-        await fs.access(entry.originalPath, fsConstants.F_OK);
-        return { restored: false, reason: '目标位置已被占用，请确认覆盖后再试' };
-      } catch {
-        // 目标不存在：可以安全还原
-      }
+    // 便宜的检查先做：路径授权 + 实体存在性/大小
+    const checked = await this.checkStored(entry);
+    if (checked.reason) return { restored: false, reason: checked.reason };
+    if (gate) {
+      const verdict = await gate(path.dirname(entry.originalPath));
+      if (!verdict.allowed) return { restored: false, reason: verdict.reason ?? '写入闸门未放行，已拒绝还原' };
     }
+    // 旧索引没有登记哈希时，内容校验会被跳过——这里先记下来，还原成功后如实说明。
+    let contentSkipped = false;
     try {
-      await fs.mkdir(path.dirname(entry.originalPath), { recursive: true });
+      try {
+        const target = await fs.lstat(entry.originalPath);
+        if (!overwrite) return { restored: false, reason: '目标位置已被占用，请确认覆盖后再试' };
+        if (!target.isFile()) return { restored: false, reason: '还原目标不是普通文件，已拒绝覆盖' };
+      } catch (err) {
+        if (errorCode(err) !== 'ENOENT') throw err;
+      }
+      // 内容校验（SHA-256）：必须在移动之前完成
+      const verified = await this.checkStored(entry, { verifyContent: true });
+      if (verified.reason) return { restored: false, reason: verified.reason };
+      contentSkipped = verified.contentSkipped === true;
       await moveFile(entry.storedPath, entry.originalPath, overwrite);
     } catch (err) {
       return { restored: false, reason: `还原失败：${errorText(err)}` };
     }
-    await this.write(items.filter((item) => item.id !== id));
+    try {
+      await this.write(items.filter((item) => item.id !== id));
+    } catch {
+      return { restored: true, path: entry.originalPath, reason: '文件已还原，但隔离区索引更新失败，该条目可能仍显示在清单中' };
+    }
+    if (contentSkipped) {
+      // 本次还原**未做**内容校验：如实说明，不得让用户以为校验通过
+      return { restored: true, path: entry.originalPath, reason: CONTENT_NOT_CHECKED };
+    }
     return { restored: true, path: entry.originalPath };
   }
 }

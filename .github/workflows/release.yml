@@ -7,12 +7,19 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -38,8 +45,28 @@ jobs:
           node-version: 22
           cache: npm
 
+      # 版本门禁：tag 必须是严格 x.y.z，且与 package.json 版本一致。
+      # 放在 npm ci 之前，失败可快速中止，避免浪费构建时间。
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if ! [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' is not a strict x.y.z version (resolved: '$TAG_VERSION')."
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag version '$TAG_VERSION' does not match package.json version '$PKG_VERSION'."
+            exit 1
+          fi
+          echo "Version gate passed: $TAG_VERSION"
+
       - name: Install
         run: npm ci
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       - name: Typecheck
         run: npm run typecheck
@@ -47,16 +74,19 @@ jobs:
       - name: Build renderer
         run: npm run build:renderer
 
+      # 引擎测试依赖编译后的 dist-electron/electron/engine/copyWorker.js
       - name: Build electron
         run: npm run build:electron
 
-      - name: Engine tests
-        run: npm run test:engine
+      # 完整质量门禁：全部 8 套测试都跑，任一失败即阻断发布
+      - name: Run all tests
+        run: npm test
 
+      # --publish never：禁止 electron-builder 自带发布路径；
+      # --no-install：禁止 npx 回退到 registry 下载
       - name: Package
-        run: npx electron-builder --${{ matrix.target }} --x64
+        run: npx --no-install electron-builder --${{ matrix.target }} --x64 --publish never
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
           ELECTRON_BUILDER_BINARIES_MIRROR: https://npmmirror.com/mirrors/electron-builder-binaries/
 
@@ -70,14 +100,36 @@ jobs:
   publish:
     name: Publish release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: ${{ success() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      # 产物完整性断言：exe / AppImage / deb 三类必须齐全，缺任一类拒绝发布
+      - name: Verify all required artifacts are present
+        shell: bash
+        run: |
+          missing=0
+          for pattern in '*.exe' '*.AppImage' '*.deb'; do
+            count=$(find artifacts -type f -name "$pattern" | wc -l)
+            if [ "$count" -eq 0 ]; then
+              echo "::error::No artifact matching '$pattern' was found under artifacts/."
+              missing=1
+            else
+              echo "Found $count artifact(s) matching '$pattern'."
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Required artifacts are incomplete; refusing to publish a partial release."
+            exit 1
+          fi
+          echo "Artifact completeness check passed."
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

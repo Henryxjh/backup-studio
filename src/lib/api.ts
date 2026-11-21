@@ -10,6 +10,7 @@ import type {
 } from '../../shared/types';
 import type { AutoSyncApi } from '../../shared/aut-types';
 import type { DupApi } from '../../shared/dup-types';
+import type { BackupRevealRequest, BackupRevealResult, BackupRevealState } from '../../shared/reveal-types';
 
 export interface PlanPayload {
   actions: PlanAction[];
@@ -25,6 +26,8 @@ export interface PlanPayload {
   totalActions?: number;
   /** 预览上限，与 electron/engine/planner.ts 的 MAX_PREVIEW_ACTIONS 保持一致。 */
   previewLimit?: number;
+  /** 本次计划的定位授权作用域 ID；没有则表示当前不允许定位。 */
+  revealScopeId?: string;
 }
 
 /**
@@ -58,27 +61,35 @@ export interface BackupAPI {
   pickDirectory(title: string): Promise<string | null>;
   scan(sourceRoot: string, targetRoot: string): Promise<ScanOutcome>;
   plan(sourceRoot: string, targetRoot: string, syncMode: SyncMode): Promise<PlanPayload>;
-  start(options: StartOptions): Promise<AppState>;
-  pause(): Promise<AppState>;
-  resume(): Promise<AppState>;
-  cancel(): Promise<AppState>;
-  getState(): Promise<AppState>;
-  cleanupMeta(): Promise<AppState>;
+  start(options: StartOptions): Promise<BackupRevealState>;
+  pause(): Promise<BackupRevealState>;
+  resume(): Promise<BackupRevealState>;
+  cancel(): Promise<BackupRevealState>;
+  getState(): Promise<BackupRevealState>;
+  cleanupMeta(): Promise<BackupRevealState>;
   assess(targetRoot: string): Promise<{ assessment: MediaAssessment; state: AppState }>;
   health(targetRoot: string): Promise<import('../../shared/types').HealthReport>;
   reenumerate(targetRoot: string): Promise<import('../../shared/types').HealthReport>;
   repairDryRun(targetRoot: string, request: import('../../shared/types').RepairRequest): Promise<import('../../shared/types').RepairResult>;
   exportPartitionEvidence(targetRoot: string): Promise<{ auditId: string; guidance: string }>;
   capabilities(): Promise<import('../../shared/types').CapabilityRow[]>;
-  recover(confirmed: boolean): Promise<AppState>;
-  quarantine(reason: string): Promise<AppState>;
-  releaseQuarantine(): Promise<AppState>;
+  recover(confirmed: boolean): Promise<BackupRevealState>;
+  quarantine(reason: string): Promise<BackupRevealState>;
+  releaseQuarantine(): Promise<BackupRevealState>;
   /** 列出目标端的回收站快照（手动备份删除项的可还原副本）。 */
   listRecycle(targetRoot: string): Promise<RecycleBin>;
   /** 还原一条回收项；目标位置已被占用时需显式允许覆盖。 */
   restoreRecycle(targetRoot: string, id: string, overwrite: boolean): Promise<RecycleBin>;
   /** 彻底删除一条回收项，副本不可再恢复。 */
   removeRecycle(targetRoot: string, id: string): Promise<RecycleBin>;
+  /**
+   * 完成一条「待收尾」回收项的收尾。
+   *
+   * 用户已经还原过（或已彻底删除），但最终索引提交失败，条目与归档还留在原地。
+   * 这时不能重新还原或重新删除，只能把这次操作收尾：移除索引残留行，
+   * 并按需清理遗留的归档副本。
+   */
+  retryRecycleCleanup(targetRoot: string, id: string): Promise<RecycleBin>;
   autoSync: AutoSyncApi;
   /**
    * 重复文件检测。
@@ -88,9 +99,15 @@ export interface BackupAPI {
    * 只靠单次 act() 的返回值，重启后用户就再也找不回这些文件。
    */
   duplicateFinder: DupApi;
-  reveal(targetPath: string): Promise<void>;
+  /**
+   * 备份主线的「定位文件」。
+   *
+   * 渲染层只提交「作用域 + 动作」，绝对路径由主进程授权表裁决；
+   * 业务拒绝以 `{ ok: false, code, message }` 返回，不抛异常。
+   */
+  reveal(request: BackupRevealRequest): Promise<BackupRevealResult>;
   setTheme(mode: 'light' | 'dark' | 'system'): Promise<'light' | 'dark'>;
-  onState(cb: (state: AppState) => void): () => void;
+  onState(cb: (state: BackupRevealState) => void): () => void;
   onPlan(cb: (payload: PlanPayload) => void): () => void;
   onProgress(cb: (payload: ProgressPayload) => void): () => void;
   onAction(cb: (action: PlanAction) => void): () => void;

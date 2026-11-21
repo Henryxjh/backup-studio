@@ -1,17 +1,29 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { BackupService } from './engine/service';
+import { pathToFileURL } from 'node:url';
+import { BackupService, type StartOptions } from './engine/service';
 import { AutoSync } from './engine/aut';
 import { createWritePermit } from './engine/aut/bridge';
-import { DuplicateFinder } from './engine/dup';
+import { DuplicateFinder, QuarantineIndexError } from './engine/dup';
 import { createDuplicateFinder } from './engine/dup/wiring';
-import type { SyncMode } from '../shared/types';
+import { RevealAuthority, isRevealSender, revealError } from './engine/reveal-authority';
+import type { AppState, SyncMode } from '../shared/types';
 import type { AutoPairInput } from '../shared/aut-types';
 import type { DupActRequest, DupItemAction } from '../shared/dup-types';
+import type { BackupRevealState } from '../shared/reveal-types';
 let mainWindow: BrowserWindow | null = null;
 let service: BackupService | null = null;
 let autoSync: AutoSync | null = null;
 let duplicateFinder: DuplicateFinder | null = null;
+
+/**
+ * 「定位文件」的路径授权表。
+ *
+ * 渲染层不能自己给路径：只有引擎登记过的绝对路径才允许被定位，
+ * 授权随计划/任务的生命周期发布与撤销（见 registerIpc）。
+ */
+const revealAuthority = new RevealAuthority();
 
 const THEME_COLORS = {
   dark: { background: '#0b0b0a', overlay: '#151515', symbol: '#a9a9a4' },
@@ -86,6 +98,27 @@ function broadcast(channel: string, payload: unknown): void {
   }
 }
 
+/** 应用自身加载的页面地址：定位请求只接受主窗口主框架的这一次加载。 */
+function appEntryUrl(): string {
+  return pathToFileURL(path.join(__dirname, '../../dist/index.html')).href;
+}
+
+/** 引擎状态 + 当前授权作用域 ID。授权 ID 只由主进程装饰，引擎本身不持有。 */
+function withRevealScope(state: AppState): BackupRevealState {
+  return { ...state, revealScopeId: revealAuthority.scopeId };
+}
+
+/**
+ * 隔离区失败的结构化描述。
+ *
+ * 引擎侧的 `QuarantineIndexError.code` 必须跨 IPC 保留下来：
+ * 渲染层要靠它区分「索引读不出来」与「索引损坏」，不能只剩一句中文消息。
+ */
+function quarantineFailure(err: unknown): { code: string; message: string } {
+  const code = err instanceof QuarantineIndexError ? err.code : 'read-failed';
+  return { code, message: err instanceof Error ? err.message : String(err) };
+}
+
 function registerIpc(): void {
   const svc = service;
   if (!svc) throw new Error('备份服务尚未初始化');
@@ -101,41 +134,72 @@ function registerIpc(): void {
     return result.filePaths[0];
   });
 
-  ipcMain.handle('backup:scan', async (_event, sourceRoot: string, targetRoot: string) =>
-    svc.scan(sourceRoot, targetRoot),
-  );
+  ipcMain.handle('backup:scan', async (_event, sourceRoot: string, targetRoot: string) => {
+    // 重新扫描意味着根目录与计划都要重来：旧授权必须先作废。
+    revealAuthority.invalidate('scan');
+    return svc.scan(sourceRoot, targetRoot);
+  });
 
   ipcMain.handle(
     'backup:plan',
-    async (_event, sourceRoot: string, targetRoot: string, syncMode: SyncMode) =>
-      svc.plan(sourceRoot, targetRoot, syncMode),
+    async (_event, sourceRoot: string, targetRoot: string, syncMode: SyncMode) => {
+      const result = await svc.plan(sourceRoot, targetRoot, syncMode);
+      // 计划生成后立刻发布本次作用域：只有这次计划登记过的文件才允许被定位。
+      const scopeId = randomUUID();
+      await revealAuthority.publishPlan({
+        scopeId,
+        sourceRoot,
+        targetRoot,
+        actions: result.actions,
+        archive: syncMode === 'mirror-archive',
+      });
+      broadcast('backup:state', withRevealScope(svc.getState()));
+      return { ...result, revealScopeId: scopeId };
+    },
   );
 
-  ipcMain.handle('backup:start', async (_event, options) => {
+  ipcMain.handle('backup:start', async (_event, options: StartOptions) => {
+    // 开始前作废旧作用域：过期计划不得用于定位。
+    revealAuthority.invalidate('start');
     await svc.start(options);
-    return svc.getState();
+    const state = svc.getState();
+    // 任务作用域只绑定归档入口：运行期的写入不再重新登记文件级授权。
+    const scopeId = randomUUID();
+    await revealAuthority.bindJob({
+      scopeId,
+      sourceRoot: options.sourceRoot,
+      targetRoot: options.targetRoot,
+      jobId: state.jobId ?? '',
+      archive: options.syncMode === 'mirror-archive',
+    });
+    const payload: BackupRevealState = { ...state, revealScopeId: scopeId };
+    broadcast('backup:state', payload);
+    return payload;
   });
 
   ipcMain.handle('backup:pause', async () => {
     svc.pause();
-    return svc.getState();
+    return withRevealScope(svc.getState());
   });
 
   ipcMain.handle('backup:resume', async () => {
     await svc.resume();
-    return svc.getState();
+    return withRevealScope(svc.getState());
   });
 
   ipcMain.handle('backup:cancel', async () => {
+    revealAuthority.invalidate('cancel');
     svc.cancel();
-    return svc.getState();
+    return withRevealScope(svc.getState());
   });
 
-  ipcMain.handle('backup:get-state', async () => svc.getState());
+  ipcMain.handle('backup:get-state', async () => withRevealScope(svc.getState()));
 
   ipcMain.handle('backup:cleanup-meta', async () => {
+    // 元数据目录被清理：目标端内容变了，旧授权随之失效。
+    revealAuthority.invalidate('cleanup-meta');
     await svc.cleanupMeta();
-    return svc.getState();
+    return withRevealScope(svc.getState());
   });
 
   ipcMain.handle('backup:assess', async (_event, targetRoot: string) => {
@@ -144,24 +208,35 @@ function registerIpc(): void {
   });
 
   ipcMain.handle('backup:health', (_event, root: string) => svc.health(root));
-  ipcMain.handle('backup:reenumerate', (_event, root: string) => svc.reenumerate(root));
+  // 重新枚举可能让服务端作废当前计划（currentPlan = null）：
+  // 旧计划登记过的文件不得再被定位，作用域必须在调用服务**之前**撤销。
+  ipcMain.handle('backup:reenumerate', async (_event, root: string) => {
+    revealAuthority.invalidate('reenumerate');
+    const report = await svc.reenumerate(root);
+    return { ...report, revealScopeId: revealAuthority.scopeId };
+  });
   ipcMain.handle('backup:repair-dry-run', (_event, root: string, request: import('../shared/types').RepairRequest) => svc.repairDryRun(root, request));
   ipcMain.handle('backup:partition-evidence', (_event, root: string) => svc.exportPartitionEvidence(root));
   ipcMain.handle('backup:capabilities', async () => (await import('./engine/capability')).capabilityMatrix);
 
   ipcMain.handle('backup:recover', async (_event, confirmed: boolean) => {
+    // 恢复会重建计划与账本：旧授权一律作废。
+    revealAuthority.invalidate('recover');
     await svc.recover({ confirmed });
-    return svc.getState();
+    return withRevealScope(svc.getState());
   });
 
   ipcMain.handle('backup:quarantine', async (_event, reason: string) => {
+    // 介质状态变了：旧授权一律作废。
+    revealAuthority.invalidate('quarantine');
     await svc.quarantine(svc.getState().targetRoot, reason);
-    return svc.getState();
+    return withRevealScope(svc.getState());
   });
 
   ipcMain.handle('backup:release-quarantine', async () => {
+    revealAuthority.invalidate('release-quarantine');
     await svc.releaseQuarantine();
-    return svc.getState();
+    return withRevealScope(svc.getState());
   });
 
   ipcMain.handle('backup:recycle:list', async (_event, targetRoot: string) => {
@@ -182,10 +257,38 @@ function registerIpc(): void {
     return svc.removeRecycleEntry(targetRoot, id);
   });
 
-  // 既有通道：**行为保持不变**，供备份主线定位文件使用。
-  // 重复文件检测页走的是下面那条受校验的 `dup:reveal`（FR-14、FR-20）。
-  ipcMain.handle('app:reveal', async (_event, targetPath: string) => {
-    if (targetPath) shell.showItemInFolder(targetPath);
+  // 「待收尾」回收项：用户已处理过，但最终索引提交失败，条目与归档还留在原地。
+  // 这里只做收尾，不得借这个入口重新还原或重新删除。
+  ipcMain.handle('backup:recycle:retry-cleanup', async (_event, targetRoot: string, id: string) => {
+    if (typeof targetRoot !== 'string' || typeof id !== 'string') throw new Error('回收项参数无效');
+    return svc.retryRecycleCleanup(targetRoot, id);
+  });
+
+  // 备份主线的「定位文件」：渲染层只提交「作用域 + 动作」，由主进程授权表
+  // 决定到底能定位哪个绝对路径。业务拒绝一律返回普通对象（渲染层要能区分
+  // 「拒绝」与「崩溃」），不抛异常。
+  ipcMain.handle('app:reveal', async (event, request: unknown) => {
+    const expectedUrl = appEntryUrl();
+    const senderValid = (): boolean => {
+      const win = mainWindow;
+      if (!win || win.isDestroyed()) return false;
+      return isRevealSender(
+        event.sender,
+        win.webContents,
+        event.senderFrame,
+        win.webContents.mainFrame,
+        event.senderFrame?.url,
+        expectedUrl,
+      );
+    };
+    if (!senderValid()) return revealError('FORBIDDEN_SENDER');
+    return revealAuthority.reveal(
+      request,
+      (absolutePath) => {
+        shell.showItemInFolder(absolutePath);
+      },
+      senderValid,
+    );
   });
 
   ipcMain.handle('app:theme', async (_event, mode: 'light' | 'dark' | 'system') => {
@@ -227,13 +330,34 @@ function registerAutoIpc(): void {
   };
 
   ipcMain.handle('aut:status', async () => aut.status());
-  ipcMain.handle('aut:add-pair', async (_event, input: AutoPairInput) => aut.addPair(input));
-  ipcMain.handle('aut:update-pair', async (_event, id: string, input: Partial<AutoPairInput>) => aut.updatePair(pairId(id), input));
+  // 新增/改配对会 arm 监听、可能后台写目标：目标内容将变，定位作用域必须先撤销。
+  ipcMain.handle('aut:add-pair', async (_event, input: AutoPairInput) => {
+    revealAuthority.invalidate('aut-add-pair');
+    return aut.addPair(input);
+  });
+  ipcMain.handle('aut:update-pair', async (_event, id: string, input: Partial<AutoPairInput>) => {
+    revealAuthority.invalidate('aut-update-pair');
+    return aut.updatePair(pairId(id), input);
+  });
   ipcMain.handle('aut:remove-pair', async (_event, id: string) => aut.removePair(pairId(id)));
-  ipcMain.handle('aut:set-enabled', async (_event, id: string, enabled: boolean) => aut.setEnabled(pairId(id), flag(enabled)));
-  ipcMain.handle('aut:resume', async (_event, id: string) => aut.resume(pairId(id)));
-  ipcMain.handle('aut:restore', async (_event, id: string, recycleId: string) => aut.restore(pairId(id), itemId(recycleId)));
-  ipcMain.handle('aut:restore-version', async (_event, id: string, versionId: string) => aut.restoreVersion(pairId(id), itemId(versionId)));
+  ipcMain.handle('aut:set-enabled', async (_event, id: string, enabled: boolean) => {
+    revealAuthority.invalidate('aut-set-enabled');
+    return aut.setEnabled(pairId(id), flag(enabled));
+  });
+  // 自动同步与备份主线共享同一份目标内容：这三个入口会写入/还原目标，
+  // 目标一变，备份主线的定位作用域必须先撤销（只读的 aut:status / aut:history 不撤销）。
+  ipcMain.handle('aut:resume', async (_event, id: string) => {
+    revealAuthority.invalidate('aut-resume');
+    return aut.resume(pairId(id));
+  });
+  ipcMain.handle('aut:restore', async (_event, id: string, recycleId: string) => {
+    revealAuthority.invalidate('aut-restore');
+    return aut.restore(pairId(id), itemId(recycleId));
+  });
+  ipcMain.handle('aut:restore-version', async (_event, id: string, versionId: string) => {
+    revealAuthority.invalidate('aut-restore-version');
+    return aut.restoreVersion(pairId(id), itemId(versionId));
+  });
   ipcMain.handle('aut:history', async (_event, id: string) => aut.history(pairId(id)));
 }
 
@@ -260,10 +384,22 @@ function registerDupIpc(): void {
   ipcMain.handle('dup:suppressions', async (_event, root: string) => dup.listSuppressions(root));
   ipcMain.handle('dup:revokeSuppression', async (_event, sha256?: string) => dup.revokeSuppression(sha256));
   ipcMain.handle('dup:export', async (_event, format: 'json' | 'csv') => dup.exportReport(format));
-  ipcMain.handle('dup:restoreQuarantine', async (_event, id: string, overwrite?: boolean) =>
-    dup.restoreQuarantine(id, overwrite === true),
-  );
-  ipcMain.handle('dup:listQuarantine', async () => dup.listQuarantine());
+  // 隔离区通道返回**可序列化结构**：失败时把结构化错误码带到渲染层，
+  // 免得跨 IPC 之后只剩一句中文消息（渲染层要靠 code 区分失败类别）。
+  ipcMain.handle('dup:restoreQuarantine', async (_event, id: string, overwrite?: boolean) => {
+    try {
+      return { ok: true, ...(await dup.restoreQuarantine(id, overwrite === true)) };
+    } catch (err) {
+      return { ok: false, ...quarantineFailure(err) };
+    }
+  });
+  ipcMain.handle('dup:listQuarantine', async () => {
+    try {
+      return { ok: true, entries: await dup.listQuarantine() };
+    } catch (err) {
+      return { ok: false, ...quarantineFailure(err) };
+    }
+  });
 
   // 受校验的「定位文件」：路径必须落在本次扫描根之内，且确实是本次扫描结果中的条目。
   // 文件已不存在或不可访问时给出明确提示，不静默失败（FR-14、FR-20）。
@@ -272,7 +408,7 @@ function registerDupIpc(): void {
 
 void app.whenReady().then(() => {
   service = new BackupService(app.getPath('userData'));
-  service.on('state', (state) => broadcast('backup:state', state));
+  service.on('state', (state) => broadcast('backup:state', withRevealScope(state)));
   service.on('plan', (plan) => broadcast('backup:plan', plan));
   service.on('progress', (progress) => broadcast('backup:progress', progress));
   service.on('action', (action) => broadcast('backup:action', action));

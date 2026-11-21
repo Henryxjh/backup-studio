@@ -89,22 +89,81 @@ export interface PlanSummary {
  * 实体内容仍存放在 `.backup-studio/history/<jobId>/<relPath>`（归档副本），
  * 这里只登记可浏览、可还原的元数据。
  */
+export type RecycleEntityState = 'present' | 'missing' | 'pending' | 'uncertain';
+export type RecycleIndexState = 'ok' | 'missing' | 'corrupt' | 'inconsistent';
+
 export interface RecycleEntry {
   id: string;
+  txId?: string;
   /** 相对目标根的 POSIX 路径：被删除文件在备份端的原位置 */
   relPath: string;
   size: number;
+  archiveRelPath?: string;
+  archiveSize?: number;
+  archiveSha256?: string;
+  state?: 'indexed' | 'pending' | 'uncertain';
+  entityState?: RecycleEntityState;
+  /**
+   * 是否具备内容完整性校验基线。
+   * - `true`：登记时已记录归档的 SHA-256，还原时会再次校验内容；
+   * - `false`：旧条目没有哈希基线，无法验证内容完整性，还原的是磁盘上的当前内容。
+   * 列表阶段不做全量哈希（回收站可达 10 GiB），因此该标记只说明「有无基线」，
+   * 不代表当前磁盘实体一定完好；还原路径才是最终校验点。
+   *
+   * 注意：「无基线」与「有基线但校验未通过」是两回事，界面必须分开表述，
+   * 不能把「校验失败」说成「没有基线」。见 `hashBaseline`。
+   */
+  contentVerified?: boolean;
+  /**
+   * 是否有哈希基线。
+   *
+   * 与 `contentVerified` 分开：前者回答「有没有可比对的基线」，
+   * 后者回答「最近一次校验是否通过」。`state === 'uncertain'` 且
+   * `hashBaseline === true` 表示**校验未通过，需人工核对**，
+   * 此时 `contentVerified` 为 false，但它绝不是「没有基线」。
+   */
+  hashBaseline?: boolean;
+  /**
+   * 内容完整性状态（比 `contentVerified` 更完整的三态）。
+   * - `verified`：最近一次校验通过；
+   * - `unverified`：有哈希基线，但列表阶段不做全量哈希（回收站可达 10 GiB），
+   *   内容要在**还原时**才会被严格校验；
+   * - `failed`：校验已失败，必须人工核对；
+   * - `unknown`：没有哈希基线（老条目），无法验证完整性。
+   *
+   * 三态必须分开说：「有基线但尚未校验」与「校验未通过」不是一回事，
+   * 界面把它们混成同一句话会误导用户。
+   */
+  contentState?: 'verified' | 'unverified' | 'failed' | 'unknown';
+  /**
+   * 「待收尾」：用户已经处理过这条回收项（已还原 / 已彻底删除，账本已结案），
+   * 但**索引提交失败**，条目与归档还留在原地等收尾。
+   *
+   * 这种条目不得再次执行还原或彻底删除（那会重复作用在已处理过的内容上），
+   * 但也**不得从列表里消失**——证据还在，归档还占着空间，
+   * 消失等于让用户以为文件彻底没了。界面对它只提供「重试收尾」。
+   */
+  cleanupPending?: boolean;
+  error?: string;
   /** 删除时间（毫秒时间戳） */
   deletedAt: number;
   /** 产生该条目的备份任务 id */
   jobId: string;
 }
 
-/** 手动备份回收站快照 */
+/** 手动备份回收站快照；totalBytes 是已索引实体实际占用。 */
 export interface RecycleBin {
   targetRoot: string;
   entries: RecycleEntry[];
   totalBytes: number;
+  limitBytes?: number;
+  usedBytes?: number;
+  pendingBytes?: number;
+  orphanBytes?: number;
+  overLimit?: boolean;
+  blockedReason?: string;
+  indexState?: RecycleIndexState;
+  uncertainCount?: number;
 }
 
 export interface ScanResult {

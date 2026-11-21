@@ -11,6 +11,7 @@ import type {
   DupItemAction,
   DupProgress,
   DupQuarantineEntry,
+  DupQuarantineErrorCode,
   DupScanResult,
   DupScanSummary,
   DupStats,
@@ -19,7 +20,14 @@ import type {
 } from '../../../shared/dup-types';
 import { DEFAULT_MIN_SIZE_BYTES, scanDupTree } from './scan';
 import { detectDuplicates } from './detect';
-import { executeAct, QuarantineStore, registryKey, type ActRegistryEntry } from './act';
+import {
+  executeAct,
+  QuarantineIndexError,
+  QuarantineStore,
+  registryKey,
+  type ActRegistryEntry,
+  type QuarantineEntry,
+} from './act';
 import { AuditLog } from './audit';
 import {
   SuppressionStore,
@@ -41,7 +49,7 @@ export type {
 } from '../../../shared/dup-types';
 export { DEFAULT_MIN_SIZE_BYTES } from './scan';
 export { detectDuplicates, pickGroupKeeper, groupNameConflicts } from './detect';
-export { executeAct, QuarantineStore } from './act';
+export { executeAct, QuarantineStore, QuarantineIndexError } from './act';
 
 /** 渲染层预览的分组上限；截断只影响呈现，统计始终基于全量 */
 export const MAX_PREVIEW_GROUPS = 2000;
@@ -130,6 +138,22 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
   private suppressionItems: SuppressionRecord[] = [];
   /** 隔离区条目快照：渲染层据此展示还原入口（FR-08） */
   private quarantineSnapshot: DupQuarantineEntry[] = [];
+  /**
+   * 隔离区索引不可读的原因（**唯一一份**状态）。
+   *
+   * 索引坏掉时**不得**把清单当成空的：那会让用户以为文件已经没了。
+   * 刷新本身永不抛错（删除已经真实发生，不能因此报成失败），
+   * 原因记在这里：`status()` 与 `listQuarantine()` 共用它，
+   * 只读状态的调用方也要能看到「索引不可读」。
+   */
+  private quarantineError: { code: DupQuarantineErrorCode; message: string } | undefined;
+  /**
+   * 已还原的隔离区条目 id。
+   *
+   * 条目仍留在索引里时（索引写失败等异常），界面据此禁用还原按钮——
+   * 否则那个按钮永远点不出结果（FR-08）。
+   */
+  private restoredQuarantineIds = new Set<string>();
   /** 扫描结果登记表：绝对路径 + 组 id → 删除动作使用的条目（FR-11） */
   private registry = new Map<string, ActRegistryEntry>();
   /** 路径级查询索引（FR-20）；同一路径可属于多个组。 */
@@ -224,6 +248,8 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
       canAct: (this.phase === 'ready' || this.phase === 'done' || this.phase === 'failed') && !this.blockedReason,
       currentRoot: this.currentRoot || undefined,
       quarantine: this.quarantineSnapshot,
+      // 索引不可读时只读状态也必须带上原因：调用方不该只有 listQuarantine 才看得见
+      quarantineError: this.quarantineError,
     };
   }
 
@@ -738,28 +764,56 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
    *
    * 还原是一次真实写入，因此与备份走同一套写入闸门：
    * 介质不可写或处于隔离观察时必须拒绝，而不是硬写。
+   * 闸门判定的是**还原目标所在目录**（文件原来所在的位置），不是扫描根——
+   * 还原写回原路径，可写性只看那个目录。
    * 目标位置已被占用时默认拒绝，需要用户显式确认覆盖（FR-08）。
    */
   restoreQuarantine = (id: string, overwrite = false): Promise<{ restored: boolean; path?: string; reason?: string }> =>
     this.run(async () => {
       if (typeof id !== 'string' || !id.trim()) throw new Error('隔离区记录标识无效');
-      if (this.options.gate) {
-        const verdict = await this.options.gate(this.currentRoot || this.localDirectory);
-        if (!verdict.allowed) {
-          const reason = verdict.reason ?? '写入闸门未放行，已拒绝还原';
-          await this.audit({ at: Date.now(), action: '还原被闸门阻断', outcome: 'blocked', reason });
-          return { restored: false, reason };
+      // 闸门由隔离区层调用：那里先做路径边界校验（assertInsideQuarantine），
+      // 校验通过后才取 path.dirname(entry.originalPath) 交给闸门，
+      // 避免拿一条非法路径去探测介质。
+      const configuredGate = this.options.gate;
+      let gateVerdict: { allowed: boolean; reason?: string } | undefined;
+      const gate = configuredGate
+        ? async (root: string): Promise<{ allowed: boolean; reason?: string }> => {
+            const verdict = await configuredGate(root);
+            gateVerdict = verdict;
+            return verdict;
+          }
+        : undefined;
+      let result: { restored: boolean; path?: string; reason?: string };
+      try {
+        result = await this.quarantine.restore(id, overwrite, gate);
+      } catch (err) {
+        // 索引不可信（读失败 / 解析失败 / 版本不符 / 条目非法）必须如实抛出：
+        // 清单此刻不可读，界面不能继续假装隔离区是空的。
+        // **原始错误码必须保留**：跨 IPC 之后调用方要靠 code 区分失败类别，
+        // 不能只拿到一段中文再靠正则剥前缀。
+        if (err instanceof QuarantineIndexError) {
+          this.quarantineError = { code: err.code, message: err.message };
         }
+        throw err;
       }
-      const result = await this.quarantine.restore(id, overwrite);
+      if (result.restored) this.restoredQuarantineIds.add(id);
       await this.refreshQuarantine();
       this.event(result.restored ? '已还原隔离文件' : '还原失败', result.reason ?? result.path);
-      await this.audit({
-        at: Date.now(),
-        action: '还原隔离文件',
-        outcome: result.restored ? 'ok' : 'failed',
-        reason: result.reason ?? result.path,
-      });
+      if (!result.restored && gateVerdict && !gateVerdict.allowed) {
+        await this.audit({
+          at: Date.now(),
+          action: '还原被闸门阻断',
+          outcome: 'blocked',
+          reason: result.reason,
+        });
+      } else {
+        await this.audit({
+          at: Date.now(),
+          action: '还原隔离文件',
+          outcome: result.restored ? 'ok' : 'failed',
+          reason: result.reason ?? result.path,
+        });
+      }
       return result;
     });
 
@@ -768,22 +822,58 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
    *
    * 隔离区里的文件是**已经从原处移走**的：没有这条列表，
    * 用户重启之后就再也找不到它们，也无从还原。
+   *
+   * 索引读不出来时**抛错**，不返回空清单：空清单等于告诉用户「文件都没了」。
+   *
+   * 抛出的错误**保留原始错误码**（read-failed / parse-failed / version-mismatch /
+   * schema-invalid / entry-invalid）：跨 IPC 之后调用方要靠 `error.code`
+   * 区分失败类别，而不是解析中文。
    */
   listQuarantine = async (): Promise<DupQuarantineEntry[]> => {
     await this.loaded;
     await this.refreshQuarantine();
+    const failure = this.quarantineError;
+    if (failure) {
+      throw new QuarantineIndexError(failure.code, `隔离区不可读取：${failure.message}`);
+    }
     return this.quarantineSnapshot;
   };
 
-  /** 从隔离区索引刷新快照 */
+  /**
+   * 从隔离区索引刷新快照。
+   *
+   * **永不抛错**：删除已经真实发生，索引读不出来不能把这次删除报成失败。
+   * 读失败时保留上一次快照，原因记进 quarantineError（由 status() 与 listQuarantine() 共用）。
+   */
   private async refreshQuarantine(): Promise<void> {
-    const entries = await this.quarantine.list();
-    this.quarantineSnapshot = entries.map((entry) => ({
-      id: entry.id,
-      originalPath: entry.originalPath,
-      size: entry.size,
-      deletedAt: entry.createdAt,
-    }));
+    let entries: QuarantineEntry[];
+    try {
+      entries = await this.quarantine.list();
+    } catch (err) {
+      this.quarantineError =
+        err instanceof QuarantineIndexError
+          ? { code: err.code, message: err.message }
+          : { code: 'read-failed', message: errorText(err) };
+      return;
+    }
+    const snapshot: DupQuarantineEntry[] = [];
+    for (const entry of entries) {
+      const item: DupQuarantineEntry = {
+        id: entry.id,
+        originalPath: entry.originalPath,
+        size: entry.size,
+        deletedAt: entry.createdAt,
+        // 已还原 / 实体缺失都要如实写出来：界面据此禁用还原按钮，
+        // 否则那个按钮会永远点不出结果（FR-08）。
+        restored: this.restoredQuarantineIds.has(entry.id),
+      };
+      const checked = await this.quarantine.checkStored(entry);
+      if (checked.missing) item.missing = true;
+      if (checked.reason) item.unavailableReason = checked.reason;
+      snapshot.push(item);
+    }
+    this.quarantineSnapshot = snapshot;
+    this.quarantineError = undefined;
   }
 
   /**
