@@ -257,6 +257,13 @@ export interface DupActResult {
   reclaimedBytes: number;
   /** 是否发生过降级：本机隔离区（FR-08） */
   degradedToQuarantine: boolean;
+  /**
+   * 审计日志是否写入失败（FR-19）。
+   *
+   * 审计是辅助证据，写失败不改变删除结果，但必须如实告知调用方，
+   * 不能静默吞掉——否则用户以为每次动作都有据可查。
+   */
+  auditFailed?: boolean;
 }
 
 /** 逐条动作：保留 / 删除 / 下次不提醒（FR-06） */
@@ -281,6 +288,32 @@ export interface DupActRequest {
   groupIds: string[];
   /** 确认类别：同名不同内容区需要两次确认（FR-18） */
   category: DupCategory;
+  /**
+   * 同名不同内容告警区的显式二次确认（FR-18）。
+   *
+   * 告警区的条目**没有**内容相同的副本，删除它就是删除唯一一份，
+   * 因此主进程必须看到显式确认才放行；未携带该标志时一律拒绝。
+   */
+  confirmSameNameConflict?: boolean;
+}
+
+/**
+ * 本机隔离区条目（FR-08 降级路径）。
+ *
+ * 系统回收站不可用时，删除的文件被移动到本机隔离区而不是被丢弃，
+ * 必须可列出、可还原——否则用户重启后就再也找不回这些文件。
+ */
+export interface DupQuarantineEntry {
+  /** 隔离区条目 id */
+  id: string;
+  /** 被删除前的原始绝对路径（还原时写回这里） */
+  originalPath: string;
+  /** 文件大小（字节） */
+  size: number;
+  /** 进入隔离区的时间戳 */
+  deletedAt: number;
+  /** 已还原过（保留记录以便追溯，不再重复还原） */
+  restored?: boolean;
 }
 
 /** 事件流条目（审计脱敏后写入，FR-19） */
@@ -312,6 +345,15 @@ export interface DupStatus {
   blockedReason?: string;
   /** 删除入口是否可用 */
   canAct: boolean;
+  /**
+   * 当前扫描根。
+   *
+   * 渲染层切换工作区会卸载检测页，回来时需要据此回填目录，
+   * 否则「保留 / 删除 / 定位」等动作会因缺少根而静默失效。
+   */
+  currentRoot?: string;
+  /** 本机隔离区条目（FR-08 降级路径，可还原） */
+  quarantine?: DupQuarantineEntry[];
 }
 
 /** 渲染层可调用的接口（主进程是唯一写入点，FR-20） */
@@ -342,7 +384,9 @@ export interface DupApi {
   /** 导出全量报告到本机文件 */
   exportReport(format: 'json' | 'csv'): Promise<{ path: string; bytes: number }>;
   /** 还原隔离区中的文件（FR-08 降级路径） */
-  restoreQuarantine(id: string): Promise<{ restored: boolean; path?: string; reason?: string }>;
+  restoreQuarantine(id: string, overwrite?: boolean): Promise<{ restored: boolean; path?: string; reason?: string }>;
+  /** 列出本机隔离区条目（FR-08 降级路径；重启后仍须能还原） */
+  listQuarantine(): Promise<DupQuarantineEntry[]>;
   /**
    * 受校验的「定位文件」：路径必须落在本次扫描根之内，且确实是本次扫描结果中的条目。
    *

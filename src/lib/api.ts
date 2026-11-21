@@ -80,6 +80,13 @@ export interface BackupAPI {
   /** 彻底删除一条回收项，副本不可再恢复。 */
   removeRecycle(targetRoot: string, id: string): Promise<RecycleBin>;
   autoSync: AutoSyncApi;
+  /**
+   * 重复文件检测。
+   *
+   * 契约见 shared/dup-types.ts 的 DupApi：其中 listQuarantine() 列出本机隔离区条目，
+   * 渲染层据此提供「还原」入口（FR-08）——隔离区条目是本机持久记录，
+   * 只靠单次 act() 的返回值，重启后用户就再也找不回这些文件。
+   */
   duplicateFinder: DupApi;
   reveal(targetPath: string): Promise<void>;
   setTheme(mode: 'light' | 'dark' | 'system'): Promise<'light' | 'dark'>;

@@ -4,10 +4,10 @@ import { BackupService } from './engine/service';
 import { AutoSync } from './engine/aut';
 import { createWritePermit } from './engine/aut/bridge';
 import { DuplicateFinder } from './engine/dup';
+import { createDuplicateFinder } from './engine/dup/wiring';
 import type { SyncMode } from '../shared/types';
 import type { AutoPairInput } from '../shared/aut-types';
 import type { DupActRequest, DupItemAction } from '../shared/dup-types';
-
 let mainWindow: BrowserWindow | null = null;
 let service: BackupService | null = null;
 let autoSync: AutoSync | null = null;
@@ -260,7 +260,10 @@ function registerDupIpc(): void {
   ipcMain.handle('dup:suppressions', async (_event, root: string) => dup.listSuppressions(root));
   ipcMain.handle('dup:revokeSuppression', async (_event, sha256?: string) => dup.revokeSuppression(sha256));
   ipcMain.handle('dup:export', async (_event, format: 'json' | 'csv') => dup.exportReport(format));
-  ipcMain.handle('dup:restoreQuarantine', async (_event, id: string) => dup.restoreQuarantine(id));
+  ipcMain.handle('dup:restoreQuarantine', async (_event, id: string, overwrite?: boolean) =>
+    dup.restoreQuarantine(id, overwrite === true),
+  );
+  ipcMain.handle('dup:listQuarantine', async () => dup.listQuarantine());
 
   // 受校验的「定位文件」：路径必须落在本次扫描根之内，且确实是本次扫描结果中的条目。
   // 文件已不存在或不可访问时给出明确提示，不静默失败（FR-14、FR-20）。
@@ -280,28 +283,28 @@ void app.whenReady().then(() => {
   autoSync = new AutoSync(path.join(app.getPath('userData'), 'aut'), createWritePermit(service));
 
   // 重复文件查找器：只读扫描用户指定目录；删除只进系统回收站，不可用时降级本机隔离区。
-  // 抑制清单写本机 userData，且会改变「写什么」，因此必须与备份计划同源：
-  // 把名单来源注入给备份服务，并在抑制项变更时让旧计划失效。
-  duplicateFinder = new DuplicateFinder(path.join(app.getPath('userData'), 'duplicate-finder'), {
+  // 抑制清单只影响**检测页的提示**，不改变备份引擎「写什么」——
+  // 规格 §4.2 明确「与备份引擎的自动联动」不做，且排除名单会把整组内容静默排除出备份（P-03）。
+  // 接线集中在 `engine/dup/wiring.ts`，便于回归用例直接覆盖这条接缝。
+  duplicateFinder = createDuplicateFinder({
+    localDirectory: path.join(app.getPath('userData'), 'duplicate-finder'),
     // 系统回收站落地；抛错视为回收站不可用 → 引擎降级到本机隔离区（FR-08）
     trash: async (absPath) => {
       await shell.trashItem(absPath);
     },
     // 写入闸门：与备份引擎同一套裁决，介质异常一律拒绝删除（FR-10）
-    gate: async (root) => {
+    writeGate: async (root) => {
       const verdict = await service!.writeGate(root);
       return { allowed: verdict.allowed, reason: verdict.reason };
     },
     // 备份任务或自动同步正在运行时，删除动作整体禁用（FR-10）
-    isBusy: () => Boolean(service?.isBusy()) || Boolean(autoSync?.isRunning()),
+    isBackupBusy: () => Boolean(service?.isBusy()),
+    isAutoSyncRunning: () => Boolean(autoSync?.isRunning()),
     // 系统文件管理器定位；引擎先做路径边界校验，通过后才调用（FR-14、FR-20）
     revealFile: (absPath) => {
       shell.showItemInFolder(absPath);
     },
-    onSuppressionsChanged: (_root, reason) => service?.invalidatePlan(reason),
   });
-  const finder = duplicateFinder;
-  service.setExclusionProvider((sourceRoot) => finder.exclusionPaths(sourceRoot));
 
   registerIpc();
   registerAutoIpc();

@@ -15,6 +15,7 @@ import type {
   DupActRequest,
   DupActResult,
   DupItemAction,
+  DupQuarantineEntry,
   DupStatus,
   DupSuppression,
 } from '../shared/dup-types';
@@ -124,8 +125,9 @@ const api = {
     revokeSuppression: (sha256?: string): Promise<DupStatus> => ipcRenderer.invoke('dup:revokeSuppression', sha256),
     exportReport: (format: 'json' | 'csv'): Promise<{ path: string; bytes: number }> =>
       ipcRenderer.invoke('dup:export', format),
-    restoreQuarantine: (id: string): Promise<{ restored: boolean; path?: string; reason?: string }> =>
-      ipcRenderer.invoke('dup:restoreQuarantine', id),
+    restoreQuarantine: (id: string, overwrite?: boolean): Promise<{ restored: boolean; path?: string; reason?: string }> =>
+      ipcRenderer.invoke('dup:restoreQuarantine', id, overwrite === true),
+    listQuarantine: (): Promise<DupQuarantineEntry[]> => ipcRenderer.invoke('dup:listQuarantine'),
     /**
      * 受校验的「定位文件」：路径必须落在本次扫描根之内且是本次扫描的真实条目。
      * 与既有 `api.reveal` 的区别：这里会先做路径边界校验，伪造路径一律拒绝。

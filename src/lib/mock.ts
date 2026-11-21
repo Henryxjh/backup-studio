@@ -29,6 +29,7 @@ import type {
   DupItemAction,
   DupPhase,
   DupProgress,
+  DupQuarantineEntry,
   DupScanResult,
   DupStatus,
   DupSuppression,
@@ -382,6 +383,13 @@ export function createMockApi(): BackupAPI {
   let dupResult: DupScanResult | null = null;
   let dupPhase: DupPhase = 'idle';
   let dupCancelled = false;
+  /** 当前扫描根：检测页重新挂载时靠它回填目录，否则动作会因缺根而静默失效 */
+  let dupCurrentRoot = '';
+  /** 本机隔离区条目：模拟系统回收站不可用时的降级落地，可还原（FR-08） */
+  let dupQuarantine: DupQuarantineEntry[] = [];
+  // 浏览器演示：系统回收站不可用时删除降级到本机隔离区（FR-08）。
+  // 演示约定：路径中带「归档」的文件模拟回收站不可用，其余走系统回收站。
+  const DUP_QUARANTINE_MARK = '归档';
   let dupProgress: DupProgress = {
     phase: 'idle',
     label: '待选目录',
@@ -460,6 +468,8 @@ export function createMockApi(): BackupAPI {
       : [],
     reason: dupResult ? '浏览器演示：未连接真实文件系统，结论仅供界面预览' : undefined,
     canAct: dupPhase === 'ready' || dupPhase === 'done',
+    currentRoot: dupCurrentRoot || undefined,
+    quarantine: dupQuarantine,
   });
 
   const aggregateState = (): AutoRunState => {
@@ -880,6 +890,7 @@ export function createMockApi(): BackupAPI {
       },
       async scan(root: string) {
         dupCancelled = false;
+        dupCurrentRoot = root;
         dupGroupsState = dupGroups();
         const stages: DupPhase[] = ['scanning', 'bucketing', 'partial-hashing', 'hashing', 'summarizing'];
         const labels: Record<string, string> = {
@@ -962,7 +973,28 @@ export function createMockApi(): BackupAPI {
           }
           entry.state = 'deleted';
           reclaimedBytes += entry.size;
-          items.push({ id: item.id, absPath: item.absPath, outcome: 'deleted', landedTo: 'system-trash' });
+          if (entry.absPath.includes(DUP_QUARANTINE_MARK)) {
+            // 降级落地：文件移入本机隔离区并给出隔离区 id，界面据此提供还原入口（FR-08）
+            const quarantineId = `q-${item.id}-${dupQuarantine.length + 1}`;
+            dupQuarantine = [
+              ...dupQuarantine,
+              {
+                id: quarantineId,
+                originalPath: entry.absPath,
+                size: entry.size,
+                deletedAt: Date.now(),
+              },
+            ];
+            items.push({
+              id: item.id,
+              absPath: item.absPath,
+              outcome: 'deleted',
+              landedTo: 'quarantine',
+              quarantineId,
+            });
+          } else {
+            items.push({ id: item.id, absPath: item.absPath, outcome: 'deleted', landedTo: 'system-trash' });
+          }
         }
         dupResult = dupBuildResult(root);
         dupPhase = 'done';
@@ -974,7 +1006,7 @@ export function createMockApi(): BackupAPI {
           blocked: 0,
           failed: items.filter((item) => item.outcome === 'failed').length,
           reclaimedBytes,
-          degradedToQuarantine: false,
+          degradedToQuarantine: items.some((item) => item.landedTo === 'quarantine'),
         };
       },
       async suppress(root: string, sha256: string, scopeMode: 'root' | 'global', samplePaths: string[]) {
@@ -1019,7 +1051,16 @@ export function createMockApi(): BackupAPI {
         return { path: `D:\\报告\\duplicate-report.${format}`, bytes: text.length };
       },
       async restoreQuarantine(id: string) {
-        return { restored: false, reason: `浏览器演示：未连接真实文件系统，未还原隔离区条目 ${id}` };
+        const entry = dupQuarantine.find((item) => item.id === id);
+        if (!entry) return { restored: false, reason: `隔离区中没有条目 ${id}` };
+        // 还原只标记状态，不真的碰文件系统：浏览器演示里路径是假的
+        dupQuarantine = dupQuarantine.map((item) =>
+          item.id === id ? { ...item, restored: true } : item,
+        );
+        return { restored: true, path: entry.originalPath };
+      },
+      async listQuarantine() {
+        return dupQuarantine;
       },
       async reveal(root: string, absPath: string) {
         // 浏览器演示：按演示约定模拟「扫描后该文件已不存在」

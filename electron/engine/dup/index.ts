@@ -10,6 +10,7 @@ import type {
   DupGroup,
   DupItemAction,
   DupProgress,
+  DupQuarantineEntry,
   DupScanResult,
   DupScanSummary,
   DupStats,
@@ -18,7 +19,7 @@ import type {
 } from '../../../shared/dup-types';
 import { DEFAULT_MIN_SIZE_BYTES, scanDupTree } from './scan';
 import { detectDuplicates } from './detect';
-import { executeAct, QuarantineStore, type ActRegistryEntry } from './act';
+import { executeAct, QuarantineStore, registryKey, type ActRegistryEntry } from './act';
 import { AuditLog } from './audit';
 import {
   SuppressionStore,
@@ -59,7 +60,12 @@ export interface DuplicateFinderOptions {
   isBusy?: () => boolean;
   /** 本机状态目录；默认取构造函数的 `localDirectory` */
   localDirectory?: string;
-  /** 抑制清单变更回调：备份侧的旧计划必须立即失效 */
+  /**
+   * 抑制清单变更回调（FR-12、FR-13）。
+   *
+   * 抑制只影响**检测页的提示**：被抑制的组下次扫描不再出现。
+   * 它**不改变备份引擎「写什么」**——规格 §4.2 明确「与备份引擎的自动联动」不做。
+   */
   onSuppressionsChanged?: (root: string, reason: string) => void;
   /**
    * 在系统文件管理器中定位文件。
@@ -78,6 +84,17 @@ export interface PathVerdict {
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * CSV 字段转义。
+ *
+ * 文件名里出现逗号、双引号或换行就会把列结构冲掉，导出的表直接不可用。
+ * 按 RFC 4180：含特殊字符时用双引号包起来，内部引号翻倍。
+ */
+function csvField(value: string): string {
+  if (!/[",\r\n]/.test(value)) return value;
+  return `"${value.replace(/"/g, '""')}"`;
 }
 
 /**
@@ -106,6 +123,8 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
   private reason: string | undefined;
   private blockedReason: string | undefined;
   private suppressionItems: SuppressionRecord[] = [];
+  /** 隔离区条目快照：渲染层据此展示还原入口（FR-08） */
+  private quarantineSnapshot: DupQuarantineEntry[] = [];
   /** 扫描结果登记表：绝对路径 → 条目（FR-20 路径边界校验的唯一依据） */
   private registry = new Map<string, ActRegistryEntry>();
   /** 组 → 组内全部条目 id（FR-11 至少留一份） */
@@ -155,7 +174,7 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
   }
 
   /** 审计日志：只写本机，绝对路径按安全模块规则脱敏 */
-  private audit(entry: Parameters<AuditLog['append']>[0]): Promise<void> {
+  private audit(entry: Parameters<AuditLog['append']>[0]): Promise<boolean> {
     return this.auditLog.append(entry);
   }
 
@@ -189,7 +208,11 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
       recent: this.recent,
       reason: this.reason,
       blockedReason: this.blockedReason,
-      canAct: (this.phase === 'ready' || this.phase === 'done') && !this.blockedReason,
+      // 「失败」阶段允许重试：被闸门挡下的条目在介质恢复后应当还能再执行一次，
+      // 不能因为上一轮失败就把入口永久关掉。
+      canAct: (this.phase === 'ready' || this.phase === 'done' || this.phase === 'failed') && !this.blockedReason,
+      currentRoot: this.currentRoot || undefined,
+      quarantine: this.quarantineSnapshot,
     };
   }
 
@@ -352,7 +375,9 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
     for (const group of groups) {
       const ids: string[] = [];
       for (const entry of group.entries) {
-        this.registry.set(entry.absPath, {
+        // 键里带组 id：同一个文件可能同时出现在内容重复组与同名告警组，
+        // 只用绝对路径做键会让后写入的组覆盖前一个，硬约束就会用错组。
+        this.registry.set(registryKey(entry.absPath, group.id), {
           id: entry.id,
           absPath: entry.absPath,
           relPath: entry.relPath,
@@ -362,6 +387,7 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
           ino: entry.ino,
           suspected: entry.suspected,
           groupId: group.id,
+          category: group.category,
         });
         ids.push(entry.id);
       }
@@ -516,23 +542,44 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
       this.assertRoot(root);
       if (!request || !Array.isArray(request.items)) throw new Error('删除请求格式无效');
       if (request.items.length === 0) throw new Error('请先选择要删除的文件');
+      // 阶段校验放在主进程侧：取消后的结果不完整，此时执行删除等于按残缺名单删文件。
+      // 渲染层虽然也会关掉入口，但主进程必须自己兜住这条底线。
+      if (this.phase !== 'ready' && this.phase !== 'done' && this.phase !== 'failed') {
+        throw new Error('当前状态不允许执行删除，请重新检测后再试');
+      }
+      this.refreshBlocked();
+      if (this.blockedReason) throw new Error(this.blockedReason);
       this.phase = 'acting';
       this.setProgress('acting', '执行删除', 0, request.items.length, 0);
 
-      const outcome = await executeAct({
-        root: this.currentRoot,
-        items: request.items,
-        category: request.category,
-        registry: this.registry,
-        groupMembers: this.groupMembers,
-        gate: this.options.gate,
-        isBusy: this.options.isBusy,
-        trash: this.options.trash,
-        quarantineDirectory: path.join(this.localDirectory, 'quarantine'),
-        isSuppressed: (hash) => Boolean(findSuppression(this.suppressionItems, hash, this.currentRoot)),
-        audit: (entry) => this.audit(entry),
-        isCancelled: () => this.cancelToken === token,
-      });
+      let outcome: DupActResult;
+      try {
+        outcome = await executeAct({
+          root: this.currentRoot,
+          items: request.items,
+          category: request.category,
+          confirmSameNameConflict: request.confirmSameNameConflict === true,
+          registry: this.registry,
+          groupMembers: this.groupMembers,
+          gate: this.options.gate,
+          isBusy: this.options.isBusy,
+          trash: this.options.trash,
+          quarantineDirectory: path.join(this.localDirectory, 'quarantine'),
+          isSuppressed: (hash) => Boolean(findSuppression(this.suppressionItems, hash, this.currentRoot)),
+          audit: (entry) => this.audit(entry),
+          isCancelled: () => this.cancelToken === token,
+        });
+      } catch (err) {
+        // 执行层整体抛错（如闸门探测本身失败）时，阶段必须退回可操作态，
+        // 否则页面会永远卡在「执行中」，用户再也无法重试。
+        this.phase = 'failed';
+        this.reason = `删除未能开始：${err instanceof Error ? err.message : String(err)}`;
+        this.setProgress('failed', '执行失败', 0, request.items.length, 0);
+        this.event('删除未能开始', this.reason, 'failed');
+        throw err;
+      }
+
+      await this.refreshQuarantine();
 
       // 逐条回写条目状态：结果必须与界面所见一致
       for (const item of outcome.items) {
@@ -564,6 +611,10 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
         `成功 ${outcome.deleted}，跳过 ${outcome.skipped}，被拒 ${outcome.blocked}，失败 ${outcome.failed}`,
         failed > 0 ? 'failed' : 'ok',
       );
+      if (outcome.auditFailed) {
+        // 审计写失败不影响删除结果，但必须让用户知道「这次动作没有落到审计里」
+        this.event('审计日志写入失败', '部分动作未记入审计日志', 'failed');
+      }
       return outcome;
     });
   }
@@ -628,12 +679,12 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
                 group.fingerprint,
                 group.size,
                 group.reclaimableBytes,
-                entry.absPath,
-                entry.relPath,
-                entry.fileName,
+                csvField(entry.absPath),
+                csvField(entry.relPath),
+                csvField(entry.fileName),
                 entry.size,
                 entry.mtimeMs,
-                entry.state,
+                csvField(entry.state),
               ].join(','),
             );
           }
@@ -649,11 +700,26 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
       return { path: file, bytes: Buffer.byteLength(text, 'utf8') };
     });
 
-  /** 还原隔离区中的文件（FR-08 降级路径） */
-  restoreQuarantine = (id: string): Promise<{ restored: boolean; path?: string; reason?: string }> =>
+  /**
+   * 还原隔离区中的文件。
+   *
+   * 还原是一次真实写入，因此与备份走同一套写入闸门：
+   * 介质不可写或处于隔离观察时必须拒绝，而不是硬写。
+   * 目标位置已被占用时默认拒绝，需要用户显式确认覆盖（FR-08）。
+   */
+  restoreQuarantine = (id: string, overwrite = false): Promise<{ restored: boolean; path?: string; reason?: string }> =>
     this.run(async () => {
       if (typeof id !== 'string' || !id.trim()) throw new Error('隔离区记录标识无效');
-      const result = await this.quarantine.restore(id);
+      if (this.options.gate) {
+        const verdict = await this.options.gate(this.currentRoot || this.localDirectory);
+        if (!verdict.allowed) {
+          const reason = verdict.reason ?? '写入闸门未放行，已拒绝还原';
+          await this.audit({ at: Date.now(), action: '还原被闸门阻断', outcome: 'blocked', reason });
+          return { restored: false, reason };
+        }
+      }
+      const result = await this.quarantine.restore(id, overwrite);
+      await this.refreshQuarantine();
       this.event(result.restored ? '已还原隔离文件' : '还原失败', result.reason ?? result.path);
       await this.audit({
         at: Date.now(),
@@ -665,6 +731,29 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
     });
 
   /**
+   * 列出本机隔离区条目（FR-08）。
+   *
+   * 隔离区里的文件是**已经从原处移走**的：没有这条列表，
+   * 用户重启之后就再也找不到它们，也无从还原。
+   */
+  listQuarantine = (): Promise<DupQuarantineEntry[]> =>
+    this.run(async () => {
+      await this.refreshQuarantine();
+      return this.quarantineSnapshot;
+    });
+
+  /** 从隔离区索引刷新快照 */
+  private async refreshQuarantine(): Promise<void> {
+    const entries = await this.quarantine.list();
+    this.quarantineSnapshot = entries.map((entry) => ({
+      id: entry.id,
+      originalPath: entry.originalPath,
+      size: entry.size,
+      deletedAt: entry.createdAt,
+    }));
+  }
+
+  /**
    * 取消扫描或取消剩余删除项（FR-15）。
    *
    * **不进操作队列**：取消必须立即生效，不能排在正在执行的扫描/删除之后。
@@ -673,40 +762,25 @@ export class DuplicateFinder extends EventEmitter implements DupApi {
   cancel = async (): Promise<DupStatus> => {
     // 取消落到「当前这次操作」上：即便它还在排队，也会被这次取消命中。
     this.cancelToken = this.operationToken;
-    // 取消优先于完成：无论扫描是「仍在跑」还是「刚好跑完」，用户点了取消就不能报完成（FR-15）。
-    // 已算出的结果仍留在会话里，但状态是「已取消」，删除入口随之关闭——结果不完整，不可当真。
-    if (this.phase !== 'idle') {
+    // 取消优先于完成：扫描途中点了取消就不能报完成（FR-15）。
+    // 但**已经跑完**的结果是完整的——此时再点取消不该把一份完整结果改成「不完整」，
+    // 否则用户白白丢掉可用结果，只能重新检测。
+    // 「刚好跑完」的竞态由扫描自身的 cancelToken 检查兜住（见 scan 末尾）。
+    const inFlight: DupStatus['phase'][] = [
+      'scanning',
+      'bucketing',
+      'partial-hashing',
+      'hashing',
+      'summarizing',
+      'acting',
+    ];
+    if (inFlight.includes(this.phase)) {
       this.phase = 'cancelled';
       this.reason = '已取消，本次检测结果不完整，可重新检测';
     }
     this.event('已请求取消');
     await this.audit({ at: Date.now(), action: '请求取消', outcome: 'skipped', reason: '用户取消' });
     return this.view();
-  };
-
-  /**
-   * 供备份侧使用的「被排除相对路径」集合。
-   *
-   * 新版抑制黑名单以**内容哈希**为键，备份侧仍需要「哪些相对路径被排除」，
-   * 因此由这里从抑制记录里映射出相对路径：
-   * 只取 `scopeMode === 'root'` 且作用域根匹配该源目录的抑制项。
-   */
-  exclusionPaths = async (sourceRoot: string): Promise<ReadonlySet<string>> => {
-    await this.loaded;
-    const root = normalizeRoot(sourceRoot);
-    const paths = new Set<string>();
-    for (const item of this.suppressionItems) {
-      if (item.scopeMode !== 'root') continue;
-      const scope = normalizeRoot(item.scopeRoot);
-      const scopeReal = item.scopeRootReal ? normalizeRoot(item.scopeRootReal) : '';
-      if (scope !== root && scopeReal !== root) continue;
-      for (const absolute of item.paths ?? []) {
-        const relative = path.relative(path.resolve(item.scopeRoot), path.resolve(absolute));
-        if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
-        paths.add(relative.split(path.sep).join('/'));
-      }
-    }
-    return paths;
   };
 
   // ---- 内部辅助 ----

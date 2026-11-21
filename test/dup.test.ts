@@ -3,8 +3,10 @@ import { promises as fs } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import path from 'node:path';
 import { DuplicateFinder } from '../electron/engine/dup';
+import { createDuplicateFinder } from '../electron/engine/dup/wiring';
 import { groupNameConflicts } from '../electron/engine/dup/detect';
 import { FULL_HASH_LIMIT_BYTES } from '../electron/engine/dup/hash';
+import { BackupService } from '../electron/engine/service';
 import type {
   DupActRequest,
   DupActResult,
@@ -140,10 +142,15 @@ async function fixture(options: FixtureOptions, fn: (fx: Fixture) => Promise<voi
     await fs.rename(absPath, path.join(dir, path.basename(absPath)));
   };
 
-  const finder = new DuplicateFinder(local, {
+  // 走真实的接线模块：回归用例必须覆盖「查重 → 备份」这条接缝本身，
+  // 否则接线被改回去时测试察觉不到（P-03 的教训）。
+  const finder = createDuplicateFinder({
+    localDirectory: local,
     trash: options.trash ?? simTrash,
-    gate: options.gate ?? (async () => ({ allowed: true })),
-    isBusy: options.isBusy ?? (() => busy.value),
+    writeGate: options.gate ?? (async () => ({ allowed: true })),
+    isBackupBusy: options.isBusy ?? (() => busy.value),
+    isAutoSyncRunning: () => false,
+    revealFile: () => undefined,
     onSuppressionsChanged: (changedRoot, reason) => changes.push(`${changedRoot}|${reason}`),
   });
 
@@ -174,6 +181,70 @@ function entryOf(group: DupGroup, absPath: string): DupFileEntry {
   const entry = group.entries.find((e) => e.absPath === absPath);
   assert.ok(entry, `组内应包含条目 ${absPath}`);
   return entry;
+}
+
+/**
+ * 由组内条目构造删除请求。
+ *
+ * `groupId` 必须带上：删除登记表按「路径 + 组」定位，
+ * 缺了它就找不到这条登记，也就无法区分同名的不同组。
+ */
+function actRequest(
+  root: string,
+  group: DupGroup,
+  entries: DupFileEntry[],
+  overrides?: Partial<DupActRequest>,
+): DupActRequest {
+  return {
+    root,
+    items: entries.map((entry) => ({
+      id: entry.id,
+      absPath: entry.absPath,
+      groupId: group.id,
+      sha256: entry.sha256,
+      size: entry.size,
+      dev: entry.dev,
+      ino: entry.ino,
+    })),
+    groupIds: [group.id],
+    category: group.category,
+    ...overrides,
+  };
+}
+
+/** CSV 行解析：用于验证导出文件的列结构没有被文件名里的分隔符冲掉 */
+function splitCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let current = '';
+  let quoted = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          current += '"';
+          i += 1;
+        } else {
+          quoted = false;
+        }
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      quoted = true;
+      continue;
+    }
+    if (ch === ',') {
+      out.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  out.push(current);
+  return out;
 }
 
 /**
@@ -976,6 +1047,293 @@ async function main(): Promise<void> {
         fakeEntry({ absPath: 'D:\\资料库\\文档\\纪要.md', dirPath: 'D:\\资料库\\文档', fileName: '纪要.md', sha256: '0'.repeat(64) }),
       ])[0];
       assert.equal(conflict.reclaimableBytes, 0, '同名不同内容区不计入可回收空间');
+    }));
+
+  // ------------------------------------------------ P-03 回归：抑制不得改变备份
+
+  await test('P-03-1 查重抑制后源端内容仍全部进入备份计划（不得静默漏备份）', () =>
+    fixture({}, async ({ root, base }) => {
+      // 源端 5 份内容完全一致的文件，分属 5 个子目录（协作者报告的现象 A / C）
+      for (const dir of ['dir1', 'dir2', 'dir3', 'dir4', 'dir5']) {
+        await put(root, `${dir}/photo.jpg`, blob('identical-five'));
+      }
+
+      // 真实备份引擎 + 真实接线：抑制项落在同一个本机状态目录，
+      // 删除侧能力全部指向这台真实的备份服务。
+      const target = path.join(base, 'target');
+      await fs.mkdir(target, { recursive: true });
+      const service = new BackupService(path.join(base, 'journal'));
+      const finder = createDuplicateFinder({
+        localDirectory: path.join(base, 'local'),
+        trash: async (absPath) => {
+          await fs.rm(absPath, { force: true });
+        },
+        writeGate: (gateRoot) => service.writeGate(gateRoot),
+        isBackupBusy: () => service.isBusy(),
+        isAutoSyncRunning: () => false,
+        revealFile: () => undefined,
+      });
+
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      assert.ok(group, '应识别出一个内容重复组');
+      assert.ok(group.sha256, '内容重复组必须带内容哈希');
+
+      // 用户点「下次不提醒」：抑制只该影响检测页的提示
+      const afterSuppress = await finder.suppress(root, group.sha256, 'root', group.entries.map((e) => e.absPath));
+      assert.equal(resultOf(afterSuppress).identicalGroups.length, 0, '抑制后该组不再提示');
+      assert.equal((await finder.listSuppressions(root)).length, 1, '抑制项必须落盘');
+
+      // 备份引擎走真实计划路径：抑制不得改变「写什么」
+      const plan = await service.plan(root, target, 'copy');
+
+      assert.equal(plan.summary.totalFiles, 5, '源端文件数照常计入');
+      assert.equal(plan.summary.copy, 5, '抑制后 5 份源端内容仍必须全部写入目标端');
+      assert.equal(plan.summary.delete, 0);
+      assert.equal(plan.summary.retained, 0);
+    }));
+
+  await test('P-03-2 严格镜像模式下源端删除后目标端收敛（孤儿清理不得被挡掉）', () =>
+    fixture({}, async ({ root, base, finder }) => {
+      const target = path.join(base, 'target');
+      await put(root, 'dir1/photo.jpg', blob('pair'));
+      await put(root, 'dir2/photo.jpg', blob('pair'));
+      // 目标端已有同样两份（此前同步过）
+      await put(target, 'dir1/photo.jpg', blob('pair'));
+      await put(target, 'dir2/photo.jpg', blob('pair'));
+
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      assert.ok(group?.sha256);
+      await finder.suppress(root, group.sha256, 'root', group.entries.map((e) => e.absPath));
+
+      // 源端删掉其中一份
+      await fs.rm(path.join(root, 'dir2/photo.jpg'));
+
+      const service = new BackupService(path.join(base, 'journal'));
+      const plan = await service.plan(root, target, 'mirror');
+      const deletes = plan.actions.filter((action) => action.type === 'delete');
+      assert.equal(deletes.length, 1, '严格镜像下源端已删除的副本必须生成删除动作');
+      assert.equal(deletes[0].relPath, 'dir2/photo.jpg');
+    }));
+
+  await test('P-03-3 查重与备份之间不存在排除名单桥（接线面边界）', () =>
+    fixture({}, async ({ base, finder }) => {
+      // 规格 §4.2：与备份引擎的自动联动不做。抑制只影响提示。
+      // 这条桥一旦被接回，抑制就会把整组内容静默排除出备份（P-03 现象 C），
+      // 因此两侧都不允许再暴露「排除名单」接口。
+      const finderBridge = Object.getOwnPropertyNames(finder).filter((name) => /exclusion|exclude/i.test(name));
+      assert.deepEqual(finderBridge, [], `查重模块不应再暴露排除名单接口：${finderBridge.join(', ')}`);
+
+      const service = new BackupService(path.join(base, 'journal'));
+      const serviceBridge = Object.getOwnPropertyNames(Object.getPrototypeOf(service)).filter((name) =>
+        /exclusion/i.test(name),
+      );
+      assert.deepEqual(serviceBridge, [], `备份引擎不应再保留排除名单注入入口：${serviceBridge.join(', ')}`);
+    }));
+
+  // ------------------------------------------------ 集成缺陷回归：P-03 与审查发现
+
+  await test('FR-11 多轮删除不得清空整组（硬约束跨轮次成立）', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'd1/a.txt', blob('triple'));
+      await put(root, 'd2/a.txt', blob('triple'));
+      await put(root, 'd3/a.txt', blob('triple'));
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      assert.equal(group.entries.length, 3);
+
+      // 第一轮：删 1 份（合法，组内还剩 2 份）
+      const first = await finder.act(root, actRequest(root, group, [group.entries[0]]));
+      assert.equal(first.deleted, 1, '第一轮删除应成功');
+
+      // 第二轮：把剩下 2 份一起删 → 必须被拒，否则整组被清空
+      const rest = group.entries.slice(1);
+      const second = await finder.act(root, actRequest(root, group, rest));
+      assert.equal(second.deleted, 0, '第二轮不得把整组清空');
+      assert.equal(second.blocked, 2);
+      assert.ok(second.items.every((item) => item.outcome === 'blocked'));
+
+      // 组内必须还剩至少一份
+      const alive = await Promise.all(
+        group.entries.map(async (entry) => {
+          try {
+            await fs.stat(entry.absPath);
+            return true;
+          } catch {
+            return false;
+          }
+        }),
+      );
+      assert.ok(alive.filter(Boolean).length >= 1, '组内必须至少保留一份');
+    }));
+
+  await test('FR-11 登记表按「路径+组」隔离：同名告警组不得覆盖内容重复组', () =>
+    fixture({}, async ({ root, finder }) => {
+      // NTFS 不做 Unicode 归一，因此 NFC 与 NFD 两种写法可以同时存在于一个目录；
+      // 但同名判定会先归一到 NFC，因此它们构成「同名不同内容」告警组。
+      // 于是 NFC 那一份同时属于「内容重复」组与「同名告警」组——
+      // 登记表若只按路径建键，就会被后写入的组覆盖，硬约束随之用错组。
+      await put(root, 'same/caf\u00e9.txt', blob('content-x'));
+      await put(root, 'same/cafe\u0301.txt', blob('content-y'));
+      await put(root, 'same/other.txt', blob('content-x'));
+      const { status } = await scanWatch(finder, root);
+      const result = resultOf(status);
+      const identical = result.identicalGroups.find((group) => group.entries.length === 2);
+      assert.ok(identical, '应识别出内容重复组');
+      assert.equal(result.nameConflictGroups.length, 1, '应识别出同名不同内容组');
+
+      // 删内容重复组的两个成员 → 整组会被清空，必须被拒
+      const outcome = await finder.act(root, actRequest(root, identical, identical.entries));
+      assert.equal(outcome.deleted, 0, '不得清空整组');
+      assert.equal(outcome.blocked, identical.entries.length);
+    }));
+
+  await test('取消后主进程必须自己拒绝执行删除（不依赖界面禁用按钮）', () =>
+    fixture({}, async ({ root, finder, trashCalls }) => {
+      for (let i = 0; i < 300; i += 1) await put(root, `bulk/f${i}.bin`, blob(`bulk-${i}`, 32 * 1024));
+      const promise = finder.scan(root);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await finder.cancel();
+      const status = await promise;
+      assert.equal(status.phase, 'cancelled');
+
+      let message = '';
+      try {
+        await finder.act(root, {
+          root,
+          items: [{ id: 'x', absPath: path.join(root, 'bulk/f0.bin'), groupId: 'g', sha256: 'a'.repeat(64), size: 1, dev: '1', ino: '1' }],
+          groupIds: ['g'],
+          category: 'identical',
+        });
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      assert.match(message, /当前状态不允许执行删除/, '取消后必须由主进程拒绝执行删除');
+      assert.equal(trashCalls.length, 0, '取消后不得删除任何文件');
+    }));
+
+  await test('扫描完成后再点取消不得作废完整结果', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'a/one.txt', blob('already-done'));
+      await put(root, 'b/two.txt', blob('already-done'));
+      await scanWatch(finder, root);
+      const after = await finder.cancel();
+      assert.equal(after.phase, 'ready', '已完成的检测结果不应被取消作废');
+      assert.equal(after.canAct, true);
+    }));
+
+  await test('同名不同内容告警区删除必须显式二次确认（FR-18）', () =>
+    fixture({}, async ({ root, finder, trashCalls }) => {
+      // NFC / NFD 两种写法同名但内容不同 → 告警区
+      await put(root, 'same/caf\u00e9.txt', blob('x-content'));
+      await put(root, 'same/cafe\u0301.txt', blob('y-content'));
+      const { status } = await scanWatch(finder, root);
+      const conflict = resultOf(status).nameConflictGroups[0];
+      assert.ok(conflict, '应识别出同名不同内容组');
+      const victim = conflict.entries[0];
+
+      const unconfirmed = await finder.act(root, actRequest(root, conflict, [victim]));
+      assert.equal(unconfirmed.deleted, 0, '未显式确认时不得删除');
+      assert.equal(unconfirmed.items[0].outcome, 'blocked');
+      assert.equal(trashCalls.length, 0);
+      await fs.stat(victim.absPath);
+
+      const confirmed = await finder.act(
+        root,
+        actRequest(root, conflict, [victim], { confirmSameNameConflict: true }),
+      );
+      assert.equal(confirmed.deleted, 1, '显式确认后应当放行');
+    }));
+
+  await test('隔离区登记失败时源文件必须留在原处（不得「报失败但文件已消失」）', () =>
+    fixture(
+      { trash: async () => { throw new Error('系统回收站不可用'); } },
+      async ({ root, finder, local }) => {
+        await put(root, 'a/one.txt', blob('quarantine-fail'));
+        await put(root, 'b/two.txt', blob('quarantine-fail'));
+        const { status } = await scanWatch(finder, root);
+        const group = resultOf(status).identicalGroups[0];
+        const victim = group.entries[0];
+
+        // 预置隔离区索引为一个目录，使索引写入必然失败
+        await fs.mkdir(path.join(local, 'quarantine', 'index.json'), { recursive: true });
+
+        const outcome = await finder.act(root, actRequest(root, group, [victim]));
+        assert.equal(outcome.deleted, 0);
+        assert.equal(outcome.failed, 1);
+        // 关键断言：文件必须还在原处，不能「报失败但已经被移走」
+        await fs.stat(victim.absPath);
+      },
+    ));
+
+  await test('隔离区条目可列出且还原时不得静默覆盖占用中的目标', () =>
+    fixture(
+      { trash: async () => { throw new Error('系统回收站不可用'); } },
+      async ({ root, finder }) => {
+        await put(root, 'a/one.txt', blob('occupied'));
+        await put(root, 'b/two.txt', blob('occupied'));
+        const { status } = await scanWatch(finder, root);
+        const group = resultOf(status).identicalGroups[0];
+        const victim = group.entries[0];
+
+        const outcome = await finder.act(root, actRequest(root, group, [victim]));
+        assert.equal(outcome.deleted, 1);
+        assert.equal(outcome.degradedToQuarantine, true);
+        const quarantineId = outcome.items[0].quarantineId;
+        assert.ok(quarantineId, '降级后必须给出隔离区条目 id');
+
+        // 隔离区条目可列出（重启后也必须能还原）
+        const listed = await finder.listQuarantine();
+        assert.equal(listed.length, 1);
+        assert.equal(listed[0].id, quarantineId);
+        assert.equal(listed[0].originalPath, victim.absPath);
+        assert.equal(listed[0].size, BLOB_SIZE);
+
+        // 目标位置被占用 → 默认拒绝还原
+        await put(root, 'a/one.txt', blob('new-content'));
+        const blocked = await finder.restoreQuarantine(quarantineId);
+        assert.equal(blocked.restored, false);
+        assert.match(blocked.reason ?? '', /占用/, '必须明确提示目标被占用');
+        const kept = await fs.readFile(victim.absPath, 'utf8');
+        assert.match(kept, /new-content/, '被占用的目标不得被静默覆盖');
+
+        // 显式确认覆盖后才还原
+        const forced = await finder.restoreQuarantine(quarantineId, true);
+        assert.equal(forced.restored, true);
+      },
+    ));
+
+  await test('审计写入失败必须如实回报（不得静默吞掉）', () =>
+    fixture({}, async ({ root, finder, local }) => {
+      const now = new Date();
+      const name = `audit-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}.jsonl`;
+      // 把审计文件占成一个目录，appendFile 必然失败
+      await fs.mkdir(path.join(local, name), { recursive: true });
+
+      await put(root, 'a/one.txt', blob('audit-fail'));
+      await put(root, 'b/two.txt', blob('audit-fail'));
+      const { status } = await scanWatch(finder, root);
+      const group = resultOf(status).identicalGroups[0];
+      const outcome = await finder.act(root, actRequest(root, group, [group.entries[0]]));
+      assert.equal(outcome.deleted, 1);
+      assert.equal(outcome.auditFailed, true, '审计写失败必须回报给调用方');
+    }));
+
+  await test('CSV 导出必须转义文件名里的分隔符（列结构不得被冲掉）', () =>
+    fixture({}, async ({ root, finder }) => {
+      await put(root, 'a/weird,name.txt', blob('csv-escape'));
+      await put(root, 'b/other.txt', blob('csv-escape'));
+      const { status } = await scanWatch(finder, root);
+      assert.equal(resultOf(status).identicalGroups.length, 1);
+
+      const exported = await finder.exportReport('csv');
+      const text = await fs.readFile(exported.path, 'utf8');
+      const lines = text.trim().split('\n');
+      assert.equal(lines.length, 3, '表头 + 两行数据');
+      for (const line of lines) {
+        assert.equal(splitCsvLine(line).length, 11, `每行必须保持 11 列：${line}`);
+      }
     }));
 
   // ------------------------------------------------ 阶段覆盖汇总

@@ -165,13 +165,6 @@ export class BackupService extends EventEmitter {
   private copiedBytes = 0;
   private totalBytes = 0;
   private startedAt = 0;
-  /**
-   * 重复排除名单来源（REQ-DUP-001）。
-   *
-   * 由重复文件查找器注入。排除名单改变的是**写什么**，必须与计划同源，
-   * 否则会出现「源端不再写入、目标端却被删掉」的自相矛盾。
-   */
-  private exclusionProvider?: (sourceRoot: string) => Promise<ReadonlySet<string>>;
 
   constructor(userDataDir: string) {
     super();
@@ -248,40 +241,6 @@ export class BackupService extends EventEmitter {
    */
   isBusy(): boolean {
     return this.running || this.diagnosing;
-  }
-
-  /**
-   * 注入重复排除名单来源。
-   *
-   * 排除名单按源目录分组，源目录用 realpath 归一（目录联接/符号链接下
-   * 原始路径与真实路径会不同，漏匹配会导致排除不生效）。
-   */
-  setExclusionProvider(provider: (sourceRoot: string) => Promise<ReadonlySet<string>>): void {
-    this.exclusionProvider = provider;
-  }
-
-  /**
-   * 排除名单变更后旧计划立即失效。
-   *
-   * 旧计划里含有变更前的动作集合，继续执行会写入用户已经排除的副本，
-   * 或者漏掉刚刚解除排除的副本——两种都是错的。必须重新扫描生成新计划。
-   */
-  invalidatePlan(reason: string): void {
-    if (!this.currentPlan) return;
-    this.currentPlan = null;
-    this.plannedMedia = null;
-    this.actionIndex.clear();
-    this.state.actions = [];
-    this.state.requiresConfirmation = false;
-    this.state.confirmReason = reason;
-    this.log('warn', reason);
-    this.setPhase('idle');
-    this.emit('plan', {
-      actions: [],
-      summary: this.state.summary,
-      requiresConfirmation: false,
-      confirmReason: reason,
-    });
   }
 
   private log(level: LogLevel['level'], text: string): void {
@@ -432,7 +391,6 @@ export class BackupService extends EventEmitter {
         target,
         manifest: verifyTarget ? null : manifest,
         syncMode,
-        excluded: this.exclusionProvider ? await this.exclusionProvider(sourceRoot) : new Set<string>(),
         onProgress: (stage, done, total) => {
           this.emit('progress', {
             copiedBytes: this.copiedBytes,

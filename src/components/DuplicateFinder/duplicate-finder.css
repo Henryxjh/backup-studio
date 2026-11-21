@@ -297,39 +297,48 @@
   min-height: 0;
 }
 
-.dup-warn-strip {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-2);
-  padding: var(--sp-3);
-  border-radius: var(--radius-outer);
-  background: var(--danger-soft);
-  color: var(--danger);
-  font-size: var(--fs-meta);
-}
-
-.dup-warn-strip strong {
-  font-weight: var(--w-semibold);
-  display: block;
-  text-wrap: pretty;
-}
-
-.dup-warn-strip p {
-  margin-top: 2px;
-  color: var(--text-secondary);
-  text-wrap: pretty;
-}
-
 /* ============ 结果区 ============ */
 
 .dup-zone {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
+  /* 结果区不参与弹性压缩：内部列表壳有确定高度，压缩会让视口量不准 */
+  flex: 0 0 auto;
   min-height: 0;
   background: var(--bg-panel);
   border-radius: var(--radius-outer);
   padding: var(--sp-3) var(--sp-4) var(--sp-4);
+}
+
+/*
+ * 告警头贴住分区卡片的顶边，做成同一张卡的头部。
+ *
+ * 警告单独成卡时用户要自己推断「它说的是下面那个分区」，
+ * 合进一个盒子后，警告与所指对象在结构上就绑在一起了。
+ */
+.dup-zone-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin: calc(var(--sp-3) * -1) calc(var(--sp-4) * -1) var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-outer) var(--radius-outer) 0 0;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: var(--fs-meta);
+}
+
+.dup-zone-warn strong {
+  font-weight: var(--w-semibold);
+  display: block;
+  text-wrap: pretty;
+}
+
+.dup-zone-warn p {
+  margin-top: 2px;
+  color: var(--text-secondary);
+  text-wrap: pretty;
 }
 
 .dup-zone-head {
@@ -361,8 +370,17 @@
   flex-wrap: wrap;
 }
 
+/*
+ * 列表壳必须给出**确定高度**。
+ *
+ * VirtualList 按容器的 clientHeight 量视口：高度不确定时视口等于全部内容，
+ * 上万条重复文件会被全量渲染并卡死主线程（FR-16）。
+ * 与 src/styles/app.css 里 .pane-body-scroll .plan-group .list-shell 的做法一致：
+ * 高度确定后，两栏各自在自己的列表里滚动，页面整体仍可滚动。
+ */
 .dup-list {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
+  height: 320px;
   min-height: 160px;
   display: flex;
   background: var(--bg-inset);
@@ -447,6 +465,53 @@
 
 .dup-group-title em[data-tone='warn'] {
   color: var(--warn);
+}
+
+/*
+ * 指纹只是分组的副信息：字号与权重都要让位给标题本身，
+ * 否则一串哈希会抢走整行的视觉重心。
+ */
+.dup-fingerprint-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: var(--fs-meta);
+  font-weight: var(--w-regular);
+  color: var(--text-secondary);
+}
+
+/*
+ * 指纹标签本身是个按钮：悬停给完整值，单击复制完整指纹。
+ * 复制成功必须改状态，否则用户无从判断是否复制成功。
+ */
+.dup-page .dup-fingerprint {
+  font: inherit;
+  font-size: var(--fs-meta);
+  font-weight: var(--w-medium);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
+  border: none;
+  border-radius: var(--radius-row);
+  padding: 0 5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.dup-page .dup-fingerprint:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.dup-page .dup-fingerprint:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-inset), 0 0 0 4px var(--accent-ghost);
+}
+
+.dup-page .dup-fingerprint[data-copied='true'] {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .dup-group-meta {
@@ -735,4 +800,61 @@
 .dup-suppress-meta {
   font-size: var(--fs-meta);
   color: var(--text-tertiary);
+}
+
+/* ============ 最近事件与报告 ============ */
+
+.dup-events {
+  background: var(--bg-panel);
+  border-radius: var(--radius-outer);
+  padding: var(--sp-3) var(--sp-4) var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.dup-event-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* 事件流可能很长，限定高度并自行滚动，避免把整页撑开 */
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.dup-event {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: 3px var(--sp-2);
+  border-radius: var(--radius-row);
+  font-size: var(--fs-meta);
+  color: var(--text-secondary);
+}
+
+.dup-event[data-outcome='failed'],
+.dup-event[data-outcome='blocked'] {
+  color: var(--danger);
+}
+
+.dup-event-time {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.dup-event-action {
+  flex: 0 0 auto;
+  color: var(--text-primary);
+}
+
+.dup-event-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }

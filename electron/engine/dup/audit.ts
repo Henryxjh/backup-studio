@@ -39,7 +39,7 @@ export function auditFileName(at: number): string {
  * 审计日志写入器。
  *
  * 写入失败不阻断业务动作：审计是辅助证据，不能因为磁盘问题让用户的清理操作失败，
- * 但也不能静默——失败会通过返回值告知调用方。
+ * 但也**不能静默**——`append` 会如实返回是否落盘成功，由调用方统计并回报。
  */
 export class AuditLog {
   constructor(readonly directory: string, private readonly knownPaths: string[] = []) {}
@@ -53,8 +53,10 @@ export class AuditLog {
    * 追加一条审计记录。
    *
    * 脱敏：绝对路径整体替换为占位符，同时保留相对路径以维持可追溯性。
+   *
+   * @returns 是否成功落盘
    */
-  async append(entry: DupAuditEntry): Promise<void> {
+  async append(entry: DupAuditEntry): Promise<boolean> {
     const record = {
       at: entry.at,
       action: entry.action,
@@ -68,8 +70,10 @@ export class AuditLog {
     try {
       await fs.mkdir(this.directory, { recursive: true });
       await fs.appendFile(this.filePath(entry.at), line, 'utf8');
+      return true;
     } catch {
-      // 审计落盘失败不改变动作结果；调用方可通过返回值感知
+      // 审计落盘失败不改变动作结果，但失败事实要带回给调用方
+      return false;
     }
   }
 
