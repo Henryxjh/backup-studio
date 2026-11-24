@@ -11,11 +11,15 @@ const suites = [
   'test:recycle-crash',
 ];
 
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const npmCli = process.env.npm_execpath;
 const failed = [];
 
+if (!npmCli) {
+  throw new Error('npm_execpath 未设置；请通过 npm test 运行测试调度器');
+}
+
 for (const suite of suites) {
-  const result = spawnSync(npm, ['run', suite], { stdio: 'inherit' });
+  const result = spawnSync(process.execPath, [npmCli, 'run', suite], { stdio: 'inherit' });
   if (result.error) {
     console.error(`\n无法启动 ${suite}:`, result.error);
     failed.push(suite);
