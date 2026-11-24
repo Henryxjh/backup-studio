@@ -627,7 +627,7 @@ export default function App() {
         <Splitter containerRef={workspaceRef} collapsed={collapsed} onCollapsedChange={setCollapsed} />
 
         <section className="pane pane-right">
-          <div className="pane-body">
+          <div className="pane-body pane-body-scroll" tabIndex={0} role="region" aria-label="备份详情">
             {workspace === 'manual' ? (
               <div className="section">
                 <div className="section-title">执行进度</div>

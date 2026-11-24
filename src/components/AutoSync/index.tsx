@@ -132,7 +132,8 @@ export function AutoSyncPanel({ api, pickDirectory, onActiveTargetChange, onRunn
   };
 
   const submitPair = (input: AutoPairInput) => {
-    if (formMode === 'edit' && focused) {
+    if (formMode === 'edit') {
+      if (!focused) return;
       void perform(async () => {
         const next = await api.updatePair(focused.pair.id, input);
         setFormMode('view');
@@ -421,43 +422,52 @@ export function AutoSyncPanel({ api, pickDirectory, onActiveTargetChange, onRunn
                   确认并重新对账
                 </button>
               ) : null}
+            </>
+          )}
 
-              <section className="aut-form-section">
-                <div className="aut-detail-head">
-                  <div className="aut-subtitle">
-                    {formMode === 'add' ? '新增配对' : formMode === 'edit' ? '修改配对' : '配对设置'}
-                  </div>
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    aria-expanded={formOpen}
-                    onClick={() => setFormOpen((open) => !open)}
-                  >
-                    {formOpen ? '收起' : '展开'}
-                  </button>
+          {formMode === 'add' || focused ? (
+            <section className="aut-form-section">
+              <div className="aut-detail-head">
+                <div className="aut-subtitle">
+                  {formMode === 'add' ? '新增配对' : formMode === 'edit' ? '修改配对' : '配对设置'}
                 </div>
-                {formOpen ? (
-                  formMode === 'add' ? (
-                    <PairForm
-                      key="new"
-                      busy={busy}
-                      pickDirectory={pickDirectory}
-                      onSubmit={submitPair}
-                      onCancel={() => setFormMode('view')}
-                    />
-                  ) : (
-                    <PairForm
-                      key={focused.pair.id}
-                      initial={focused.pair}
-                      busy={busy}
-                      pickDirectory={pickDirectory}
-                      onSubmit={submitPair}
-                      onCancel={() => setFormMode('view')}
-                    />
-                  )
-                ) : null}
-              </section>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  aria-expanded={formOpen}
+                  onClick={() => setFormOpen((open) => !open)}
+                >
+                  {formOpen ? '收起' : '展开'}
+                </button>
+              </div>
+              {formOpen ? (
+                formMode === 'add' ? (
+                  <PairForm
+                    key="new"
+                    busy={busy}
+                    pickDirectory={pickDirectory}
+                    onSubmit={submitPair}
+                    onCancel={() => {
+                      setAlert('');
+                      setFormMode('view');
+                    }}
+                  />
+                ) : focused ? (
+                  <PairForm
+                    key={focused.pair.id}
+                    initial={focused.pair}
+                    busy={busy}
+                    pickDirectory={pickDirectory}
+                    onSubmit={submitPair}
+                    onCancel={() => setFormMode('view')}
+                  />
+                ) : null
+              ) : null}
+            </section>
+          ) : null}
 
+          {focused && (
+            <>
               {/* 回收站摘要常驻：项数、占用、最早到期时间 */}
               <section className="aut-recycle-summary" aria-label="回收站摘要">
                 <div className="aut-subtitle">回收站</div>
@@ -589,6 +599,7 @@ export function AutoSyncPanel({ api, pickDirectory, onActiveTargetChange, onRunn
               void perform(async () => {
                 const next = await api.removePair(current.pairId);
                 setFocusId(next.pairs[0]?.pair.id ?? '');
+                if (next.pairs.length === 0) setFormMode('view');
                 return next;
               });
               return;

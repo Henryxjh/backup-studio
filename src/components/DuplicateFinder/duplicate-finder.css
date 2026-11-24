@@ -282,11 +282,12 @@
 /* ============ 双栏：内容重复 | 同名不同内容 ============ */
 
 .dup-columns {
+  /* 双栏按内容高度排版，空间不足时由页面滚动，避免最近事件覆盖结果。 */
+  flex: 0 0 auto;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: var(--sp-4);
   align-items: start;
-  min-height: 0;
 }
 
 .dup-column {
