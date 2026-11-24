@@ -304,8 +304,30 @@ export interface MediaAssessment {
   suggestion: string;
   /** 判定时间 */
   at: number;
-  /** 是否允许写入该介质；L0 为 true，L1/L2 为 false */
+  /**
+   * 是否已取得足以确认可写的分层证据；L0 为 true，L1/L2 为 false。
+   *
+   * 注意：false 只表示「证据不足或已确认异常」，不等于「禁止写入」——
+   * L1 常常只是平台不支持卷级探测或权限不足，引擎的写入闸门按
+   * volumeHealth 与模式另行裁决。界面据此提示，不要直接当作拒绝写入。
+   */
   writable: boolean;
+  /**
+   * 本次判定针对的目标根目录。
+   *
+   * 判定结论必须与目标绑定：换了目标目录，上一份判定就不再适用，
+   * 界面据此判断是否允许开始备份，避免拿旧结论误放行或误禁用。
+   */
+  targetRoot?: string;
+  /**
+   * 判定条件。区分同为 L1 的不同成因：
+   * - filesystem-repair：文件系统需人工检查，必须保持只读；
+   * - unreachable：目标不可达，写入无从谈起；
+   * - media-unavailable：介质层不可用或已隔离；
+   * - verified：分层校验通过；
+   * - uncertain：仅是证据不足，不代表禁止写入。
+   */
+  condition?: HealthReport['condition'];
 }
 
 /** 隔离观察标记；不等同于「物理坏盘」，可撤销 */

@@ -201,6 +201,9 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
     assessment.suggestion = '目标目录不可达；先检查连接或访问权限，不据此认定介质层损伤。';
   }
   assessment.writable = assessment.level === 'L0';
+  // 判定条件随结论一起下发：同为 L1，「文件系统需人工检查」与「仅是证据不足」
+  // 对写入的含义完全不同，界面据此区分「必须保持只读」与「证据不足待复查」。
+  assessment.condition = condition;
   return { assessment, condition, volume: volume && letter ? `${letter}:` : null, permission, smart, index, files, diskReadOnly: typeof volume?.readOnly === 'boolean' ? volume.readOnly : null };
 }
 

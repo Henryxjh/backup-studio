@@ -1,4 +1,4 @@
-import { useLayoutEffect, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { IconDrive, IconFolder } from './Icons';
 import { fmtBytes, fmtInt } from '../lib/format';
 import type { ScanOutcome } from '../lib/api';
@@ -38,6 +38,9 @@ export function DirectoryPicker({
 }: Props) {
   const [sourceDraft, setSourceDraft] = useState<string>();
   const [targetDraft, setTargetDraft] = useState<string>();
+  // 点「浏览」时输入框会先失焦。此时不应提交草稿：提交会立刻进入扫描态并把
+  // 浏览按钮置为 disabled，用户点的对话框反而打不开，还会多扫一次。
+  const browsingRef = useRef(false);
 
   // 浏览等外部更新以父组件为准；同步草稿本身不触发提交。
   useLayoutEffect(() => setSourceDraft(undefined), [sourceRoot]);
@@ -45,9 +48,22 @@ export function DirectoryPicker({
 
   const commitDraft = (field: DirectoryField, draft: string | undefined) => {
     if (draft === undefined) return;
+    if (browsingRef.current) return;
     if (field === 'source') setSourceDraft(undefined);
     else setTargetDraft(undefined);
     onCommit(field, draft);
+  };
+
+  const startBrowse = (browse: () => void) => {
+    browsingRef.current = true;
+    try {
+      browse();
+    } finally {
+      // 浏览是异步的，对话框关闭后失焦才发生；下一帧再放开，避免误吞正常失焦提交。
+      requestAnimationFrame(() => {
+        browsingRef.current = false;
+      });
+    }
   };
 
   const commitOnEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
@@ -81,7 +97,12 @@ export function DirectoryPicker({
           onBlur={() => commitDraft('source', sourceDraft)}
           onKeyDown={commitOnEnter}
         />
-        <button className="btn btn-sm" type="button" onClick={onBrowseSource} disabled={busy}>
+        <button
+          className="btn btn-sm"
+          type="button"
+          onClick={() => startBrowse(onBrowseSource)}
+          disabled={busy}
+        >
           浏览
         </button>
       </div>
@@ -102,7 +123,12 @@ export function DirectoryPicker({
           onBlur={() => commitDraft('target', targetDraft)}
           onKeyDown={commitOnEnter}
         />
-        <button className="btn btn-sm" type="button" onClick={onBrowseTarget} disabled={busy}>
+        <button
+          className="btn btn-sm"
+          type="button"
+          onClick={() => startBrowse(onBrowseTarget)}
+          disabled={busy}
+        >
           浏览
         </button>
       </div>

@@ -285,9 +285,23 @@ export default function App() {
 
   const running = phase === 'running' || phase === 'paused';
   const assessment = state?.assessment;
+  // 判定结论只对被判定过的目标有效：目标换了就不得沿用上一份结论。
+  const assessmentApplies = Boolean(
+    assessment?.targetRoot && targetRoot && assessment.targetRoot === targetRoot
+  );
+  // L1 有两种成因，含义不同：
+  // - filesystem-repair：文件系统需人工检查，必须保持只读，按钮禁用；
+  // - uncertain：仅是证据不足（常见于平台不支持卷级探测或权限不足），不等于禁止写入。
+  const mustStayReadOnly = assessmentApplies
+    && (assessment?.condition === 'filesystem-repair'
+      || assessment?.condition === 'media-unavailable'
+      || assessment?.condition === 'unreachable'
+      || assessment?.level === 'L2');
+  // 证据不足：提示复查，但不禁用——引擎的写入闸门会按 volumeHealth 与模式裁决。
+  const evidenceIncomplete = assessmentApplies && !mustStayReadOnly && assessment?.writable === false;
   // 完成态按钮只重新扫描和生成计划，不会启动写入。
-  const writeBlockReason = phase !== 'completed' && assessment?.writable === false
-    ? `${assessment.level}：${assessment.suggestion}`
+  const writeBlockReason = phase !== 'completed' && mustStayReadOnly
+    ? `${assessment?.level}：${assessment?.suggestion}`
     : null;
   const canStart = Boolean(sourceRoot && targetRoot) && !running && phase !== 'scanning' && phase !== 'planning'
     && writeBlockReason === null;
@@ -595,6 +609,14 @@ export default function App() {
                 </div>
               ) : null}
 
+              {evidenceIncomplete && phase !== 'completed' ? (
+                <div className="banner" role="status">
+                  <span className="banner-text" title={assessment?.suggestion}>
+                    分层证据不足，建议先复查介质：{assessment?.suggestion}
+                  </span>
+                </div>
+              ) : null}
+
               <div className="action-bar">
                 <div className="status-line">
                   <span className="status-line-text">{statusText}</span>
@@ -682,7 +704,7 @@ export default function App() {
               disabled={phase === 'running' || phase === 'paused'}
             />
 
-            <div className="section" style={{ flex: '1 1 auto', minHeight: 0 }}>
+            <div className="section pane-event-section">
               <div className="section-title">执行事件</div>
               <EventFeed logs={state?.logs ?? []} />
             </div>

@@ -55,10 +55,18 @@ export function fmtPercent(ratio: number): string {
  * 那些属于引擎 `path-identity.ts` 的职责。
  *
  * 保留的根目录语义：Linux `/`、Windows 盘符根 `C:\`（含 `C:/`）、
- * Windows UNC 设备路径 `\\?\C:\`。POSIX 下反斜杠是合法文件名字符，故不当作分隔符。
+ * Windows 设备路径 `\\?\C:\`、Windows 卷 GUID 根 `\\?\Volume{...}\`。
+ * POSIX 下反斜杠是合法文件名字符，故不当作分隔符。
  */
 export function normalizeDirectoryRoot(path: string, isWindows: boolean): string {
-  if (isWindows && /^(?:[\\/]{2}[?.][\\/])?[A-Za-z]:[\\/]+$/.test(path)) return path;
+  if (isWindows) {
+    // 盘符根与设备路径根：盘符后必须带分隔符，`C:` 只是盘符不是根。
+    if (/^(?:[\\/]{2}[?.][\\/])?[A-Za-z]:[\\/]+$/.test(path)) return path;
+    // 卷 GUID 根（\\?\Volume{...}\）：末尾分隔符是卷根的一部分，删掉就不再被识别为卷根。
+    // Windows 的卷命名空间前缀大小写不敏感（Volume / volume / VOLUME 均可访问），
+    // 因此这里必须按不区分大小写匹配，否则小写变体会被削成不可访问的路径。
+    if (/^[\\/]{2}\?[\\/]volume\{[^}]+\}[\\/]+$/i.test(path)) return path;
+  }
   // 全是分隔符时保留原值，否则根目录会被削成空串。
   return path.replace(isWindows ? /[\\/]+$/ : /\/+$/, '') || path;
 }

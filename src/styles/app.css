@@ -254,6 +254,22 @@
   overflow-y: auto;
 }
 
+/*
+ * 右栏正文可滚动后，事件流仍是最底部模块。若它继续用 `flex: 1 1 auto` 撑满剩余高度，
+ * 窗口很矮时 `.feed` 会被压到没有可读高度，底部内容依然不可达。
+ * 这里给事件区一个最小可读高度，让它在空间不足时按内容高度参与外层滚动，
+ * 而不是把内部滚动容器压扁。
+ */
+.pane-event-section {
+  flex: 0 1 auto;
+  min-height: calc(6 * var(--fs-body) + var(--sp-4));
+}
+
+.pane-event-section .feed {
+  flex: 0 0 auto;
+  max-height: 40vh;
+}
+
 /* 左栏底部常驻区：恢复卡、错误横幅与主操作按钮都不随内容滚走 */
 .pane-footer {
   flex: 0 0 auto;

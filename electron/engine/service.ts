@@ -1033,6 +1033,8 @@ export class BackupService extends EventEmitter {
     const riskKey = await this.targetRiskKey(targetRoot);
     if (report.condition === 'filesystem-repair') this.blockedTargets.add(riskKey);
     if (report.condition === 'verified' && report.assessment.level === 'L0') this.blockedTargets.delete(riskKey);
+    // 判定结论必须带上它针对的目标：换了目标，上一份判定就不再适用。
+    report.assessment.targetRoot = targetRoot;
     this.state.assessment = report.assessment;
     this.emitState();
     return report;
@@ -1047,6 +1049,10 @@ export class BackupService extends EventEmitter {
     const report = process.platform === 'win32' ? await this.inspectTarget(targetRoot, true) : undefined;
     const riskKey = await this.targetRiskKey(targetRoot);
     const mark = this.state.quarantine;
+    // L2 是已确认的介质层故障，必须拒绝。
+    // L1 只表示「分层证据不足」，不等于禁止写入：证据不足往往源于平台不支持
+    // 卷级探测或权限不足，若一律拒绝会让无卷级权限的环境完全无法备份。
+    // 是否放行由 writeGate/decideWriteGate 按 volumeHealth 与模式裁决。
     if (report?.assessment.level === 'L2' || report?.diskReadOnly === true || this.blockedTargets.has(riskKey) || (mark && !mark.released && await this.targetRiskKey(mark.targetRoot) === riskKey)) {
       throw new Error('当前目标存在只读风险，禁止写入；请查看介质证据。');
     }
