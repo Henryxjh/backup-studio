@@ -1,17 +1,18 @@
+import { useLayoutEffect, useState } from 'react';
 import { IconDrive, IconFolder } from './Icons';
 import { fmtBytes, fmtInt } from '../lib/format';
 import type { ScanOutcome } from '../lib/api';
+
+export type DirectoryField = 'source' | 'target';
 
 interface Props {
   sourceRoot: string;
   targetRoot: string;
   scan: ScanOutcome | null;
   busy: boolean;
-  onSourceChange: (value: string) => void;
-  onTargetChange: (value: string) => void;
   onBrowseSource: () => void;
   onBrowseTarget: () => void;
-  onCommit: () => void;
+  onCommit: (field: DirectoryField, value: string) => void;
 }
 
 function Meta({ files, bytes }: { files: number; bytes: number }) {
@@ -31,16 +32,28 @@ export function DirectoryPicker({
   targetRoot,
   scan,
   busy,
-  onSourceChange,
-  onTargetChange,
   onBrowseSource,
   onBrowseTarget,
   onCommit,
 }: Props) {
+  const [sourceDraft, setSourceDraft] = useState<string>();
+  const [targetDraft, setTargetDraft] = useState<string>();
+
+  // 浏览等外部更新以父组件为准；同步草稿本身不触发提交。
+  useLayoutEffect(() => setSourceDraft(undefined), [sourceRoot]);
+  useLayoutEffect(() => setTargetDraft(undefined), [targetRoot]);
+
+  const commitDraft = (field: DirectoryField, draft: string | undefined) => {
+    if (draft === undefined) return;
+    if (field === 'source') setSourceDraft(undefined);
+    else setTargetDraft(undefined);
+    onCommit(field, draft);
+  };
+
   const commitOnEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === 'Enter') {
+    if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+      event.preventDefault();
       event.currentTarget.blur();
-      onCommit();
     }
   };
 
@@ -60,12 +73,12 @@ export function DirectoryPicker({
         </span>
         <input
           className="path-field"
-          value={sourceRoot}
+          value={sourceDraft ?? sourceRoot}
           spellCheck={false}
           placeholder="选择需要备份的源目录"
           aria-label="源目录"
-          onChange={(e) => onSourceChange(e.currentTarget.value)}
-          onBlur={onCommit}
+          onChange={(e) => setSourceDraft(e.currentTarget.value)}
+          onBlur={() => commitDraft('source', sourceDraft)}
           onKeyDown={commitOnEnter}
         />
         <button className="btn btn-sm" type="button" onClick={onBrowseSource} disabled={busy}>
@@ -81,12 +94,12 @@ export function DirectoryPicker({
         </span>
         <input
           className="path-field"
-          value={targetRoot}
+          value={targetDraft ?? targetRoot}
           spellCheck={false}
           placeholder="选择备份存放的备份目标目录"
           aria-label="备份目标目录"
-          onChange={(e) => onTargetChange(e.currentTarget.value)}
-          onBlur={onCommit}
+          onChange={(e) => setTargetDraft(e.currentTarget.value)}
+          onBlur={() => commitDraft('target', targetDraft)}
           onKeyDown={commitOnEnter}
         />
         <button className="btn btn-sm" type="button" onClick={onBrowseTarget} disabled={busy}>

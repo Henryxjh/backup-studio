@@ -143,29 +143,28 @@ export function ProgressPanel({
       {phase === 'ready' ? (
         <div className="banner">
           <span className="banner-dot" />
-          <span>计划已就绪，尚未开始执行</span>
+          <span className="banner-text">计划已就绪，尚未开始执行</span>
         </div>
       ) : null}
 
       {media === 'lost' ? (
         <div className="banner" data-tone="danger">
           <span className="banner-dot" />
-          <span>备份介质已断开，已停止写入。断点保存在本机，重新接入后需确认恢复</span>
+          <span className="banner-text">备份介质已断开，已停止写入。断点保存在本机，重新接入后需确认恢复</span>
         </div>
       ) : null}
 
       {media === 'restoring' ? (
         <div className="banner">
           <span className="banner-dot" />
-          <span>正在等待备份介质重新接入</span>
+          <span className="banner-text">正在等待备份介质重新接入</span>
         </div>
       ) : null}
 
       {quarantined ? (
-        <div className="banner" data-tone="danger">
+        <div className="banner progress-banner-action" data-tone="danger">
           <IconAlert size={13} className="icon-inline" />
-          <span>该介质已标记为隔离观察：{quarantine?.reason}。这不是物理坏盘结论</span>
-          <span style={{ flex: '1 1 auto' }} />
+          <span className="banner-text">该介质已标记为隔离观察：{quarantine?.reason}。这不是物理坏盘结论</span>
           <button className="btn btn-sm" type="button" onClick={() => setConfirmRelease(true)}>
             解除隔离并恢复写入
           </button>
@@ -175,14 +174,14 @@ export function ProgressPanel({
       {phase === 'interrupted' ? (
         <div className="banner" data-tone="warn">
           <IconAlert size={13} className="icon-inline" />
-          <span>备份已中断。恢复前会重新扫描并生成新计划，旧的删除动作不会执行</span>
+          <span className="banner-text">备份已中断。恢复前会重新扫描并生成新计划，旧的删除动作不会执行</span>
         </div>
       ) : null}
 
       {assessment ? (
         <div className="banner">
           <span className="banner-dot" />
-          <span>
+          <span className="banner-text">
             介质判定 {assessment.level}（置信度 {Math.round(assessment.confidence * 100)}%）：{assessment.suggestion}
           </span>
         </div>
@@ -191,7 +190,7 @@ export function ProgressPanel({
       {activeFile ? (
         <div className="banner">
           <IconAlert size={13} className="icon-inline" />
-          <span className="status-line-text">正在写入 {activeFile}</span>
+          <span className="banner-text">正在写入 {activeFile}</span>
         </div>
       ) : null}
 

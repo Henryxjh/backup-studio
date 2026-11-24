@@ -778,9 +778,23 @@
 
 .progress-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
   gap: var(--sp-4);
+}
+
+.progress-head .action-bar-group {
+  min-inline-size: 0;
+  flex-wrap: wrap;
+}
+
+.progress-head .btn,
+.progress-banner-action .btn {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .progress-figure {
@@ -829,7 +843,7 @@
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 6.5rem), 1fr));
   gap: var(--sp-4);
 }
 
@@ -838,21 +852,18 @@
   flex-direction: column;
   gap: 1px;
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .metric-value {
   font-size: var(--fs-title);
   font-weight: var(--w-medium);
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .metric-label {
   font-size: var(--fs-meta);
   color: var(--text-tertiary);
-  white-space: nowrap;
 }
 
 .banner {
@@ -879,6 +890,18 @@
   flex: 1 1 auto;
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.progress-banner-action {
+  flex-wrap: wrap;
+}
+
+.progress-banner-action .banner-text {
+  flex-basis: min(50%, 12em);
+}
+
+.progress-banner-action .btn {
+  margin-inline-start: auto;
 }
 
 /* ============ 完成摘要与恢复卡 ============ */

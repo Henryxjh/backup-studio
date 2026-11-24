@@ -47,3 +47,18 @@ export function fmtPercent(ratio: number): string {
   if (percent >= 1) return `${percent.toFixed(1)}%`;
   return '0%';
 }
+
+/**
+ * 规范化目录路径的显示形式：除根目录外移除末尾分隔符。
+ *
+ * 只处理尾部分隔符，不做 realpath、不解析符号链接、不解析 `..`、不归一大小写——
+ * 那些属于引擎 `path-identity.ts` 的职责。
+ *
+ * 保留的根目录语义：Linux `/`、Windows 盘符根 `C:\`（含 `C:/`）、
+ * Windows UNC 设备路径 `\\?\C:\`。POSIX 下反斜杠是合法文件名字符，故不当作分隔符。
+ */
+export function normalizeDirectoryRoot(path: string, isWindows: boolean): string {
+  if (isWindows && /^(?:[\\/]{2}[?.][\\/])?[A-Za-z]:[\\/]+$/.test(path)) return path;
+  // 全是分隔符时保留原值，否则根目录会被削成空串。
+  return path.replace(isWindows ? /[\\/]+$/ : /\/+$/, '') || path;
+}

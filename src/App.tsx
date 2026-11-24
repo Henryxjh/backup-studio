@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getApi, type BackupAPI, type ScanOutcome } from './lib/api';
 import { createMockApi } from './lib/mock';
-import { DirectoryPicker } from './components/DirectoryPicker';
+import { DirectoryPicker, type DirectoryField } from './components/DirectoryPicker';
 import { PlanPanel } from './components/PlanPanel';
 import { RecycleBin } from './components/RecycleBin';
 import { MediaDiagnostics } from './components/MediaDiagnostics';
@@ -14,7 +14,7 @@ import { Splitter } from './components/Splitter';
 import { IconAlert, IconCheck, IconLayers, IconMoon, IconRefresh, IconSun } from './components/Icons';
 import { useSpringValue } from './hooks/useSpringValue';
 import { POP_SPRING } from './lib/spring';
-import { fmtBytes, fmtDuration, fmtInt } from './lib/format';
+import { fmtBytes, fmtDuration, fmtInt, normalizeDirectoryRoot } from './lib/format';
 import type { BackupPhase, RecycleEntry, SyncMode } from '../shared/types';
 import type { BackupRevealResult, BackupRevealState } from '../shared/reveal-types';
 
@@ -223,19 +223,26 @@ export default function App() {
     [api],
   );
 
+  const commitDirectory = useCallback((field: DirectoryField, value: string) => {
+    // 渲染层只做显示规范化；路径身份判定仍在引擎侧。
+    const root = normalizeDirectoryRoot(value, navigator.platform.startsWith('Win'));
+    if (field === 'source') {
+      setSourceRoot(root);
+      return runScanAndPlan(root, targetRoot, syncMode);
+    }
+    setTargetRoot(root);
+    return runScanAndPlan(sourceRoot, root, syncMode);
+  }, [sourceRoot, targetRoot, syncMode, runScanAndPlan]);
+
   const handleBrowseSource = useCallback(async () => {
     const picked = await api.pickDirectory('选择需要备份的源目录');
-    if (!picked) return;
-    setSourceRoot(picked);
-    await runScanAndPlan(picked, targetRoot, syncMode);
-  }, [api, targetRoot, syncMode, runScanAndPlan]);
+    if (picked) await commitDirectory('source', picked);
+  }, [api, commitDirectory]);
 
   const handleBrowseTarget = useCallback(async () => {
     const picked = await api.pickDirectory('选择备份存放的备份目标目录');
-    if (!picked) return;
-    setTargetRoot(picked);
-    await runScanAndPlan(sourceRoot, picked, syncMode);
-  }, [api, sourceRoot, syncMode, runScanAndPlan]);
+    if (picked) await commitDirectory('target', picked);
+  }, [api, commitDirectory]);
 
   const handleCommit = useCallback(() => {
     void runScanAndPlan(sourceRoot, targetRoot, syncMode);
@@ -277,7 +284,13 @@ export default function App() {
   );
 
   const running = phase === 'running' || phase === 'paused';
-  const canStart = Boolean(sourceRoot && targetRoot) && !running && phase !== 'scanning' && phase !== 'planning';
+  const assessment = state?.assessment;
+  // 完成态按钮只重新扫描和生成计划，不会启动写入。
+  const writeBlockReason = phase !== 'completed' && assessment?.writable === false
+    ? `${assessment.level}：${assessment.suggestion}`
+    : null;
+  const canStart = Boolean(sourceRoot && targetRoot) && !running && phase !== 'scanning' && phase !== 'planning'
+    && writeBlockReason === null;
 
   /**
    * 恢复中断的备份。
@@ -447,11 +460,9 @@ export default function App() {
                     targetRoot={targetRoot}
                     scan={scan}
                     busy={busy}
-                    onSourceChange={setSourceRoot}
-                    onTargetChange={setTargetRoot}
                     onBrowseSource={handleBrowseSource}
                     onBrowseTarget={handleBrowseTarget}
-                    onCommit={handleCommit}
+                    onCommit={commitDirectory}
                   />
                 </div>
 
@@ -578,6 +589,12 @@ export default function App() {
                 </div>
               ) : null}
 
+              {writeBlockReason !== null ? (
+                <div id="backup-write-block-reason" className="banner" data-tone="danger" role="status">
+                  <span className="banner-text" title={writeBlockReason}>{writeBlockReason}</span>
+                </div>
+              ) : null}
+
               <div className="action-bar">
                 <div className="status-line">
                   <span className="status-line-text">{statusText}</span>
@@ -594,9 +611,10 @@ export default function App() {
                     <IconRefresh size={15} />
                   </button>
                   <button
-                    className="btn btn-primary"
+                    className={writeBlockReason === null ? 'btn btn-primary' : 'btn'}
                     type="button"
                     disabled={phase === 'completed' ? !sourceRoot || !targetRoot || busy : !canStart || busy}
+                    aria-describedby={writeBlockReason === null ? undefined : 'backup-write-block-reason'}
                     onClick={() => {
                       if (phase === 'completed') {
                         // 再次备份 = 重新扫描并重新生成计划，而不是直接复用旧计划。
